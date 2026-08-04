@@ -1,39 +1,44 @@
 # FediTexter
-Clustered texting platform that works like others on the market
-Similar to how a federated system works
-People should be able to make there own instances of the server even a version that allow for their own clusters
-Currently thinking of using rust + wgpu for the backend and gui something lightweight
 
-Each server should be able to talk to each other to coordinate logins, getting text and what links to use
-At the beginning stickers should be stored on the client side and access when required probs will transition to stickers being hosted server side with a cache client side
-Files should be sent peer2peer to save on hosting costs
+Clustered texting platform that works like others on the market. Similar to how a federated system works. People should be able to make their own instances of the server, even a version that allows for their own clusters. Currently thinking of using Rust + wgpu for the backend and GUI, something lightweight.
 
-With p2p connections should make it so ip addresses are not given out for each user should be a hidden in a code that is unique to each connection 
+## Architecture
 
-Decisions should be made with a majority of developers approval and with all devs knowledgable with what is going on
+- Each server should be able to talk to each other to coordinate logins, getting text and what links to use.
+- At the beginning, stickers should be stored on the client side and accessed when required. Will probably transition to stickers being hosted server side with a cache client side.
+- Files should be sent peer-to-peer to save on hosting costs.
+- With p2p connections, IP addresses should not be given out for each user. Each should be hidden in a code that is unique to each connection.
 
-Currently wanting to implement:
-2fa need to be a requirement, stuff like google authenticator should be standard
-Probs requiring a phone number for accounts to avoid spam on the service 
-create uuid for each device that makes an account and link those uuids to phone numbers (this should not affect privacy too much and this data will be deleted soon after account creation (maybe build a trust score of it and hold account info for less time if its considered trustworthy)
-Allowing for sticker/emoji packs 
-Gifs (these can be hosted externally) if possible allow for a similar thing to telegram where videos can be converted to gifs if user wants (make these easy to make and an option to not put them into for gif selection)
-Text
-Link embedding (this need to work for bsky, twitter, youtube and instagram (if possible) will allow for links to be auto converted to fx links if needed) do allow for mastodon as well 
-Images (allow for use of getting from gallery but also attempt to use the new camera apis that allow for nice looking photos)
-Video (this should be sent p2p)
-Voice chats (this can also be p2p)
-Sending files
-Group chats
-Large group chats (this would be a more discord server style ui)
-Blocking users is required by google play
-Under 16 ban is also required but probs will be an under 18 ban to be safe (this project is in Aus region so need to follow local laws)
-(maybe) video chats
+## Decision Making
 
+Decisions should be made with a majority of developers approval, with all devs knowledgeable about what is going on.
 
-!! Never implement:
-AI features for example text gen, image gen
-Avoid using AI to write code (finding bugs is ok, bug reports do need to be written by a person and tested properly by that person)
-Coder UI (unless that ui is not final/shipped, does not include beta testers)
+## Currently Wanting to Implement
 
-Will be making a system to allow for people to easily contact me for now just use the github systems 
+- **2FA** — needs to be a requirement; stuff like Google Authenticator should be standard.
+- **Phone number verification** — probably requiring a phone number for accounts to avoid spam on the service.
+- **Device UUIDs** — create a UUID for each device that makes an account and link those UUIDs to phone numbers (this should not affect privacy too much, and this data will be deleted soon after account creation). Maybe build a trust score of it and hold account info for less time if it is considered trustworthy.
+- **Sticker/emoji packs**
+- **GIFs** — can be hosted externally. If possible, allow for a similar thing to Telegram where videos can be converted to GIFs if the user wants. Make these easy to make with an option to not put them in for GIF selection.
+- **Text**
+- **Link embedding** — needs to work for bsky, Twitter, YouTube, Instagram (if possible) and Mastodon. Allow links to be auto converted to fx links if needed.
+- **Images** — allow for getting from gallery, but also attempt to use the new camera APIs that allow for nice looking photos.
+- **Video** — should be sent p2p.
+- **Voice chats** — can also be p2p.
+- **Sending files**
+- **Group chats**
+- **Large group chats** — a more Discord server style UI.
+- **Blocking users** — required by Google Play.
+- **Under 16 ban** — also required, but will probably be an under 18 ban to be safe (project is in the Aus region so needs to follow local laws).
+- **(maybe) Video chats**
+
+## Never Implement
+
+- AI features, for example text gen, image gen.
+- Avoid using AI to write code (finding bugs is OK; bug reports do need to be written by a person and tested properly by that person).
+- Coder UI (unless that UI is not final/shipped, does not include beta testers).
+- Never allow people to ramble like the telegram dev does (just dont put it infront of all users faces without consent)
+
+## Contact
+
+Will be making a system to allow for people to easily contact me; for now, just use the GitHub systems.
