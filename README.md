@@ -16,7 +16,7 @@ Decisions should be made with a majority of developers approval, with all devs k
 ## Currently Wanting to Implement
 
 - **2FA** — needs to be a requirement; stuff like Google Authenticator should be standard.
-- **Phone number verification** — probably requiring a phone number for accounts to avoid spam on the service.
+- **Phone number verification** — (later just use email for now) probably requiring a phone number for accounts to avoid spam on the service.
 - **Device UUIDs** — create a UUID for each device that makes an account and link those UUIDs to phone numbers (this should not affect privacy too much, and this data will be deleted soon after account creation). Maybe build a trust score of it and hold account info for less time if it is considered trustworthy.
 - **Sticker/emoji packs**
 - **GIFs** — can be hosted externally. If possible, allow for a similar thing to Telegram where videos can be converted to GIFs if the user wants. Make these easy to make with an option to not put them in for GIF selection.
@@ -38,6 +38,7 @@ Decisions should be made with a majority of developers approval, with all devs k
 - Avoid using AI to write code (finding bugs is OK; bug reports do need to be written by a person and tested properly by that person).
 - Coder UI (unless that UI is not final/shipped, does not include beta testers).
 - Never allow people to ramble like the telegram dev does (just dont put it infront of all users faces without consent)
+- Avoid stuff like electron and be light weight to run
 
 ## Contact
 
