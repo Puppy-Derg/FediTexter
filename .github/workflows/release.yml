@@ -42,15 +42,19 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             name: feditexter-client-macos-arm64
+            binary: feditexter-client
           - os: macos-latest
             target: x86_64-apple-darwin
             name: feditexter-client-macos-x64
+            binary: feditexter-client
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             name: feditexter-client-windows-x64.exe
+            binary: feditexter-client.exe
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             name: feditexter-client-linux-x64
+            binary: feditexter-client
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -75,7 +79,7 @@ jobs:
         shell: bash
         run: |
           ls target/${{ matrix.target }}/release/
-          cp "target/${{ matrix.target }}/release/feditexter-client"* "target/${{ matrix.target }}/release/${{ matrix.name }}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "target/${{ matrix.target }}/release/${{ matrix.name }}"
 
       - name: Upload client
         uses: actions/upload-artifact@v4
