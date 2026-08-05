@@ -1,4 +1,4 @@
-import { Button, LineEdit, ListView, Palette } from "std-widgets.slint";
+import { LineEdit, ListView, Palette } from "std-widgets.slint";
 
 export struct UiConversation {
     id: int,
@@ -135,6 +135,61 @@ component ContextMenuItem inherits Rectangle {
     }
 }
 
+component Button inherits Rectangle {
+    in property <string> text: "";
+    in property <bool> primary: false;
+    in property <bool> enabled: true;
+    in property <brush> accent: #7C5CE0;
+    in property <brush> on-accent: #FFFFFF;
+    callback clicked;
+
+    property <brush> bg: root.primary ? root.accent : Palette.control-background;
+    property <brush> label-color: root.primary ? root.on-accent : Palette.control-foreground;
+
+    min-width: 64px;
+    height: 36px;
+    border-radius: 8px;
+    background: root.bg;
+    border-width: 1px;
+    border-color: Palette.border;
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        alignment: center;
+        Text {
+            text: root.text;
+            color: root.label-color;
+            font-size: 14px;
+            font-weight: 500;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+    states [
+        disabled when !root.enabled : {
+            bg: Palette.control-background.with-alpha(0.4);
+            label-color: Palette.control-foreground.with-alpha(0.4);
+        }
+        pressed-primary when root.enabled && ta.pressed && root.primary : {
+            bg: root.accent.with-alpha(0.72);
+        }
+        pressed when root.enabled && ta.pressed : {
+            bg: Palette.control-background.with-alpha(0.35);
+        }
+        hover-primary when root.enabled && ta.has-hover && root.primary : {
+            bg: root.accent.with-alpha(0.85);
+        }
+        hover when root.enabled && ta.has-hover : {
+            bg: Palette.control-background.with-alpha(0.55);
+        }
+    ]
+    animate bg { duration: 60ms; }
+    ta := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
 component NewChatForm inherits Rectangle {
     in-out property <string> chat-input: "";
     in property <[UiContact]> suggestions;
@@ -233,6 +288,8 @@ component NewChatForm inherits Rectangle {
             Button {
                 text: "Create conversation";
                 primary: true;
+                accent: root.accent-color;
+                on-accent: #FFFFFF;
                 enabled: root.chat-input != "";
                 clicked => {
                     root.create-chat(root.chat-input);
@@ -247,7 +304,7 @@ component DarkInput inherits Rectangle {
     in property <string> placeholder: "";
     in property <InputType> input-type: InputType.text;
     callback accepted();
-    width: 100%;
+    horizontal-stretch: 1;
     height: 44px;
     border-radius: 8px;
     border-width: 1px;
@@ -255,24 +312,28 @@ component DarkInput inherits Rectangle {
     background: #1C1C1C;
     ti := TextInput {
         x: 12px;
-        y: 10px;
+        y: 0px;
         width: parent.width - 24px;
-        height: parent.height - 20px;
+        height: 100%;
         color: #FFFFFF;
         font-size: 16px;
         single-line: true;
+        vertical-alignment: center;
         input-type: root.input-type;
         text <=> root.text;
         accepted => { root.accepted(); }
     }
     Text {
         x: 14px;
-        y: 12px;
+        y: 0px;
+        height: 100%;
         text: root.text == "" ? root.placeholder : "";
         color: #FFFFFF8A;
         font-size: 16px;
+        vertical-alignment: center;
     }
 }
+
 
 export component MainWindow inherits Window {
     title: "FediTexter";
@@ -327,6 +388,8 @@ export component MainWindow inherits Window {
     property <float> ui-scale-base: 1.3;
     in-out property<bool> nc-append: false;
     in-out property<int> nc-cursor-len: 0;
+    in-out property<int> msg-scroll-tick: 0;
+    in-out property<bool> msg-at-bottom: false;
     in property <image> my-avatar;
 
     callback login(email: string, password: string);
@@ -388,12 +451,13 @@ export component MainWindow inherits Window {
         background: #232323;
         VerticalLayout {
             spacing: 10px;
-            Rectangle { height: 8%; }
+            alignment: start;
+            Rectangle { height: 24px; }
             HorizontalLayout {
                 alignment: center;
                 VerticalLayout {
                     spacing: 10px;
-                    width: 360px;
+                    width: 380px;
 
                     Text {
                         text: "FediTexter";
@@ -409,29 +473,64 @@ export component MainWindow inherits Window {
                         color: #FFFFFFA6;
                     }
 
+                    Rectangle { height: 26px; }
+
                     if !root.register-mode: VerticalLayout {
                         spacing: 8px;
-                        Text { text: "Server"; color: #FFFFFFC9; }
-                        DarkInput {
-                            text <=> root.server-input;
-                            placeholder: "https://your-server.example";
-                        }
-                        Text { text: "Email"; color: #FFFFFFC9; }
-                        DarkInput {
-                            text <=> root.login-email;
-                            placeholder: "you@example.com";
-                        }
-                        Text { text: "Password"; color: #FFFFFFC9; }
-                        DarkInput {
-                            text <=> root.login-password;
-                            input-type: InputType.password;
-                            accepted => {
-                                root.login(root.login-email, root.login-password);
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: "Server";
+                                font-size: 17px;
+                                font-weight: 500;
+                                color: #FFFFFF;
+                                width: 100px;
+                                vertical-alignment: center;
+                            }
+                            DarkInput {
+                                text <=> root.server-input;
+                                placeholder: "your-server.example";
                             }
                         }
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: "Email";
+                                font-size: 17px;
+                                font-weight: 500;
+                                color: #FFFFFF;
+                                width: 100px;
+                                vertical-alignment: center;
+                            }
+                            DarkInput {
+                                text <=> root.login-email;
+                                placeholder: "you@example.com";
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: "Password";
+                                font-size: 17px;
+                                font-weight: 500;
+                                color: #FFFFFF;
+                                width: 100px;
+                                vertical-alignment: center;
+                            }
+                            DarkInput {
+                                text <=> root.login-password;
+                                input-type: InputType.password;
+                                accepted => {
+                                    root.login(root.login-email, root.login-password);
+                                }
+                            }
+                        }
+                        Rectangle { height: 12px; }
                         Button {
                             text: "Login";
                             primary: true;
+                            accent: root.accent-color;
+                            on-accent: root.md3-on-primary;
                             clicked => {
                                 root.login(root.login-email, root.login-password);
                             }
@@ -444,32 +543,75 @@ export component MainWindow inherits Window {
 
                     if root.register-mode: VerticalLayout {
                         spacing: 8px;
-                        Text { text: "Server"; color: #FFFFFFC9; }
-                        DarkInput {
-                            text <=> root.server-input;
-                            placeholder: "https://your-server.example";
-                        }
-                        Text { text: "Email"; color: #FFFFFFC9; }
-                        DarkInput {
-                            text <=> root.reg-email;
-                            placeholder: "you@example.com";
-                        }
-                        Text { text: "Username"; color: #FFFFFFC9; }
-                        DarkInput {
-                            text <=> root.reg-username;
-                            placeholder: "alice";
-                        }
-                        Text { text: "Password"; color: #FFFFFFC9; }
-                        DarkInput {
-                            text <=> root.reg-password;
-                            input-type: InputType.password;
-                            accepted => {
-                                root.register(root.reg-email, root.reg-username, root.reg-password);
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: "Server";
+                                font-size: 17px;
+                                font-weight: 500;
+                                color: #FFFFFF;
+                                width: 100px;
+                                vertical-alignment: center;
+                            }
+                            DarkInput {
+                                text <=> root.server-input;
+                                placeholder: "your-server.example";
                             }
                         }
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: "Email";
+                                font-size: 17px;
+                                font-weight: 500;
+                                color: #FFFFFF;
+                                width: 100px;
+                                vertical-alignment: center;
+                            }
+                            DarkInput {
+                                text <=> root.reg-email;
+                                placeholder: "you@example.com";
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: "Username";
+                                font-size: 17px;
+                                font-weight: 500;
+                                color: #FFFFFF;
+                                width: 100px;
+                                vertical-alignment: center;
+                            }
+                            DarkInput {
+                                text <=> root.reg-username;
+                                placeholder: "alice";
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: "Password";
+                                font-size: 17px;
+                                font-weight: 500;
+                                color: #FFFFFF;
+                                width: 100px;
+                                vertical-alignment: center;
+                            }
+                            DarkInput {
+                                text <=> root.reg-password;
+                                input-type: InputType.password;
+                                accepted => {
+                                    root.register(root.reg-email, root.reg-username, root.reg-password);
+                                }
+                            }
+                        }
+                        Rectangle { height: 12px; }
                         Button {
                             text: "Register";
                             primary: true;
+                            accent: root.accent-color;
+                            on-accent: root.md3-on-primary;
                             clicked => {
                                 root.register(root.reg-email, root.reg-username, root.reg-password);
                             }
@@ -488,7 +630,6 @@ export component MainWindow inherits Window {
                     }
                 }
             }
-            Rectangle { height: 8%; }
         }
     }
 
@@ -518,15 +659,17 @@ export component MainWindow inherits Window {
                             font-size: 12px;
                         }
                     }
-                    HorizontalLayout {
-                        spacing: 0px;
-                        Button {
-                            text: "Settings";
-                            clicked => { root.settings-open = true; }
-                        }
-                        Button {
-                            text: "Logout";
-                            clicked => { root.logout(); }
+                    VerticalLayout { vertical-stretch: 1; alignment: center;
+                        HorizontalLayout {
+                            spacing: 0px;
+                            Button {
+                                text: "Settings";
+                                clicked => { root.settings-open = true; }
+                            }
+                            Button {
+                                text: "Logout";
+                                clicked => { root.logout(); }
+                            }
                         }
                     }
                 }
@@ -636,8 +779,8 @@ export component MainWindow inherits Window {
                                         CloseButton {
                                             text-color: root.md3-on-secondary-container;
                                             clicked => {
-                                                root.context-conversation-id = c.id;
-                                                root.context-delete();
+                                                root.selected-conversation = -1;
+                                                root.select-conversation(-1);
                                             }
                                         }
                                     }
@@ -674,9 +817,17 @@ export component MainWindow inherits Window {
                         if root.selected-conversation >= 0: Rectangle {
                             horizontal-stretch: 1;
                             vertical-stretch: 1;
+                            property <int> scroll-tick: root.msg-scroll-tick;
+                            property <bool> at-bottom: msg-list.viewport-y <= -(msg-list.viewport-height - msg-list.visible-height) + 8px;
+                            changed scroll-tick => {
+                                msg-list.viewport-y = -(msg-list.viewport-height - msg-list.visible-height);
+                            }
+                            changed at-bottom => {
+                                root.msg-at-bottom = self.at-bottom;
+                            }
                             VerticalLayout {
                                 spacing: 8px;
-                                ListView {
+                                msg-list := ListView {
                                     horizontal-stretch: 1;
                                     vertical-stretch: 1;
                                     for m in root.messages: VerticalLayout {
@@ -737,7 +888,7 @@ export component MainWindow inherits Window {
                                 }
                                 HorizontalLayout {
                                     spacing: 8px;
-                                    Rectangle {
+                                    composer := Rectangle {
                                         horizontal-stretch: 1;
                                         height: max(48px, min(input.preferred-height + 20px, 160px));
                                         border-width: 1px;
@@ -775,6 +926,9 @@ export component MainWindow inherits Window {
                                         Button {
                                             text: "Send";
                                             primary: true;
+                                            accent: root.accent-color;
+                                            on-accent: root.md3-on-primary;
+                                            height: composer.height;
                                             enabled: root.draft != "";
                                             clicked => {
                                                 root.send-message(root.draft);
@@ -800,6 +954,10 @@ export component MainWindow inherits Window {
         width: 100%;
         height: 100%;
         background: #66000000;
+        TouchArea {
+            width: 100%;
+            height: 100%;
+        }
         Rectangle {
             x: (parent.width - 420px) / 2;
             y: (parent.height - 560px) / 2;
@@ -872,7 +1030,7 @@ export component MainWindow inherits Window {
                 }
 
                 Text { text: "Server"; color: root.md3-on-surface-variant; }
-                LineEdit { text <=> root.server-input; placeholder-text: "https://your-server.example"; }
+                LineEdit { text <=> root.server-input; placeholder-text: "your-server.example"; }
 
                 HorizontalLayout {
                     spacing: 8px;
@@ -899,6 +1057,8 @@ export component MainWindow inherits Window {
                     Button {
                         text: "Save";
                         primary: true;
+                        accent: root.accent-color;
+                        on-accent: root.md3-on-primary;
                         clicked => {
                             root.settings-saved();
                             root.settings-open = false;
@@ -955,6 +1115,8 @@ export component MainWindow inherits Window {
                     Button {
                         text: "Verify";
                         primary: true;
+                        accent: root.accent-color;
+                        on-accent: root.md3-on-primary;
                         enabled: root.verify-code != "";
                         clicked => {
                             root.verify(root.verify-code);
@@ -1048,6 +1210,10 @@ export component MainWindow inherits Window {
         width: 100%;
         height: 100%;
         background: #66000000;
+        TouchArea {
+            width: 100%;
+            height: 100%;
+        }
         Rectangle {
             x: (parent.width - 340px) / 2;
             y: (parent.height - 400px) / 2;
@@ -1146,6 +1312,10 @@ export component MainWindow inherits Window {
         width: 100%;
         height: 100%;
         background: #66000000;
+        TouchArea {
+            width: 100%;
+            height: 100%;
+        }
         Rectangle {
             x: (parent.width - 380px) / 2;
             y: (parent.height - 200px) / 2;
@@ -1178,6 +1348,8 @@ export component MainWindow inherits Window {
                     Button {
                         text: "Delete";
                         primary: true;
+                        accent: root.accent-color;
+                        on-accent: root.md3-on-primary;
                         clicked => {
                             root.confirm-delete();
                             root.confirm-delete-open = false;

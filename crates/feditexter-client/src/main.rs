@@ -937,6 +937,20 @@ fn set_error(sh: &Shared, msg: &str) {
     sh.ui().set_error_message(msg.into());
 }
 
+/// Scroll the message list to the bottom. The tick triggers a Slint-side
+/// scroll; the delayed second tick re-applies it after the list has relaid out
+/// so `viewport-height` reflects the new messages.
+fn scroll_to_bottom(sh: &Shared) {
+    let ui = sh.ui();
+    ui.set_msg_scroll_tick(ui.get_msg_scroll_tick() + 1);
+    let weak = sh.ui.clone();
+    slint::Timer::single_shot(Duration::from_millis(60), move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_msg_scroll_tick(ui.get_msg_scroll_tick() + 1);
+        }
+    });
+}
+
 /// Push a server profile into the profile card and keep the context menu's
 /// block/mute state in sync.
 fn apply_profile(sh: &Shared, p: &Profile) {
@@ -1282,6 +1296,7 @@ fn handle_event(sh: &Shared, ev: Event) {
             ui.set_error_message(SharedString::default());
             sh.messages.borrow_mut().clear();
             refresh_messages_ui(sh);
+            scroll_to_bottom(sh);
             sh.backend.refresh_messages(&sh.server(), &sh.token.borrow().clone().unwrap_or_default(), c.id);
         }
         Event::Messages { conversation_id, messages } => {
@@ -1292,6 +1307,7 @@ fn handle_event(sh: &Shared, ev: Event) {
                 msgs.sort_by_key(|m| m.id);
                 drop(msgs);
                 refresh_messages_ui(sh);
+                scroll_to_bottom(sh);
             }
         }
         Event::MessageSent(m) => {
@@ -1311,7 +1327,11 @@ fn handle_event(sh: &Shared, ev: Event) {
                 *sh.unread.borrow_mut().entry(m.conversation_id).or_insert(0) += 1;
                 refresh_conversations_ui(sh);
             }
+            let at_bottom = sh.ui().get_msg_at_bottom();
             refresh_messages_ui(sh);
+            if at_bottom {
+                scroll_to_bottom(sh);
+            }
         }
         Event::WsStatus(b) => {
             sh.ui().set_ws_connected(b);
@@ -1504,6 +1524,7 @@ fn main() -> Result<(), slint::PlatformError> {
             if id >= 0 {
                 sh.unread.borrow_mut().remove(&(id as u64));
                 refresh_conversations_ui(&sh);
+                scroll_to_bottom(&sh);
                 if let Some(token) = sh.token.borrow().clone() {
                     sh.backend.refresh_messages(&sh.server(), &token, id as u64);
                 }
@@ -1777,6 +1798,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 sh.unread.borrow_mut().remove(&cid);
                 refresh_conversations_ui(&sh);
                 ui.set_selected_conversation(cid as i32);
+                scroll_to_bottom(&sh);
                 if let Some(token) = sh.token.borrow().clone() {
                     sh.backend.refresh_messages(&sh.server(), &token, cid);
                 }
