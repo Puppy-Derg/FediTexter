@@ -64,6 +64,8 @@ pub async fn register(
     Ok((StatusCode::CREATED, Json(json!({ "token": token, "user": user }))))
 }
 
+const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$fAWlNrU+t0yc2hZQVobo/Q$YcqXjlp/Iy9rWpLwLPTwDBUyV1umH3j88kucq4n1zuU";
+
 pub async fn login(
     State(state): State<AppState>,
     Json(body): Json<LoginRequest>,
@@ -76,8 +78,13 @@ pub async fn login(
     .await
     .map_err(|_| ApiError::Internal("db error"))?;
 
-    let (id, email, username, display_name, password_hash) =
-        row.ok_or(ApiError::Unauthorized("invalid credentials"))?;
+    let (id, email, username, display_name, password_hash) = match row {
+        Some(r) => r,
+        None => {
+            verify_password(&body.password, DUMMY_PASSWORD_HASH);
+            return Err(ApiError::Unauthorized("invalid credentials"));
+        }
+    };
 
     if !verify_password(&body.password, &password_hash) {
         return Err(ApiError::Unauthorized("invalid credentials"));

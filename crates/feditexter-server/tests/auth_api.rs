@@ -162,3 +162,38 @@ async fn duplicate_email_conflicts() {
 
     assert_eq!(status, StatusCode::CONFLICT);
 }
+
+#[tokio::test]
+async fn register_conflict_message_is_generic() {
+    let state = test_state().await;
+    let email = unique_email("conflict");
+    let username1 = unique_username("conflict");
+    let username2 = unique_username("conflict2");
+
+    let (status, _) = post_json(&state, "/api/register", json!({
+        "email": email, "username": username1, "password": "password123"
+    })).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = post_json(&state, "/api/register", json!({
+        "email": email, "username": username2, "password": "password123"
+    })).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body["error"],
+        json!("email or username already taken"),
+        "conflict must not reveal which field collided"
+    );
+}
+
+#[tokio::test]
+async fn login_unknown_email_returns_generic_401() {
+    let state = test_state().await;
+
+    let (status, body) = post_json(&state, "/api/login", json!({
+        "email": unique_email("nobody"), "password": "password123"
+    })).await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"], json!("invalid credentials"));
+}
