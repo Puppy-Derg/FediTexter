@@ -16,7 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sqlx::migrate!("../../migrations").run(&pool).await?;
     info!("connected to db, migrations applied");
 
-    let app = build_app(AppState { pool });
+    let app = build_app(AppState { pool, hub: Default::default() });
 
     let addr = format!("{bind_addr}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;

@@ -20,7 +20,7 @@ async fn test_state() -> AppState {
             sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
         })
         .await;
-    AppState { pool }
+    AppState { pool, hub: Default::default() }
 }
 
 fn unique_nanos() -> u128 {

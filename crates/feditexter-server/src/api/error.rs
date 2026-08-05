@@ -7,6 +7,7 @@ pub enum ApiError {
     BadRequest(&'static str),
     Conflict(&'static str),
     Unauthorized(&'static str),
+    NotFound(&'static str),
     Internal(&'static str),
 }
 
@@ -16,6 +17,7 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
             ApiError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m),
+            ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
         };
         (status, Json(json!({ "error": message }))).into_response()
