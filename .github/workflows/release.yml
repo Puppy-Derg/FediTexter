@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  build-server:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,8 +28,74 @@ jobs:
       - name: Strip binary
         run: strip target/x86_64-unknown-linux-musl/release/feditexter-server
 
+      - name: Upload server
+        uses: actions/upload-artifact@v4
+        with:
+          name: feditexter-server
+          path: target/x86_64-unknown-linux-musl/release/feditexter-server
+
+  build-client:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: feditexter-client-macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            name: feditexter-client-macos-x64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: feditexter-client-windows-x64.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: feditexter-client-linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux build deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libgtk-3-dev libssl-dev pkg-config
+
+      - name: Build client
+        run: cargo build --release --target ${{ matrix.target }} -p feditexter-client
+
+      - name: Rename binary
+        shell: bash
+        run: |
+          ls target/${{ matrix.target }}/release/
+          cp "target/${{ matrix.target }}/release/feditexter-client"* "target/${{ matrix.target }}/release/${{ matrix.name }}"
+
+      - name: Upload client
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: target/${{ matrix.target }}/release/${{ matrix.name }}
+
+  release:
+    needs: [build-server, build-client]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/x86_64-unknown-linux-musl/release/feditexter-server
+          files: artifacts/**/*
           generate_release_notes: true
