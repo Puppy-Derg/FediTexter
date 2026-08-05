@@ -1683,16 +1683,18 @@ dependencies = [
 
 [[package]]
 name = "feditexter-server"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "argon2",
  "axum",
+ "base64",
  "chrono",
  "dotenvy",
  "ed25519-dalek",
  "futures-util",
  "hex",
  "http-body-util",
+ "image",
  "rand_core 0.6.4",
  "reqwest",
  "serde",

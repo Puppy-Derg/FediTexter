@@ -138,6 +138,7 @@ component NewChatForm inherits Rectangle {
     in-out property <string> chat-input: "";
     in property <[UiContact]> suggestions;
     in property <string> error-message: "";
+    in property <color> accent-color: #7C5CE0;
     in-out property <bool> focus-end-tick: false;
     in-out property <int> cursor-len: 0;
     callback create-chat(input: string);
@@ -172,7 +173,7 @@ component NewChatForm inherits Rectangle {
                 height: 56px;
                 border-width: 1px;
                 border-radius: 8px;
-                border-color: nc-input.has-focus ? Palette.accent-background : Palette.border;
+                border-color: nc-input.has-focus ? root.accent-color : Palette.border;
                 background: Palette.background;
                 nc-input := LineEdit {
                     x: 10px;
@@ -237,6 +238,38 @@ component NewChatForm inherits Rectangle {
                 }
             }
         }
+    }
+}
+
+component DarkInput inherits Rectangle {
+    in-out property <string> text;
+    in property <string> placeholder: "";
+    in property <InputType> input-type: InputType.text;
+    callback accepted();
+    width: 100%;
+    height: 44px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: ti.has-focus ? #8AB4F8 : #FFFFFF3D;
+    background: #1C1C1C;
+    ti := TextInput {
+        x: 12px;
+        y: 10px;
+        width: parent.width - 24px;
+        height: parent.height - 20px;
+        color: #FFFFFF;
+        font-size: 16px;
+        single-line: true;
+        input-type: root.input-type;
+        text <=> root.text;
+        accepted => { root.accepted(); }
+    }
+    Text {
+        x: 14px;
+        y: 12px;
+        text: root.text == "" ? root.placeholder : "";
+        color: #FFFFFF8A;
+        font-size: 16px;
     }
 }
 
@@ -348,10 +381,10 @@ export component MainWindow inherits Window {
         }
 
     // ------------------------------------------------------------------
-    // Login / register screen
+    // Login / register screen (dark grey)
     // ------------------------------------------------------------------
     if !root.logged-in: Rectangle {
-        background: transparent;
+        background: #232323;
         VerticalLayout {
             spacing: 10px;
             Rectangle { height: 8%; }
@@ -366,29 +399,32 @@ export component MainWindow inherits Window {
                         font-size: 34px;
                         font-weight: 700;
                         horizontal-alignment: center;
-                        color: root.md3-primary;
+                        color: #FFFFFF;
                     }
 
                     Text {
                         text: "A federated texting client";
                         horizontal-alignment: center;
-                        color: root.md3-on-surface-variant;
+                        color: #FFFFFFA6;
                     }
 
                     if !root.register-mode: VerticalLayout {
                         spacing: 8px;
-                        Text { text: "Server"; color: root.md3-on-surface; }
-                        LineEdit {
+                        Text { text: "Server"; color: #FFFFFFC9; }
+                        DarkInput {
                             text <=> root.server-input;
-                            placeholder-text: "https://your-server.example";
+                            placeholder: "https://your-server.example";
                         }
-                        Text { text: "Email"; color: root.md3-on-surface; }
-                        LineEdit { text <=> root.login-email; placeholder-text: "you@example.com"; }
-                        Text { text: "Password"; color: root.md3-on-surface; }
-                        LineEdit {
+                        Text { text: "Email"; color: #FFFFFFC9; }
+                        DarkInput {
+                            text <=> root.login-email;
+                            placeholder: "you@example.com";
+                        }
+                        Text { text: "Password"; color: #FFFFFFC9; }
+                        DarkInput {
                             text <=> root.login-password;
                             input-type: InputType.password;
-                            accepted(text) => {
+                            accepted => {
                                 root.login(root.login-email, root.login-password);
                             }
                         }
@@ -407,17 +443,26 @@ export component MainWindow inherits Window {
 
                     if root.register-mode: VerticalLayout {
                         spacing: 8px;
-                        Text { text: "Server"; color: root.md3-on-surface; }
-                        LineEdit { text <=> root.server-input; placeholder-text: "https://your-server.example"; }
-                        Text { text: "Email"; color: root.md3-on-surface; }
-                        LineEdit { text <=> root.reg-email; placeholder-text: "you@example.com"; }
-                        Text { text: "Username"; color: root.md3-on-surface; }
-                        LineEdit { text <=> root.reg-username; placeholder-text: "alice"; }
-                        Text { text: "Password"; color: root.md3-on-surface; }
-                        LineEdit {
+                        Text { text: "Server"; color: #FFFFFFC9; }
+                        DarkInput {
+                            text <=> root.server-input;
+                            placeholder: "https://your-server.example";
+                        }
+                        Text { text: "Email"; color: #FFFFFFC9; }
+                        DarkInput {
+                            text <=> root.reg-email;
+                            placeholder: "you@example.com";
+                        }
+                        Text { text: "Username"; color: #FFFFFFC9; }
+                        DarkInput {
+                            text <=> root.reg-username;
+                            placeholder: "alice";
+                        }
+                        Text { text: "Password"; color: #FFFFFFC9; }
+                        DarkInput {
                             text <=> root.reg-password;
                             input-type: InputType.password;
-                            accepted(text) => {
+                            accepted => {
                                 root.register(root.reg-email, root.reg-username, root.reg-password);
                             }
                         }
@@ -437,7 +482,7 @@ export component MainWindow inherits Window {
                     if root.error-message != "": Text {
                         text: root.error-message;
                         wrap: word-wrap;
-                        color: root.md3-error;
+                        color: #FF8A80;
                         horizontal-alignment: center;
                     }
                 }
@@ -468,7 +513,7 @@ export component MainWindow inherits Window {
                     VerticalLayout { alignment: center;
                         Text {
                             text: root.ws-connected ? "live" : "reconnecting…";
-                            color: root.ws-connected ? root.md3-primary : root.md3-on-surface-variant;
+                            color: root.ws-connected ? #66BB6A : root.md3-on-surface-variant;
                             font-size: 12px;
                         }
                     }
@@ -608,6 +653,7 @@ export component MainWindow inherits Window {
                             height: 100%;
                             suggestions: root.suggestions;
                             error-message: root.error-message;
+                            accent-color: root.accent-color;
                             chat-input <=> root.new-conversation-input;
                             focus-end-tick: root.nc-append;
                             cursor-len: root.nc-cursor-len;
@@ -650,20 +696,20 @@ export component MainWindow inherits Window {
                                             max-width: 480px;
                                             min-height: 40px;
                                             border-radius: 16px;
-                                            background: m.is-self ? root.md3-primary-container : root.md3-surface-container-high;
+                                            background: m.is-self ? root.md3-primary-container : #333333;
                                             VerticalLayout {
                                                 padding: 8px;
                                                 spacing: 2px;
                                                 if !m.is-self: Text {
                                                     text: m.sender + "  ·  " + m.created-at;
                                                     font-size: 11px;
-                                                    color: root.md3-on-surface-variant;
+                                                    color: #AAAAAA;
                                                     overflow: elide;
                                                 }
                                                 Text {
                                                     text: m.body;
                                                     wrap: word-wrap;
-                                                    color: m.is-self ? root.md3-on-primary-container : root.md3-on-surface;
+                                                    color: m.is-self ? root.md3-on-primary-container : #E8E8E8;
                                                 }
                                                 if m.is-self: Text {
                                                     text: "You  ·  " + m.created-at;
@@ -822,7 +868,7 @@ export component MainWindow inherits Window {
                     spacing: 8px;
                     Text {
                         text: "Connection: " + (root.ws-connected ? "live" : "reconnecting…");
-                        color: root.ws-connected ? root.md3-primary : root.md3-on-surface-variant;
+                        color: root.ws-connected ? #66BB6A : root.md3-on-surface-variant;
                         horizontal-alignment: center;
                     }
                 }
@@ -943,7 +989,7 @@ export component MainWindow inherits Window {
                     text: "Profile";
                     text-color: root.md3-on-surface;
                     item-background: transparent;
-                    item-hover-background: root.md3-surface-container-low;
+                    item-hover-background: root.md3-primary.with-alpha(0.16);
                     clicked => {
                         root.context-open = false;
                         root.context-profile();
@@ -953,7 +999,7 @@ export component MainWindow inherits Window {
                     text: root.context-blocked ? "Unblock" : "Block";
                     text-color: root.md3-on-surface;
                     item-background: transparent;
-                    item-hover-background: root.md3-surface-container-low;
+                    item-hover-background: root.md3-primary.with-alpha(0.16);
                     clicked => {
                         root.context-open = false;
                         root.toggle-block();
@@ -963,7 +1009,7 @@ export component MainWindow inherits Window {
                     text: root.context-muted ? "Unmute" : "Mute";
                     text-color: root.md3-on-surface;
                     item-background: transparent;
-                    item-hover-background: root.md3-surface-container-low;
+                    item-hover-background: root.md3-primary.with-alpha(0.16);
                     clicked => {
                         root.context-open = false;
                         root.toggle-mute();
@@ -973,7 +1019,7 @@ export component MainWindow inherits Window {
                     text: "Delete conversation";
                     text-color: root.md3-error;
                     item-background: transparent;
-                    item-hover-background: root.md3-surface-container-low;
+                    item-hover-background: root.md3-primary.with-alpha(0.16);
                     clicked => {
                         root.context-open = false;
                         root.context-delete();

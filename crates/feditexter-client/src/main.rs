@@ -1552,15 +1552,32 @@ fn main() -> Result<(), slint::PlatformError> {
                     .await;
                 let Some(handle) = file else { return };
                 let bytes = handle.read().await;
-                let ext = handle.path().extension().and_then(|e| e.to_str()).unwrap_or("png").to_lowercase();
-                let mime = match ext.as_str() {
-                    "jpg" | "jpeg" => "image/jpeg",
-                    "webp" => "image/webp",
-                    _ => "image/png",
+                let img = match image::load_from_memory(&bytes) {
+                    Ok(img) => img,
+                    Err(_) => {
+                        eprintln!("[error] unsupported image format");
+                        return;
+                    }
                 };
+                let max_dim = 256u32;
+                let img = if img.width() > max_dim || img.height() > max_dim {
+                    let scale = max_dim as f32 / img.width().max(img.height()) as f32;
+                    img.resize(
+                        ((img.width() as f32) * scale) as u32,
+                        ((img.height() as f32) * scale) as u32,
+                        image::imageops::FilterType::Lanczos3,
+                    )
+                } else {
+                    img
+                };
+                let mut out = std::io::Cursor::new(Vec::new());
+                if img.write_to(&mut out, image::ImageFormat::Png).is_err() {
+                    eprintln!("[error] failed to encode avatar");
+                    return;
+                }
                 use base64::Engine;
-                let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                let data_url = format!("data:{mime};base64,{data}");
+                let data = base64::engine::general_purpose::STANDARD.encode(out.into_inner());
+                let data_url = format!("data:image/png;base64,{data}");
                 let _ = tx.send(Event::UploadAvatar { server, token, data_url });
             });
         });

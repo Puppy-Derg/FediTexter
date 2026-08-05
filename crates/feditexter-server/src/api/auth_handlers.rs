@@ -214,10 +214,19 @@ pub async fn set_avatar(
     if avatar.len() > 2_000_000 {
         return Err(ApiError::BadRequest("avatar too large (max ~2MB)"));
     }
-    if !avatar.is_empty() && !avatar.starts_with("data:image/") {
+    let avatar_url: Option<String> = if avatar.is_empty() {
+        None
+    } else if avatar.starts_with("data:image/") {
+        // Store only a small 32x32 thumbnail. High-resolution originals are
+        // meant to be exchanged peer-to-peer between clients, so the server
+        // keeps just enough for list avatars.
+        match downscale_avatar(&avatar) {
+            Some(thumb) => Some(thumb),
+            None => return Err(ApiError::BadRequest("could not decode avatar image")),
+        }
+    } else {
         return Err(ApiError::BadRequest("avatar must be a data:image/... URL"));
-    }
-    let avatar_url: Option<String> = if avatar.is_empty() { None } else { Some(avatar) };
+    };
 
     sqlx::query("UPDATE users SET avatar_url = ? WHERE id = ?")
         .bind(&avatar_url)
@@ -235,6 +244,29 @@ pub async fn set_avatar(
     .map_err(|_| ApiError::Internal("db error"))?;
 
     Ok(Json(json!({ "user": user })))
+}
+
+/// Decode a `data:image/...;base64,...` avatar and re-encode it as a 32x32 PNG.
+fn downscale_avatar(data_url: &str) -> Option<String> {
+    let b64 = data_url.split_once(";base64,")?.1;
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?;
+    let max_dim = 32u32;
+    let img = if img.width() > max_dim || img.height() > max_dim {
+        let scale = max_dim as f32 / img.width().max(img.height()) as f32;
+        img.resize(
+            ((img.width() as f32) * scale) as u32,
+            ((img.height() as f32) * scale) as u32,
+            image::imageops::FilterType::Lanczos3,
+        )
+    } else {
+        img
+    };
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png).ok()?;
+    let data = base64::engine::general_purpose::STANDARD.encode(out.into_inner());
+    Some(format!("data:image/png;base64,{data}"))
 }
 
 async fn create_session(state: &AppState, user_id: u64) -> Result<String, ApiError> {
