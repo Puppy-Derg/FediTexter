@@ -4,10 +4,6 @@ use axum::{routing::get, Router};
 use sqlx::{MySqlPool, Pool, MySql};
 use tracing::info;
 
-async fn healthz() -> &'static str {
-    "ok"
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
