@@ -14,6 +14,10 @@ use crate::federation;
 pub struct CreateConversationRequest {
     pub user_id: Option<u64>,
     pub handle: Option<String>,
+    #[serde(default)]
+    pub member_ids: Vec<u64>,
+    #[serde(default)]
+    pub handles: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -75,6 +79,29 @@ pub(crate) async fn ensure_direct_conversation(
         .execute(&mut *tx)
         .await
         .map_err(|_| ApiError::Internal("db error"))?;
+    tx.commit().await.map_err(|_| ApiError::Internal("db error"))?;
+    Ok(conversation_id)
+}
+
+async fn create_group_conversation(state: &AppState, member_ids: &[u64]) -> Result<u64, ApiError> {
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?;
+    let inserted = sqlx::query("INSERT INTO conversations (kind) VALUES ('group')")
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?;
+    let conversation_id = inserted.last_insert_id();
+    for uid in member_ids {
+        sqlx::query("INSERT INTO conversation_members (conversation_id, user_id) VALUES (?, ?)")
+            .bind(conversation_id)
+            .bind(uid)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| ApiError::Internal("db error"))?;
+    }
     tx.commit().await.map_err(|_| ApiError::Internal("db error"))?;
     Ok(conversation_id)
 }
@@ -148,29 +175,51 @@ pub async fn create_conversation(
     auth: AuthUser,
     Json(body): Json<CreateConversationRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let other_id = match (body.user_id, body.handle) {
-        (Some(id), None) => id,
-        (None, Some(handle)) => resolve_handle(&state, &handle).await?,
-        (Some(_), Some(_)) => {
-            return Err(ApiError::BadRequest("provide either user_id or handle, not both"));
-        }
-        (None, None) => return Err(ApiError::BadRequest("provide user_id or handle")),
-    };
+    let mut ids: Vec<u64> = Vec::new();
 
-    if other_id == auth.user.id {
+    if let Some(id) = body.user_id {
+        ids.push(id);
+    }
+    if let Some(handle) = body.handle {
+        ids.push(resolve_handle(&state, &handle).await?);
+    }
+    for id in body.member_ids {
+        ids.push(id);
+    }
+    for handle in body.handles {
+        ids.push(resolve_handle(&state, &handle).await?);
+    }
+
+    if ids.is_empty() {
+        return Err(ApiError::BadRequest("provide user_id, handle, member_ids, or handles"));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    ids.retain(|id| seen.insert(*id));
+    let ids: Vec<u64> = ids.into_iter().filter(|id| *id != auth.user.id).collect();
+
+    if ids.is_empty() {
         return Err(ApiError::BadRequest("cannot start a conversation with yourself"));
     }
 
-    let exists: Option<(u64,)> = sqlx::query_as("SELECT id FROM users WHERE id = ?")
-        .bind(other_id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|_| ApiError::Internal("db error"))?;
-    if exists.is_none() {
-        return Err(ApiError::NotFound("user not found"));
+    for id in &ids {
+        let exists: Option<(u64,)> = sqlx::query_as("SELECT id FROM users WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| ApiError::Internal("db error"))?;
+        if exists.is_none() {
+            return Err(ApiError::NotFound("user not found"));
+        }
     }
 
-    let conversation_id = ensure_direct_conversation(&state, auth.user.id, other_id).await?;
+    let conversation_id = if ids.len() == 1 {
+        ensure_direct_conversation(&state, auth.user.id, ids[0]).await?
+    } else {
+        let mut members = vec![auth.user.id];
+        members.extend(ids);
+        create_group_conversation(&state, &members).await?
+    };
 
     Ok((StatusCode::CREATED, Json(conversation_json(&state, conversation_id).await?)))
 }

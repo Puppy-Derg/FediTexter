@@ -5,7 +5,7 @@ edition = "2024"
 build = "build.rs"
 
 [dependencies]
-slint = { version = "1.15", features = ["backend-winit", "renderer-femtovg", "std"] }
+slint = { version = "1.15", features = ["backend-winit", "renderer-femtovg", "std", "unstable-winit-030"] }
 i-slint-backend-winit = "=1.17.1"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

@@ -6,6 +6,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel, Weak};
+use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -342,21 +343,14 @@ impl Backend {
         });
     }
 
-    fn create_conversation(&self, server: &str, token: &str, user_id: Option<u64>, handle: Option<String>) {
+    fn create_conversation(&self, server: &str, token: &str, member_ids: Vec<u64>, handles: Vec<String>) {
         let tx = self.tx.clone();
         let http = self.http.clone();
         let server = server.to_string();
         let token = token.to_string();
-        let handle = handle.clone();
         self.runtime.spawn(async move {
             let url = api_url(&server, "/api/conversations");
-            let mut body = json!({});
-            if let Some(id) = user_id {
-                body["user_id"] = json!(id);
-            }
-            if let Some(h) = handle {
-                body["handle"] = json!(h);
-            }
+            let body = json!({ "member_ids": member_ids, "handles": handles });
             let resp = match http.post(&url).bearer_auth(&token).json(&body).send().await {
                 Ok(r) => r,
                 Err(e) => {
@@ -810,6 +804,23 @@ fn conversation_target(input: &str) -> Result<(Option<u64>, Option<String>), Str
     Err("enter a numeric user id, @handle, or profile URL".into())
 }
 
+/// Parse a comma/whitespace separated list of targets into user ids and handles.
+fn parse_targets(input: &str) -> Result<(Vec<u64>, Vec<String>), String> {
+    let mut ids = Vec::new();
+    let mut handles = Vec::new();
+    for token in input.split([',', ' ', '\t', '\n']).map(str::trim).filter(|s| !s.is_empty()) {
+        match conversation_target(token) {
+            Ok((Some(id), None)) => ids.push(id),
+            Ok((None, Some(h))) => handles.push(h),
+            _ => return Err(format!("could not understand '{token}'")),
+        }
+    }
+    if ids.is_empty() && handles.is_empty() {
+        return Err("enter at least one user id, @handle, or profile URL".into());
+    }
+    Ok((ids, handles))
+}
+
 fn set_error(sh: &Shared, msg: &str) {
     eprintln!("[error] {msg}");
     sh.ui().set_error_message(msg.into());
@@ -1088,7 +1099,6 @@ fn handle_event(sh: &Shared, ev: Event) {
             refresh_conversations_ui(sh);
             let ui = sh.ui();
             ui.set_selected_conversation(c.id as i32);
-            ui.set_new_conversation_open(false);
             ui.set_new_conversation_input(SharedString::default());
             ui.set_error_message(SharedString::default());
             sh.messages.borrow_mut().clear();
@@ -1174,6 +1184,7 @@ fn logout(sh: &Shared) {
     ui.set_context_open(false);
     ui.set_confirm_delete_open(false);
     ui.set_confirm_delete_conversation_id(-1);
+    ui.set_new_conversation_input(SharedString::default());
 }
 
 // ---------------------------------------------------------------------------
@@ -1232,6 +1243,45 @@ fn main() -> Result<(), slint::PlatformError> {
 
     {
         let sh = shared.clone();
+        let mut mods = winit::keyboard::ModifiersState::default();
+        ui.window().on_winit_window_event(move |_window, event| {
+            match event {
+                winit::event::WindowEvent::ModifiersChanged(m) => {
+                    mods = m.state();
+                    EventResult::Propagate
+                }
+                winit::event::WindowEvent::KeyboardInput { event: key, .. } => {
+                    if key.state == winit::event::ElementState::Pressed && (mods.control_key() || mods.super_key()) {
+                        use winit::keyboard::{KeyCode, PhysicalKey};
+                        let code = match key.physical_key {
+                            PhysicalKey::Code(c) => Some(c),
+                            _ => None,
+                        };
+                        let zoom_in = matches!(code, Some(KeyCode::Equal) | Some(KeyCode::NumpadAdd) | Some(KeyCode::NumpadEqual));
+                        let zoom_out = matches!(code, Some(KeyCode::Minus) | Some(KeyCode::NumpadSubtract));
+                        let zoom_reset = matches!(code, Some(KeyCode::Digit0) | Some(KeyCode::Numpad0));
+                        if zoom_in || zoom_out || zoom_reset {
+                            let current = sh.ui().get_ui_scale();
+                            let next = if zoom_reset {
+                                1.0
+                            } else if zoom_in {
+                                (current + 0.1).min(1.8)
+                            } else {
+                                (current - 0.1).max(0.5)
+                            };
+                            sh.ui().set_ui_scale(next);
+                            return EventResult::PreventDefault;
+                        }
+                    }
+                    EventResult::Propagate
+                }
+                _ => EventResult::Propagate,
+            }
+        });
+    }
+
+    {
+        let sh = shared.clone();
         let server_tx = server_tx.clone();
         ui.on_login(move |email, password| {
             let _ = server_tx.send(sh.server());
@@ -1283,10 +1333,10 @@ fn main() -> Result<(), slint::PlatformError> {
                 None => return,
             };
             let input = input.trim().to_string();
-            match conversation_target(&input) {
-                Ok((user_id, handle)) => {
+            match parse_targets(&input) {
+                Ok((ids, handles)) => {
                     set_error(&sh, "");
-                    sh.backend.create_conversation(&sh.server(), &token, user_id, handle);
+                    sh.backend.create_conversation(&sh.server(), &token, ids, handles);
                 }
                 Err(msg) => set_error(&sh, &msg),
             }
@@ -1330,7 +1380,7 @@ fn main() -> Result<(), slint::PlatformError> {
             match handle {
                 Some(h) => {
                     set_error(&sh, "");
-                    sh.backend.create_conversation(&sh.server(), &token, None, Some(h));
+                    sh.backend.create_conversation(&sh.server(), &token, Vec::new(), vec![h]);
                 }
                 None => set_error(&sh, "contact not found"),
             }
@@ -1439,6 +1489,32 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
+    {
+        let sh = shared.clone();
+        ui.on_open_chat(move |user_id| {
+            if user_id < 0 {
+                return;
+            }
+            let existing = sh
+                .conversations
+                .borrow()
+                .iter()
+                .find(|c| c.kind != "group" && c.members.iter().any(|m| m.id == user_id as u64))
+                .map(|c| c.id);
+            let ui = sh.ui();
+            ui.set_profile_open(false);
+            if let Some(cid) = existing {
+                sh.selected.replace(cid as i32);
+                ui.set_selected_conversation(cid as i32);
+                if let Some(token) = sh.token.borrow().clone() {
+                    sh.backend.refresh_messages(&sh.server(), &token, cid);
+                }
+            } else if let Some(token) = sh.token.borrow().clone() {
+                sh.backend.create_conversation(&sh.server(), &token, vec![user_id as u64], Vec::new());
+            }
+        });
+    }
+
     let drain = shared.clone();
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(50), move || {
@@ -1452,7 +1528,7 @@ fn main() -> Result<(), slint::PlatformError> {
         for ev in events {
             handle_event(&drain, ev);
         }
-        if drain.ui().get_new_conversation_open() {
+        if drain.ui().get_logged_in() && drain.ui().get_selected_conversation() < 0 {
             refresh_suggestions(&drain);
         }
     });
