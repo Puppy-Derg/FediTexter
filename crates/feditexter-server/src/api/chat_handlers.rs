@@ -23,6 +23,12 @@ pub struct CreateConversationRequest {
 #[derive(Deserialize)]
 pub struct SendMessageRequest {
     pub body: String,
+    #[serde(default)]
+    pub attachment_mime: Option<String>,
+    #[serde(default)]
+    pub attachment_name: Option<String>,
+    #[serde(default)]
+    pub attachment_data: Option<String>,
 }
 
 async fn is_member(state: &AppState, conversation_id: u64, user_id: u64) -> Result<bool, ApiError> {
@@ -253,7 +259,7 @@ pub async fn list_messages(
     }
 
     let messages: Vec<Message> = sqlx::query_as(
-        "SELECT id, conversation_id, sender_id, body, created_at
+        "SELECT id, conversation_id, sender_id, body, created_at, attachment_mime, attachment_name, attachment_data
          FROM messages WHERE conversation_id = ? ORDER BY id ASC",
     )
     .bind(conversation_id)
@@ -273,28 +279,44 @@ pub async fn send_message(
     if !is_member(&state, conversation_id, auth.user.id).await? {
         return Err(ApiError::NotFound("conversation not found"));
     }
-    if body.body.trim().is_empty() {
+    let has_attachment = body.attachment_data.is_some();
+    if body.body.trim().is_empty() && !has_attachment {
         return Err(ApiError::BadRequest("message body cannot be empty"));
     }
     if body.body.len() > 2000 {
         return Err(ApiError::BadRequest("message body too long (max 2000)"));
     }
+    if let Some(data) = &body.attachment_data {
+        if data.len() > 6_000_000 {
+            return Err(ApiError::BadRequest("attachment too large (max ~6MB)"));
+        }
+        if !data.starts_with("data:") {
+            return Err(ApiError::BadRequest("attachment must be a data: URL"));
+        }
+        if body.attachment_mime.is_none() {
+            return Err(ApiError::BadRequest("attachment requires a mime type"));
+        }
+    }
 
     let created_at = chrono::Utc::now().naive_utc();
     let inserted = sqlx::query(
-        "INSERT INTO messages (conversation_id, sender_id, body, created_at) VALUES (?, ?, ?, ?)",
+        "INSERT INTO messages (conversation_id, sender_id, body, created_at, attachment_mime, attachment_name, attachment_data)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(conversation_id)
     .bind(auth.user.id)
     .bind(&body.body)
     .bind(created_at)
+    .bind(&body.attachment_mime)
+    .bind(&body.attachment_name)
+    .bind(&body.attachment_data)
     .execute(&state.pool)
     .await
     .map_err(|_| ApiError::Internal("db error"))?;
     let inserted_id = inserted.last_insert_id();
 
     let message: Message = sqlx::query_as(
-        "SELECT id, conversation_id, sender_id, body, created_at FROM messages WHERE id = ?",
+        "SELECT id, conversation_id, sender_id, body, created_at, attachment_mime, attachment_name, attachment_data FROM messages WHERE id = ?",
     )
     .bind(inserted_id)
     .fetch_one(&state.pool)

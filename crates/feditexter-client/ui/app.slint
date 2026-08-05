@@ -20,6 +20,9 @@ export struct UiMessage {
     avatar-text: string,
     avatar-color: color,
     avatar-image: image,
+    attachment-image: image,
+    attachment-name: string,
+    attachment-mime: string,
 }
 
 export struct UiContact {
@@ -390,6 +393,8 @@ export component MainWindow inherits Window {
     in-out property<int> nc-cursor-len: 0;
     in-out property<int> msg-scroll-tick: 0;
     in-out property<bool> msg-at-bottom: false;
+    in-out property<string> pending-attach-name: "";
+    in-out property<image> pending-attach-image;
     in property <image> my-avatar;
 
     callback login(email: string, password: string);
@@ -402,6 +407,8 @@ export component MainWindow inherits Window {
     callback settings-saved();
     callback settings-choose-avatar();
     callback settings-remove-avatar();
+    callback choose-attachment();
+    callback clear-attachment();
     callback suggestion-selected(id: int);
     callback request-profile(user-id: int);
     callback request-context(user-id: int, conversation-id: int, x: length, y: length);
@@ -867,6 +874,27 @@ export component MainWindow inherits Window {
                                                     color: #AAAAAA;
                                                     overflow: elide;
                                                 }
+                                                if m.attachment-image.width > 0: Rectangle {
+                                                    width: 260px;
+                                                    height: 200px;
+                                                    border-radius: 12px;
+                                                    clip: true;
+                                                    background: #00000033;
+                                                    Image {
+                                                        width: 100%;
+                                                        height: 100%;
+                                                        source: m.attachment-image;
+                                                        image-fit: cover;
+                                                    }
+                                                }
+                                                if m.attachment-name != "" && !(m.attachment-image.width > 0): HorizontalLayout {
+                                                    spacing: 6px;
+                                                    Text {
+                                                        text: "📎 " + m.attachment-name;
+                                                        color: m.is-self ? root.md3-on-primary-container : #E8E8E8;
+                                                        overflow: elide;
+                                                    }
+                                                }
                                                 Text {
                                                     text: m.body;
                                                     wrap: word-wrap;
@@ -886,55 +914,98 @@ export component MainWindow inherits Window {
                                     }
                                     }
                                 }
-                                HorizontalLayout {
-                                    spacing: 8px;
-                                    composer := Rectangle {
-                                        horizontal-stretch: 1;
-                                        height: max(48px, min(input.preferred-height + 20px, 160px));
-                                        border-width: 1px;
+                                VerticalLayout {
+                                    spacing: 6px;
+                                    if root.pending-attach-name != "": Rectangle {
+                                        height: 56px;
                                         border-radius: 8px;
-                                        border-color: input.has-focus ? root.md3-primary : root.md3-outline;
-                                        background: root.md3-surface;
-                                        input := TextInput {
-                                            x: 10px;
-                                            y: 10px;
-                                            width: parent.width - 20px;
-                                            height: parent.height - 20px;
-                                            text <=> root.draft;
-                                            wrap: word-wrap;
-                                            single-line: false;
-                                            color: root.md3-on-surface;
-                                            font-size: 16px;
-                                            key-pressed(event) => {
-                                                if (event.text == Key.Return && !event.modifiers.shift) {
-                                                    root.send-message(root.draft);
-                                                    root.draft = "";
-                                                    return accept;
+                                        background: root.md3-surface-container-low;
+                                        HorizontalLayout {
+                                            padding-left: 8px;
+                                            padding-right: 8px;
+                                            spacing: 8px;
+                                            if root.pending-attach-image.width > 0: Rectangle {
+                                                width: 44px;
+                                                height: 44px;
+                                                border-radius: 6px;
+                                                clip: true;
+                                                Image {
+                                                    width: 100%;
+                                                    height: 100%;
+                                                    source: root.pending-attach-image;
+                                                    image-fit: cover;
                                                 }
-                                                reject
+                                            }
+                                            VerticalLayout { vertical-stretch: 1; alignment: center;
+                                                Text { text: root.pending-attach-name; color: root.md3-on-surface; overflow: elide; }
+                                            }
+                                            Rectangle { height: 100%; }
+                                            VerticalLayout { vertical-stretch: 1; alignment: center;
+                                                CloseButton {
+                                                    text-color: root.md3-on-surface;
+                                                    clicked => { root.clear-attachment(); }
+                                                }
                                             }
                                         }
-                                        Text {
-                                            x: 12px;
-                                            y: 12px;
-                                            text: root.draft == "" ? "Type a message…" : "";
-                                            color: root.md3-outline;
-                                            font-size: 16px;
-                                        }
                                     }
-                                    VerticalLayout { vertical-stretch: 1; alignment: end;
-                                        Button {
-                                            text: "Send";
-                                            primary: true;
-                                            accent: root.accent-color;
-                                            on-accent: root.md3-on-primary;
-                                            height: composer.height;
-                                            enabled: root.draft != "";
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        VerticalLayout { vertical-stretch: 1; alignment: end;
+                                            Button {
+                                                text: "📎";
+                                                width: 40px;
+                                                height: composer.height;
+                                                clicked => { root.choose-attachment(); }
+                                            }
+                                        }
+                                        composer := Rectangle {
+                                            horizontal-stretch: 1;
+                                            height: max(48px, min(input.preferred-height + 20px, 160px));
+                                            border-width: 1px;
+                                            border-radius: 8px;
+                                            border-color: input.has-focus ? root.md3-primary : root.md3-outline;
+                                            background: root.md3-surface;
+                                            input := TextInput {
+                                                x: 10px;
+                                                y: 10px;
+                                                width: parent.width - 20px;
+                                                height: parent.height - 20px;
+                                                text <=> root.draft;
+                                                wrap: word-wrap;
+                                                single-line: false;
+                                                color: root.md3-on-surface;
+                                                font-size: 16px;
+                                                key-pressed(event) => {
+                                                    if (event.text == Key.Return && !event.modifiers.shift) {
+                                                        root.send-message(root.draft);
+                                                        root.draft = "";
+                                                        return accept;
+                                                    }
+                                                    reject
+                                                }
+                                            }
+                                            Text {
+                                                x: 12px;
+                                                y: 12px;
+                                                text: root.draft == "" ? "Type a message…" : "";
+                                                color: root.md3-outline;
+                                                font-size: 16px;
+                                            }
+                                        }
+                                        VerticalLayout { vertical-stretch: 1; alignment: end;
+                                            Button {
+                                                text: "Send";
+                                                primary: true;
+                                                accent: root.accent-color;
+                                                on-accent: root.md3-on-primary;
+                                                height: composer.height;
+                                                enabled: root.draft != "" || root.pending-attach-name != "";
                                             clicked => {
                                                 root.send-message(root.draft);
                                                 root.draft = "";
                                             }
                                         }
+                                    }
                                     }
                                 }
                             }

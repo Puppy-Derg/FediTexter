@@ -119,7 +119,7 @@ pub async fn inbox(
         .map_err(|_| ApiError::Internal("db error"))?;
 
     let message: Message = sqlx::query_as(
-        "SELECT id, conversation_id, sender_id, body, created_at FROM messages WHERE id = ?",
+        "SELECT id, conversation_id, sender_id, body, created_at, attachment_mime, attachment_name, attachment_data FROM messages WHERE id = ?",
     )
     .bind(inserted.last_insert_id())
     .fetch_one(&state.pool)

@@ -77,6 +77,25 @@ pub async fn register(
     };
 
     let token = create_session(&state, user_id).await?;
+
+    if state.verify_emails {
+        if let Some(code) = &verification_code {
+            match &state.mailer {
+                Some(mailer) => {
+                    if let Err(e) = mailer.send_verification_code(&user.email, code).await {
+                        tracing::warn!("failed to send verification email to {}: {e}", user.email);
+                        // Log the code so it can still be recovered in an outage.
+                        tracing::warn!("verification code for {} is {code}", user.email);
+                    }
+                }
+                None => {
+                    // No SMTP configured: log the code so it can be used manually.
+                    tracing::warn!("no SMTP configured; verification code for {} is {code}", user.email);
+                }
+            }
+        }
+    }
+
     Ok((StatusCode::CREATED, Json(json!({ "token": token, "user": user }))))
 }
 

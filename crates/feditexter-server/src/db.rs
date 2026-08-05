@@ -2,6 +2,7 @@ use sqlx::MySqlPool;
 
 use crate::chat::ChatHub;
 use crate::federation::Federation;
+use crate::mail::Mailer;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -11,4 +12,6 @@ pub struct AppState {
     /// When true, new accounts require email verification; otherwise accounts
     /// are auto-verified (dev mode).
     pub verify_emails: bool,
+    /// SMTP mailer, present when SMTP is configured.
+    pub mailer: Option<Mailer>,
 }

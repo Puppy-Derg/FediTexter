@@ -69,6 +69,12 @@ struct Message {
     sender_id: u64,
     body: String,
     created_at: String,
+    #[serde(default)]
+    attachment_mime: Option<String>,
+    #[serde(default)]
+    attachment_name: Option<String>,
+    #[serde(default)]
+    attachment_data: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -104,6 +110,14 @@ struct Contact {
     handle: String,
 }
 
+/// A pending (or sent) file attachment carried with a message.
+#[derive(Clone)]
+struct Attachment {
+    mime: String,
+    name: String,
+    data: String,
+}
+
 // ---------------------------------------------------------------------------
 // Events flowing from background tasks to the UI
 // ---------------------------------------------------------------------------
@@ -125,6 +139,7 @@ enum Event {
     ProfileError,
     ConversationDeleted(u64),
     UploadAvatar { server: String, token: String, data_url: String },
+    AttachmentPicked(Attachment),
     Error(String),
 }
 
@@ -417,20 +432,27 @@ impl Backend {
         });
     }
 
-    fn send_message(&self, server: &str, token: &str, conversation_id: u64, body: String) {
+    fn send_message(
+        &self,
+        server: &str,
+        token: &str,
+        conversation_id: u64,
+        body: String,
+        attachment: Option<Attachment>,
+    ) {
         let tx = self.tx.clone();
         let http = self.http.clone();
         let server = server.to_string();
         let token = token.to_string();
         self.runtime.spawn(async move {
             let url = api_url(&server, &format!("/api/conversations/{conversation_id}/messages"));
-            let resp = match http
-                .post(&url)
-                .bearer_auth(&token)
-                .json(&json!({ "body": body }))
-                .send()
-                .await
-            {
+            let mut payload = json!({ "body": body });
+            if let Some(att) = attachment {
+                payload["attachment_mime"] = json!(att.mime);
+                payload["attachment_name"] = json!(att.name);
+                payload["attachment_data"] = json!(att.data);
+            }
+            let resp = match http.post(&url).bearer_auth(&token).json(&payload).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx.send(Event::Error(format!("{e}")));
@@ -686,6 +708,25 @@ fn accent_to_hex(c: slint::Color) -> String {
     format!("#{:02X}{:02X}{:02X}", c.red(), c.green(), c.blue())
 }
 
+fn mime_from_path(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "pdf" => "application/pdf",
+        "txt" | "md" => "text/plain",
+        "zip" => "application/zip",
+        "json" => "application/json",
+        _ => "application/octet-stream",
+    }
+}
+
 fn ws_url(server: &str) -> String {
     let base = server.trim_end_matches('/');
     if let Some(rest) = base.strip_prefix("https://") {
@@ -810,6 +851,7 @@ struct Shared {
     hidden: Rc<RefCell<Vec<u64>>>,
     unread: Rc<RefCell<std::collections::HashMap<u64, u32>>>,
     avatar_cache: Rc<RefCell<std::collections::HashMap<u64, slint::Image>>>,
+    pending_attach: Rc<RefCell<Option<Attachment>>>,
 }
 
 impl Shared {
@@ -1189,6 +1231,13 @@ fn refresh_messages_ui(sh: &Shared) {
                 .find(|x| x.id == m.sender_id)
                 .and_then(|x| x.avatar_url.clone());
             let local_time = format_local_time(&m.created_at);
+            let attachment_image = if m.attachment_data.is_some()
+                && m.attachment_mime.as_deref().unwrap_or("").starts_with("image/")
+            {
+                m.attachment_data.as_deref().and_then(load_avatar_image).unwrap_or_default()
+            } else {
+                slint::Image::default()
+            };
             UiMessage {
                 id: m.id as i32,
                 sender: sender.into(),
@@ -1199,6 +1248,9 @@ fn refresh_messages_ui(sh: &Shared) {
                 avatar_text: initials(&avatar_name).into(),
                 avatar_color: avatar_color(&avatar_name),
                 avatar_image: avatar_image_for(sh, m.sender_id, &sender_avatar_url),
+                attachment_image,
+                attachment_name: m.attachment_name.clone().unwrap_or_default().into(),
+                attachment_mime: m.attachment_mime.clone().unwrap_or_default().into(),
             }
         })
         .collect();
@@ -1366,6 +1418,18 @@ fn handle_event(sh: &Shared, ev: Event) {
         Event::UploadAvatar { server, token, data_url } => {
             sh.backend.set_avatar(&server, &token, data_url);
         }
+        Event::AttachmentPicked(att) => {
+            let ui = sh.ui();
+            ui.set_pending_attach_name(att.name.clone().into());
+            if att.mime.starts_with("image/") {
+                ui.set_pending_attach_image(
+                    load_avatar_image(&att.data).unwrap_or_default(),
+                );
+            } else {
+                ui.set_pending_attach_image(slint::Image::default());
+            }
+            *sh.pending_attach.borrow_mut() = Some(att);
+        }
         Event::Error(m) => set_error(sh, &m),
     }
 }
@@ -1456,6 +1520,7 @@ fn main() -> Result<(), slint::PlatformError> {
         hidden: Rc::new(RefCell::new(Vec::new())),
         unread: Rc::new(RefCell::new(std::collections::HashMap::new())),
         avatar_cache: Rc::new(RefCell::new(std::collections::HashMap::new())),
+        pending_attach: Rc::new(RefCell::new(None)),
     });
 
     {
@@ -1538,8 +1603,15 @@ fn main() -> Result<(), slint::PlatformError> {
                 let conv = sh.selected.get();
                 if conv >= 0 {
                     let body = body.trim().to_string();
-                    if !body.is_empty() {
-                        sh.backend.send_message(&sh.server(), &token, conv as u64, body);
+                    let attachment = sh.pending_attach.borrow_mut().take();
+                    let has_attach = attachment.is_some();
+                    if !body.is_empty() || has_attach {
+                        sh.backend.send_message(&sh.server(), &token, conv as u64, body, attachment);
+                    }
+                    if has_attach {
+                        let ui = sh.ui();
+                        ui.set_pending_attach_name(SharedString::default());
+                        ui.set_pending_attach_image(slint::Image::default());
                     }
                 }
             }
@@ -1641,6 +1713,35 @@ fn main() -> Result<(), slint::PlatformError> {
             if let Some(token) = sh.token.borrow().clone() {
                 sh.backend.set_avatar(&sh.server(), &token, String::new());
             }
+        });
+    }
+    {
+        let sh = shared.clone();
+        ui.on_choose_attachment(move || {
+            let tx = sh.backend.tx.clone();
+            sh.backend.runtime.spawn(async move {
+                let file = rfd::AsyncFileDialog::new().pick_file().await;
+                let Some(handle) = file else { return };
+                let bytes = handle.read().await;
+                let name = handle.file_name();
+                let mime = mime_from_path(handle.path()).to_string();
+                use base64::Engine;
+                let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let _ = tx.send(Event::AttachmentPicked(Attachment {
+                    mime: mime.clone(),
+                    name,
+                    data: format!("data:{mime};base64,{data}"),
+                }));
+            });
+        });
+    }
+    {
+        let sh = shared.clone();
+        ui.on_clear_attachment(move || {
+            *sh.pending_attach.borrow_mut() = None;
+            let ui = sh.ui();
+            ui.set_pending_attach_name(SharedString::default());
+            ui.set_pending_attach_image(slint::Image::default());
         });
     }
     {

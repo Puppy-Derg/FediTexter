@@ -3,6 +3,7 @@ pub mod auth;
 pub mod chat;
 pub mod db;
 pub mod federation;
+pub mod mail;
 
 use axum::routing::{delete, get, post};
 use axum::Router;

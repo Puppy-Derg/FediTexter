@@ -9,6 +9,12 @@ pub struct Message {
     pub sender_id: u64,
     pub body: String,
     pub created_at: chrono::NaiveDateTime,
+    #[serde(default)]
+    pub attachment_mime: Option<String>,
+    #[serde(default)]
+    pub attachment_name: Option<String>,
+    #[serde(default)]
+    pub attachment_data: Option<String>,
 }
 
 #[derive(FromRow, Debug, Clone)]

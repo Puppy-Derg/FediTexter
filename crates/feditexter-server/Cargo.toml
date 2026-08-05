@@ -1,6 +1,6 @@
 [package]
 name = "feditexter-server"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 
 [dependencies]
@@ -21,6 +21,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 base64 = "0.22"
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "pool", "tokio1", "tokio1-native-tls"] }
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

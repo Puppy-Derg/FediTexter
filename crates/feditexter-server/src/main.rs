@@ -13,6 +13,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
     let public_domain = env::var("PUBLIC_DOMAIN").unwrap_or_else(|_| "localhost".to_string());
     let verify_emails = env::var("REQUIRE_EMAIL_VERIFICATION").map(|v| v == "1").unwrap_or(false);
+    let mailer = if verify_emails {
+        let m = feditexter_server::mail::Mailer::from_env();
+        if m.is_none() {
+            info!("email verification enabled but SMTP not configured — codes will be logged to the server output");
+        }
+        m
+    } else {
+        None
+    };
 
     let pool = MySqlPool::connect(&database_url).await?;
     sqlx::migrate!("../../migrations").run(&pool).await?;
@@ -26,6 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hub: Default::default(),
         federation,
         verify_emails,
+        mailer,
     });
 
     let addr = format!("{bind_addr}:{port}");
