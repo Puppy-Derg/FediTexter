@@ -280,12 +280,14 @@ pub async fn send_message(
         return Err(ApiError::BadRequest("message body too long (max 2000)"));
     }
 
+    let created_at = chrono::Utc::now().naive_utc();
     let inserted = sqlx::query(
-        "INSERT INTO messages (conversation_id, sender_id, body) VALUES (?, ?, ?)",
+        "INSERT INTO messages (conversation_id, sender_id, body, created_at) VALUES (?, ?, ?, ?)",
     )
     .bind(conversation_id)
     .bind(auth.user.id)
     .bind(&body.body)
+    .bind(created_at)
     .execute(&state.pool)
     .await
     .map_err(|_| ApiError::Internal("db error"))?;

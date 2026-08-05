@@ -6,6 +6,7 @@ export struct UiConversation {
     avatar-text: string,
     avatar-color: color,
     avatar-image: image,
+    unread: bool,
     other-user-id: int,
 }
 
@@ -599,6 +600,14 @@ export component MainWindow inherits Window {
                                             width: 32px;
                                             height: 32px;
                                             Avatar { avatar-text: c.avatar-text; avatar-color: c.avatar-color; avatar-image: c.avatar-image; size: 32px; }
+                                            if c.unread: Rectangle {
+                                                x: parent.width - 11px;
+                                                y: -1px;
+                                                width: 12px;
+                                                height: 12px;
+                                                border-radius: 6px;
+                                                background: #E53935;
+                                            }
                                             TouchArea {
                                                 width: 100%;
                                                 height: 100%;
@@ -623,11 +632,12 @@ export component MainWindow inherits Window {
                                         }
                                     }
                                     Rectangle { height: 100%; }
-                                    VerticalLayout { vertical-stretch: 1; alignment: center;
+                                    if root.selected-conversation == c.id: VerticalLayout { vertical-stretch: 1; alignment: center;
                                         CloseButton {
-                                            text-color: root.selected-conversation == c.id ? root.md3-on-secondary-container : root.md3-on-surface-variant;
+                                            text-color: root.md3-on-secondary-container;
                                             clicked => {
-                                                root.selected-conversation = -1;
+                                                root.context-conversation-id = c.id;
+                                                root.context-delete();
                                             }
                                         }
                                     }

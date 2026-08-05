@@ -108,10 +108,12 @@ pub async fn inbox(
 
     let conversation_id = crate::api::chat_handlers::ensure_direct_conversation(&state, sender_id, recipient_id).await?;
 
-    let inserted = sqlx::query("INSERT INTO messages (conversation_id, sender_id, body) VALUES (?, ?, ?)")
+    let created_at = chrono::Utc::now().naive_utc();
+    let inserted = sqlx::query("INSERT INTO messages (conversation_id, sender_id, body, created_at) VALUES (?, ?, ?, ?)")
         .bind(conversation_id)
         .bind(sender_id)
         .bind(&payload.body)
+        .bind(created_at)
         .execute(&state.pool)
         .await
         .map_err(|_| ApiError::Internal("db error"))?;

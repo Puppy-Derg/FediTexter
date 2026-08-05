@@ -808,6 +808,7 @@ struct Shared {
     selected: Rc<Cell<i32>>,
     contacts: Rc<RefCell<Vec<Contact>>>,
     hidden: Rc<RefCell<Vec<u64>>>,
+    unread: Rc<RefCell<std::collections::HashMap<u64, u32>>>,
     avatar_cache: Rc<RefCell<std::collections::HashMap<u64, slint::Image>>>,
 }
 
@@ -1017,6 +1018,25 @@ fn sender_name(members: &[Member], sender_id: u64, self_id: Option<u64>) -> Stri
     format!("user {sender_id}")
 }
 
+/// Convert a server UTC timestamp into local time. Shows HH:MM for today,
+/// and date + time otherwise.
+fn format_local_time(created_at: &str) -> String {
+    let naive = chrono::NaiveDateTime::parse_from_str(created_at, "%Y-%m-%dT%H:%M:%S")
+        .ok()
+        .or_else(|| chrono::NaiveDateTime::parse_from_str(created_at, "%Y-%m-%d %H:%M:%S").ok());
+    let Some(naive) = naive else {
+        return created_at.to_string();
+    };
+    let utc = chrono::TimeZone::from_utc_datetime(&chrono::Utc, &naive);
+    let local = utc.with_timezone(&chrono::Local);
+    let now = chrono::Local::now();
+    if local.date_naive() == now.date_naive() {
+        local.format("%H:%M").to_string()
+    } else {
+        local.format("%d %b %H:%M").to_string()
+    }
+}
+
 fn refresh_conversations_ui(sh: &Shared) {
     let self_id = sh.self_id.get();
     let hidden = sh.hidden.borrow().clone();
@@ -1063,6 +1083,7 @@ fn refresh_conversations_ui(sh: &Shared) {
                 avatar_text: initials(&title).into(),
                 avatar_color: avatar_color(&title),
                 avatar_image: avatar_image_for(sh, other_id, &avatar_url),
+                unread: sh.unread.borrow().get(&c.id).copied().unwrap_or(0) > 0,
                 other_user_id: c
                     .members
                     .iter()
@@ -1153,11 +1174,12 @@ fn refresh_messages_ui(sh: &Shared) {
                 .iter()
                 .find(|x| x.id == m.sender_id)
                 .and_then(|x| x.avatar_url.clone());
+            let local_time = format_local_time(&m.created_at);
             UiMessage {
                 id: m.id as i32,
                 sender: sender.into(),
                 body: m.body.clone().into(),
-                created_at: m.created_at.clone().into(),
+                created_at: local_time.into(),
                 is_self: self_id == Some(m.sender_id),
                 sender_id: m.sender_id as i32,
                 avatar_text: initials(&avatar_name).into(),
@@ -1281,7 +1303,14 @@ fn handle_event(sh: &Shared, ev: Event) {
             if !known {
                 sh.backend.refresh_conversations(&sh.server(), &sh.token.borrow().clone().unwrap_or_default());
             }
-            merge_message(sh, m);
+            merge_message(sh, m.clone());
+            let selected = sh.selected.get();
+            if selected == m.conversation_id as i32 {
+                sh.unread.borrow_mut().remove(&m.conversation_id);
+            } else if sh.self_id.get() != Some(m.sender_id) {
+                *sh.unread.borrow_mut().entry(m.conversation_id).or_insert(0) += 1;
+                refresh_conversations_ui(sh);
+            }
             refresh_messages_ui(sh);
         }
         Event::WsStatus(b) => {
@@ -1405,6 +1434,7 @@ fn main() -> Result<(), slint::PlatformError> {
         selected: Rc::new(Cell::new(-1)),
         contacts: Rc::new(RefCell::new(Vec::new())),
         hidden: Rc::new(RefCell::new(Vec::new())),
+        unread: Rc::new(RefCell::new(std::collections::HashMap::new())),
         avatar_cache: Rc::new(RefCell::new(std::collections::HashMap::new())),
     });
 
@@ -1472,6 +1502,8 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.on_select_conversation(move |id| {
             sh.selected.replace(id);
             if id >= 0 {
+                sh.unread.borrow_mut().remove(&(id as u64));
+                refresh_conversations_ui(&sh);
                 if let Some(token) = sh.token.borrow().clone() {
                     sh.backend.refresh_messages(&sh.server(), &token, id as u64);
                 }
@@ -1742,6 +1774,8 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_profile_open(false);
             if let Some(cid) = existing {
                 sh.selected.replace(cid as i32);
+                sh.unread.borrow_mut().remove(&cid);
+                refresh_conversations_ui(&sh);
                 ui.set_selected_conversation(cid as i32);
                 if let Some(token) = sh.token.borrow().clone() {
                     sh.backend.refresh_messages(&sh.server(), &token, cid);

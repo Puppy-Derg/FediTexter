@@ -1652,6 +1652,7 @@ name = "feditexter-client"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "chrono",
  "futures-util",
  "i-slint-backend-winit",
  "image",
@@ -1683,7 +1684,7 @@ dependencies = [
 
 [[package]]
 name = "feditexter-server"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "argon2",
  "axum",
