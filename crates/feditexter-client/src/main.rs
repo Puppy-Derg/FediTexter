@@ -26,6 +26,8 @@ struct User {
     display_name: String,
     #[serde(default = "default_email_verified")]
     email_verified: bool,
+    #[serde(default)]
+    avatar_url: Option<String>,
 }
 
 fn default_email_verified() -> bool {
@@ -49,6 +51,8 @@ struct Member {
     display_name: String,
     #[serde(default)]
     domain: String,
+    #[serde(default)]
+    avatar_url: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -80,6 +84,8 @@ struct Profile {
     display_name: String,
     #[serde(default)]
     domain: String,
+    #[serde(default)]
+    avatar_url: Option<String>,
     #[serde(default)]
     is_self: bool,
     #[serde(default)]
@@ -118,6 +124,7 @@ enum Event {
     ModerationResult(Profile),
     ProfileError,
     ConversationDeleted(u64),
+    UploadAvatar { server: String, token: String, data_url: String },
     Error(String),
 }
 
@@ -254,6 +261,43 @@ impl Backend {
                 .patch(&url)
                 .bearer_auth(&token)
                 .json(&json!({ "display_name": display_name }))
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Event::Error(format!("{e}")));
+                    return;
+                }
+            };
+            if !resp.status().is_success() {
+                let _ = tx.send(Event::Error(error_message(resp).await));
+                return;
+            }
+            let v: Value = match resp.json().await {
+                Ok(v) => v,
+                Err(_) => {
+                    let _ = tx.send(Event::Error("malformed server response".into()));
+                    return;
+                }
+            };
+            if let Ok(u) = serde_json::from_value::<User>(v.get("user").cloned().unwrap_or(Value::Null)) {
+                let _ = tx.send(Event::UserUpdated(u));
+            }
+        });
+    }
+
+    fn set_avatar(&self, server: &str, token: &str, data_url: String) {
+        let tx = self.tx.clone();
+        let http = self.http.clone();
+        let server = server.to_string();
+        let token = token.to_string();
+        self.runtime.spawn(async move {
+            let url = api_url(&server, "/api/me/avatar");
+            let resp = match http
+                .post(&url)
+                .bearer_auth(&token)
+                .json(&json!({ "avatar": data_url }))
                 .send()
                 .await
             {
@@ -590,16 +634,56 @@ fn server_state_path() -> std::path::PathBuf {
 }
 
 fn load_saved_server() -> Option<String> {
-    std::fs::read_to_string(server_state_path())
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    load_settings().map(|s| s.server)
+}
+
+fn load_settings() -> Option<LocalSettings> {
+    let raw = std::fs::read_to_string(server_state_path()).ok()?;
+    let raw = raw.trim();
+    if raw.starts_with('{') {
+        serde_json::from_str::<LocalSettings>(raw).ok()
+    } else if !raw.is_empty() {
+        // Legacy: the file was just a server URL.
+        Some(LocalSettings { server: raw.to_string(), accent: None })
+    } else {
+        None
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LocalSettings {
+    server: String,
+    #[serde(default)]
+    accent: Option<String>,
+}
+
+fn save_settings(settings: &LocalSettings) {
+    if let Ok(json) = serde_json::to_string(settings)
+        && let Err(e) = std::fs::write(server_state_path(), json)
+    {
+        eprintln!("[error] failed to save settings: {e}");
+    }
 }
 
 fn save_server(server: &str) {
-    if let Err(e) = std::fs::write(server_state_path(), server.trim()) {
-        eprintln!("[error] failed to save server: {e}");
+    let mut settings = load_settings().unwrap_or(LocalSettings { server: String::new(), accent: None });
+    settings.server = server.trim().to_string();
+    save_settings(&settings);
+}
+
+fn color_from_hex(hex: &str) -> Option<slint::Color> {
+    let h = hex.trim_start_matches('#');
+    if h.len() != 6 {
+        return None;
     }
+    let r = u8::from_str_radix(&h[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&h[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&h[4..6], 16).ok()?;
+    Some(slint::Color::from_rgb_u8(r, g, b))
+}
+
+fn accent_to_hex(c: slint::Color) -> String {
+    format!("#{:02X}{:02X}{:02X}", c.red(), c.green(), c.blue())
 }
 
 fn ws_url(server: &str) -> String {
@@ -724,6 +808,7 @@ struct Shared {
     selected: Rc<Cell<i32>>,
     contacts: Rc<RefCell<Vec<Contact>>>,
     hidden: Rc<RefCell<Vec<u64>>>,
+    avatar_cache: Rc<RefCell<std::collections::HashMap<u64, slint::Image>>>,
 }
 
 impl Shared {
@@ -772,6 +857,31 @@ fn avatar_color(name: &str) -> slint::Color {
     let hash: u32 = name.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
     let (r, g, b) = PALETTE[(hash as usize) % PALETTE.len()];
     slint::Color::from_rgb_u8(r, g, b)
+}
+
+/// Decode a `data:image/...;base64,...` avatar into a Slint image.
+fn load_avatar_image(data_url: &str) -> Option<slint::Image> {
+    let b64 = data_url.split_once(";base64,")?.1;
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w, h);
+    Some(slint::Image::from_rgba8(buffer))
+}
+
+/// Return a cached (or freshly decoded) avatar image for a user.
+fn avatar_image_for(sh: &Shared, user_id: u64, avatar_url: &Option<String>) -> slint::Image {
+    if let Some(img) = sh.avatar_cache.borrow().get(&user_id) {
+        return img.clone();
+    }
+    let img = avatar_url
+        .as_deref()
+        .and_then(load_avatar_image)
+        .unwrap_or_default();
+    sh.avatar_cache.borrow_mut().insert(user_id, img.clone());
+    img
 }
 
 /// Turn a profile URL (`https://domain/@user`, `domain/@user`) into an @handle.
@@ -847,6 +957,7 @@ fn apply_profile(sh: &Shared, p: &Profile) {
         handle: handle.into(),
         avatar_text: initials(&display_name).into(),
         avatar_color: avatar_color(&display_name),
+        avatar_image: avatar_image_for(sh, p.id, &p.avatar_url),
         is_self: p.is_self,
         blocked: p.blocked,
         muted: p.muted,
@@ -939,11 +1050,19 @@ fn refresh_conversations_ui(sh: &Shared) {
                     });
                 }
             }
+            let avatar_url = c.members.iter().find(|m| Some(m.id) != self_id).and_then(|m| m.avatar_url.clone());
+            let other_id = c
+                .members
+                .iter()
+                .find(|m| Some(m.id) != self_id)
+                .map(|m| m.id)
+                .unwrap_or(0);
             UiConversation {
                 id: c.id as i32,
                 title: title.clone().into(),
                 avatar_text: initials(&title).into(),
                 avatar_color: avatar_color(&title),
+                avatar_image: avatar_image_for(sh, other_id, &avatar_url),
                 other_user_id: c
                     .members
                     .iter()
@@ -959,11 +1078,28 @@ fn refresh_conversations_ui(sh: &Shared) {
 }
 
 fn refresh_suggestions(sh: &Shared) {
-    let query = sh.ui().get_new_conversation_input().to_string().to_lowercase();
+    let input = sh.ui().get_new_conversation_input().to_string();
+    let fragments: Vec<&str> = input.split(',').map(str::trim).collect();
+    let already: Vec<String> = fragments
+        .iter()
+        .filter(|s| {
+            !s.is_empty()
+                && (s.parse::<u64>().is_ok() || (s.starts_with('@') && s.matches('@').count() >= 2))
+        })
+        .map(|s| s.to_string())
+        .collect();
+    let last = fragments.last().map(|s| s.to_string()).unwrap_or_default();
+    let last_complete = last.parse::<u64>().is_ok()
+        || (last.starts_with('@') && last.matches('@').count() >= 2);
+    let query = if last_complete { String::new() } else { last.to_lowercase() };
+
     let matches: Vec<UiContact> = sh
         .contacts
         .borrow()
         .iter()
+        .filter(|c| {
+            !already.iter().any(|a| *a == c.handle || a.parse::<u64>().ok() == Some(c.id))
+        })
         .filter(|c| {
             query.is_empty()
                 || c.name.to_lowercase().contains(&query)
@@ -976,6 +1112,7 @@ fn refresh_suggestions(sh: &Shared) {
             handle: c.handle.clone().into(),
             avatar_text: initials(&c.name).into(),
             avatar_color: avatar_color(&c.name),
+            avatar_image: avatar_image_for(sh, c.id, &None),
         })
         .collect();
     sh.ui().set_suggestions(ModelRc::new(VecModel::from(matches)));
@@ -1012,6 +1149,10 @@ fn refresh_messages_ui(sh: &Shared) {
                     })
                     .unwrap_or_else(|| format!("user {}", m.sender_id))
             };
+            let sender_avatar_url = members
+                .iter()
+                .find(|x| x.id == m.sender_id)
+                .and_then(|x| x.avatar_url.clone());
             UiMessage {
                 id: m.id as i32,
                 sender: sender.into(),
@@ -1021,6 +1162,7 @@ fn refresh_messages_ui(sh: &Shared) {
                 sender_id: m.sender_id as i32,
                 avatar_text: initials(&avatar_name).into(),
                 avatar_color: avatar_color(&avatar_name),
+                avatar_image: avatar_image_for(sh, m.sender_id, &sender_avatar_url),
             }
         })
         .collect();
@@ -1064,6 +1206,12 @@ fn handle_event(sh: &Shared, ev: Event) {
             ui.set_profile_open(false);
             ui.set_context_open(false);
             ui.set_confirm_delete_open(false);
+            if let Some(url) = &user.avatar_url
+                && let Some(img) = load_avatar_image(url)
+            {
+                sh.avatar_cache.borrow_mut().insert(user.id, img.clone());
+                ui.set_my_avatar(img);
+            }
             sh.conversations.borrow_mut().clear();
             sh.messages.borrow_mut().clear();
             sh.hidden.borrow_mut().clear();
@@ -1085,6 +1233,15 @@ fn handle_event(sh: &Shared, ev: Event) {
             let ui = sh.ui();
             ui.set_display_name_input(u.display_name.clone().into());
             ui.set_error_message(SharedString::default());
+            if let Some(url) = &u.avatar_url {
+                if let Some(img) = load_avatar_image(url) {
+                    sh.avatar_cache.borrow_mut().insert(u.id, img.clone());
+                    ui.set_my_avatar(img);
+                }
+            } else {
+                sh.avatar_cache.borrow_mut().remove(&u.id);
+                ui.set_my_avatar(slint::Image::default());
+            }
             refresh_conversations_ui(sh);
         }
         Event::Conversations(list) => {
@@ -1157,6 +1314,9 @@ fn handle_event(sh: &Shared, ev: Event) {
             refresh_conversations_ui(sh);
             refresh_messages_ui(sh);
         }
+        Event::UploadAvatar { server, token, data_url } => {
+            sh.backend.set_avatar(&server, &token, data_url);
+        }
         Event::Error(m) => set_error(sh, &m),
     }
 }
@@ -1226,6 +1386,12 @@ fn main() -> Result<(), slint::PlatformError> {
     );
     let (server_tx, server_rx) = watch::channel(default_server.clone());
     ui.set_server_input(default_server.into());
+    if let Some(settings) = load_settings()
+        && let Some(hex) = &settings.accent
+        && let Some(color) = color_from_hex(hex)
+    {
+        ui.set_accent_color(color);
+    }
     spawn_ws(&backend.runtime, server_rx, token_rx, tx);
 
     let shared = Rc::new(Shared {
@@ -1239,6 +1405,7 @@ fn main() -> Result<(), slint::PlatformError> {
         selected: Rc::new(Cell::new(-1)),
         contacts: Rc::new(RefCell::new(Vec::new())),
         hidden: Rc::new(RefCell::new(Vec::new())),
+        avatar_cache: Rc::new(RefCell::new(std::collections::HashMap::new())),
     });
 
     {
@@ -1355,6 +1522,11 @@ fn main() -> Result<(), slint::PlatformError> {
         let server_tx = server_tx.clone();
         ui.on_settings_saved(move || {
             save_server(&sh.server());
+            let accent = sh.ui().get_accent_color();
+            let mut settings = load_settings().unwrap_or(LocalSettings { server: String::new(), accent: None });
+            settings.server = sh.server();
+            settings.accent = Some(accent_to_hex(accent));
+            save_settings(&settings);
             let _ = server_tx.send(sh.server());
             if let Some(token) = sh.token.borrow().clone() {
                 let name = sh.ui().get_display_name_input().to_string();
@@ -1366,11 +1538,44 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let sh = shared.clone();
-        ui.on_suggestion_selected(move |id| {
+        ui.on_settings_choose_avatar(move || {
+            let tx = sh.backend.tx.clone();
+            let server = sh.server();
             let token = match sh.token.borrow().clone() {
                 Some(t) => t,
                 None => return,
             };
+            sh.backend.runtime.spawn(async move {
+                let file = rfd::AsyncFileDialog::new()
+                    .add_filter("Image", &["png", "jpg", "jpeg", "webp"])
+                    .pick_file()
+                    .await;
+                let Some(handle) = file else { return };
+                let bytes = handle.read().await;
+                let ext = handle.path().extension().and_then(|e| e.to_str()).unwrap_or("png").to_lowercase();
+                let mime = match ext.as_str() {
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "webp" => "image/webp",
+                    _ => "image/png",
+                };
+                use base64::Engine;
+                let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let data_url = format!("data:{mime};base64,{data}");
+                let _ = tx.send(Event::UploadAvatar { server, token, data_url });
+            });
+        });
+    }
+    {
+        let sh = shared.clone();
+        ui.on_settings_remove_avatar(move || {
+            if let Some(token) = sh.token.borrow().clone() {
+                sh.backend.set_avatar(&sh.server(), &token, String::new());
+            }
+        });
+    }
+    {
+        let sh = shared.clone();
+        ui.on_suggestion_selected(move |id| {
             let handle = sh
                 .contacts
                 .borrow()
@@ -1379,8 +1584,23 @@ fn main() -> Result<(), slint::PlatformError> {
                 .map(|c| c.handle.clone());
             match handle {
                 Some(h) => {
+                    let current = sh.ui().get_new_conversation_input().to_string();
+                    let mut parts: Vec<String> = current
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| {
+                            !s.is_empty()
+                                && *s != "@"
+                                && !(s.starts_with('@') && s.matches('@').count() < 2)
+                        })
+                        .map(str::to_string)
+                        .collect();
+                    parts.push(h);
+                    let joined = parts.join(", ");
+                    sh.ui().set_nc_cursor_len(joined.chars().count() as i32);
+                    sh.ui().set_new_conversation_input(joined.into());
+                    sh.ui().set_nc_append(true);
                     set_error(&sh, "");
-                    sh.backend.create_conversation(&sh.server(), &token, Vec::new(), vec![h]);
                 }
                 None => set_error(&sh, "contact not found"),
             }

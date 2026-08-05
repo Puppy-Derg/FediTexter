@@ -5,6 +5,7 @@ export struct UiConversation {
     title: string,
     avatar-text: string,
     avatar-color: color,
+    avatar-image: image,
     other-user-id: int,
 }
 
@@ -17,6 +18,7 @@ export struct UiMessage {
     sender-id: int,
     avatar-text: string,
     avatar-color: color,
+    avatar-image: image,
 }
 
 export struct UiContact {
@@ -25,6 +27,7 @@ export struct UiContact {
     handle: string,
     avatar-text: string,
     avatar-color: color,
+    avatar-image: image,
 }
 
 export struct UiProfile {
@@ -34,6 +37,7 @@ export struct UiProfile {
     handle: string,
     avatar-text: string,
     avatar-color: color,
+    avatar-image: image,
     is-self: bool,
     blocked: bool,
     muted: bool,
@@ -43,12 +47,20 @@ export struct UiProfile {
 component Avatar inherits Rectangle {
     in property <string> avatar-text: "";
     in property <color> avatar-color: #888888;
+    in property <image> avatar-image;
     in property <length> size: 36px;
     width: root.size;
     height: root.size;
     border-radius: root.size / 2;
     background: root.avatar-color;
-    HorizontalLayout {
+    clip: true;
+    if root.avatar-image.width > 0: Image {
+        width: 100%;
+        height: 100%;
+        source: root.avatar-image;
+        image-fit: cover;
+    }
+    if !(root.avatar-image.width > 0): HorizontalLayout {
         width: 100%;
         height: 100%;
         alignment: center;
@@ -122,28 +134,137 @@ component ContextMenuItem inherits Rectangle {
     }
 }
 
+component NewChatForm inherits Rectangle {
+    in-out property <string> chat-input: "";
+    in property <[UiContact]> suggestions;
+    in property <string> error-message: "";
+    in-out property <bool> focus-end-tick: false;
+    in-out property <int> cursor-len: 0;
+    callback create-chat(input: string);
+    callback pick-contact(id: int);
+    callback append-done();
+
+    changed focus-end-tick => {
+        if self.focus-end-tick {
+            nc-input.set-selection-offsets(self.cursor-len, self.cursor-len);
+            self.append-done();
+        }
+    }
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 12px;
+        Text {
+            text: "Start a conversation";
+            font-size: 18px;
+            font-weight: 600;
+            color: Palette.foreground;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: "Enter one or more usernames, separated by commas";
+            color: Palette.foreground.with-alpha(0.72);
+            horizontal-alignment: center;
+        }
+        HorizontalLayout { alignment: center;
+            Rectangle {
+                width: 460px;
+                height: 56px;
+                border-width: 1px;
+                border-radius: 8px;
+                border-color: nc-input.has-focus ? Palette.accent-background : Palette.border;
+                background: Palette.background;
+                nc-input := LineEdit {
+                    x: 10px;
+                    y: 10px;
+                    width: parent.width - 20px;
+                    height: parent.height - 20px;
+                    text <=> root.chat-input;
+                    placeholder-text: "@alice@example.com, @bob@example.com";
+                    accepted(text) => {
+                        root.create-chat(root.chat-input);
+                    }
+                }
+            }
+        }
+        if root.suggestions.length > 0: HorizontalLayout { alignment: center;
+            Rectangle {
+                width: 460px;
+                height: 170px;
+                border-radius: 12px;
+                background: Palette.alternate-background;
+                ListView {
+                    for c in root.suggestions: Rectangle {
+                        height: 46px;
+                        background: Palette.alternate-background;
+                        TouchArea {
+                            clicked => {
+                                root.pick-contact(c.id);
+                            }
+                        }
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            spacing: 10px;
+                            VerticalLayout { vertical-stretch: 1; alignment: center;
+                                Avatar { avatar-text: c.avatar-text; avatar-color: c.avatar-color; avatar-image: c.avatar-image; size: 28px; }
+                            }
+                            VerticalLayout { vertical-stretch: 1; alignment: center;
+                                Text { text: c.name; color: Palette.foreground; overflow: elide; }
+                            }
+                            Rectangle { height: 100%; }
+                            VerticalLayout { vertical-stretch: 1; alignment: center;
+                                Text { text: c.handle; color: Palette.foreground.with-alpha(0.72); overflow: elide; font-size: 12px; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if root.error-message != "": Text {
+            text: root.error-message;
+            wrap: word-wrap;
+            color: #B3261E;
+            horizontal-alignment: center;
+        }
+        HorizontalLayout { alignment: center;
+            Button {
+                text: "Create conversation";
+                primary: true;
+                enabled: root.chat-input != "";
+                clicked => {
+                    root.create-chat(root.chat-input);
+                }
+            }
+        }
+    }
+}
+
 export component MainWindow inherits Window {
     title: "FediTexter";
     width: 1000px;
     height: 700px;
 
-    // Adaptive Material 3 palette: follows the system light/dark scheme so
-    // text stays readable against the widget backgrounds.
-    property <brush> md3-primary: Palette.accent-background;
-    property <brush> md3-on-primary: Palette.accent-foreground;
-    property <brush> md3-primary-container: Palette.control-background;
-    property <brush> md3-on-primary-container: Palette.control-foreground;
-    property <brush> md3-secondary-container: Palette.selection-background;
-    property <brush> md3-on-secondary-container: Palette.foreground;
+    // Adaptive Material 3 palette: accent color is user-selectable; the
+    // on-colors adapt to the light/dark scheme so text stays readable.
+    property <brush> md3-primary: root.accent-color;
+    property <brush> md3-on-primary: #FFFFFF;
+    property <brush> md3-primary-container: root.accent-color.with-alpha(0.18);
+    property <brush> md3-on-primary-container: root.md3-on-surface;
+    property <brush> md3-secondary-container: root.accent-color.with-alpha(0.12);
+    property <brush> md3-on-secondary-container: root.md3-on-surface;
     property <brush> md3-background: Palette.background;
-    property <brush> md3-surface: Palette.background;
+    property <brush> md3-surface: Palette.background.with-alpha(0.86);
     property <brush> md3-on-surface: Palette.foreground;
-    property <brush> md3-on-surface-variant: Palette.foreground.with-alpha(0.72);
+    property <brush> md3-on-surface-variant: Palette.foreground.with-alpha(0.78);
     property <brush> md3-error: #B3261E;
     property <brush> md3-outline: Palette.border;
-    property <brush> md3-surface-container: Palette.control-background;
-    property <brush> md3-surface-container-high: Palette.control-background;
-    property <brush> md3-surface-container-low: Palette.alternate-background;
+    property <brush> md3-surface-container: Palette.control-background.with-alpha(0.9);
+    property <brush> md3-surface-container-high: Palette.control-background.with-alpha(0.9);
+    property <brush> md3-surface-container-low: Palette.alternate-background.with-alpha(0.85);
+
+    // User-selectable accent color (saved to the settings file).
+    in-out property <color> accent-color: #7C5CE0;
 
     in property<bool> logged-in;
     in-out property<string> server-input: "http://localhost:3000";
@@ -170,6 +291,9 @@ export component MainWindow inherits Window {
     in-out property<string> confirm-delete-title: "";
     in-out property<float> ui-scale: 1.0;
     property <float> ui-scale-base: 1.3;
+    in-out property<bool> nc-append: false;
+    in-out property<int> nc-cursor-len: 0;
+    in property <image> my-avatar;
 
     callback login(email: string, password: string);
     callback register(email: string, username: string, password: string);
@@ -179,6 +303,8 @@ export component MainWindow inherits Window {
     callback new-conversation(input: string);
     callback verify(code: string);
     callback settings-saved();
+    callback settings-choose-avatar();
+    callback settings-remove-avatar();
     callback suggestion-selected(id: int);
     callback request-profile(user-id: int);
     callback request-context(user-id: int, conversation-id: int, x: length, y: length);
@@ -209,16 +335,23 @@ export component MainWindow inherits Window {
         y: 0px;
         width: parent.width / (root.ui-scale * root.ui-scale-base);
         height: parent.height / (root.ui-scale * root.ui-scale-base);
-        background: root.md3-background;
+        background: transparent;
         transform-scale-x: root.ui-scale * root.ui-scale-base * 100%;
         transform-scale-y: root.ui-scale * root.ui-scale-base * 100%;
         transform-origin: { x: 0px, y: 0px };
+
+        // Translucent Material-You style backdrop
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            background: @linear-gradient(160deg, root.accent-color.with-alpha(0.45), root.accent-color.with-alpha(0.15) 40%, root.md3-background 85%, root.accent-color.with-alpha(0.35));
+        }
 
     // ------------------------------------------------------------------
     // Login / register screen
     // ------------------------------------------------------------------
     if !root.logged-in: Rectangle {
-        background: root.md3-background;
+        background: transparent;
         VerticalLayout {
             spacing: 10px;
             Rectangle { height: 8%; }
@@ -420,7 +553,7 @@ export component MainWindow inherits Window {
                                         Rectangle {
                                             width: 32px;
                                             height: 32px;
-                                            Avatar { avatar-text: c.avatar-text; avatar-color: c.avatar-color; size: 32px; }
+                                            Avatar { avatar-text: c.avatar-text; avatar-color: c.avatar-color; avatar-image: c.avatar-image; size: 32px; }
                                             TouchArea {
                                                 width: 100%;
                                                 height: 100%;
@@ -471,95 +604,16 @@ export component MainWindow inherits Window {
                     VerticalLayout {
                         spacing: 4px;
                         padding: 10px;
-                        if root.selected-conversation < 0: Rectangle {
+                        if root.selected-conversation < 0: NewChatForm {
                             height: 100%;
-                            VerticalLayout {
-                                alignment: center;
-                                spacing: 12px;
-                                Text {
-                                    text: "Start a conversation";
-                                    font-size: 18px;
-                                    font-weight: 600;
-                                    color: root.md3-on-surface;
-                                    horizontal-alignment: center;
-                                }
-                                Text {
-                                    text: "Enter one or more usernames, separated by commas";
-                                    color: root.md3-on-surface-variant;
-                                    horizontal-alignment: center;
-                                }
-                                HorizontalLayout { alignment: center;
-                                    Rectangle {
-                                        width: 460px;
-                                        height: 56px;
-                                        border-width: 1px;
-                                        border-radius: 8px;
-                                        border-color: nc-input.has-focus ? root.md3-primary : root.md3-outline;
-                                        background: root.md3-surface;
-                                        nc-input := LineEdit {
-                                            x: 10px;
-                                            y: 10px;
-                                            width: parent.width - 20px;
-                                            height: parent.height - 20px;
-                                            text <=> root.new-conversation-input;
-                                            placeholder-text: "@alice@example.com, @bob@example.com";
-                                            accepted(text) => {
-                                                root.new-conversation(root.new-conversation-input);
-                                            }
-                                        }
-                                    }
-                                }
-                                if root.new-conversation-input != "" && root.suggestions.length > 0: HorizontalLayout { alignment: center;
-                                    Rectangle {
-                                        width: 460px;
-                                        height: 170px;
-                                        border-radius: 12px;
-                                        background: root.md3-surface-container-low;
-                                        ListView {
-                                            for c in root.suggestions: Rectangle {
-                                                height: 46px;
-                                                background: root.md3-surface-container-low;
-                                                TouchArea {
-                                                    clicked => {
-                                                        root.suggestion-selected(c.id);
-                                                    }
-                                                }
-                                                HorizontalLayout {
-                                                    padding-left: 12px;
-                                                    padding-right: 12px;
-                                                    spacing: 10px;
-                                                    VerticalLayout { vertical-stretch: 1; alignment: center;
-                                                        Avatar { avatar-text: c.avatar-text; avatar-color: c.avatar-color; size: 28px; }
-                                                    }
-                                                    VerticalLayout { vertical-stretch: 1; alignment: center;
-                                                        Text { text: c.name; color: root.md3-on-surface; overflow: elide; }
-                                                    }
-                                                    Rectangle { height: 100%; }
-                                                    VerticalLayout { vertical-stretch: 1; alignment: center;
-                                                        Text { text: c.handle; color: root.md3-on-surface-variant; overflow: elide; font-size: 12px; }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                if root.error-message != "": Text {
-                                    text: root.error-message;
-                                    wrap: word-wrap;
-                                    color: root.md3-error;
-                                    horizontal-alignment: center;
-                                }
-                                HorizontalLayout { alignment: center;
-                                    Button {
-                                        text: "Create conversation";
-                                        primary: true;
-                                        enabled: root.new-conversation-input != "";
-                                        clicked => {
-                                            root.new-conversation(root.new-conversation-input);
-                                        }
-                                    }
-                                }
-                            }
+                            suggestions: root.suggestions;
+                            error-message: root.error-message;
+                            chat-input <=> root.new-conversation-input;
+                            focus-end-tick: root.nc-append;
+                            cursor-len: root.nc-cursor-len;
+                            create-chat(input) => { root.new-conversation(input); }
+                            pick-contact(id) => { root.suggestion-selected(id); }
+                            append-done() => { root.nc-append = false; }
                         }
                         if root.selected-conversation >= 0: Rectangle {
                             horizontal-stretch: 1;
@@ -569,14 +623,17 @@ export component MainWindow inherits Window {
                                 ListView {
                                     horizontal-stretch: 1;
                                     vertical-stretch: 1;
-                                    for m in root.messages: HorizontalLayout {
-                                        alignment: m.is-self ? LayoutAlignment.end : LayoutAlignment.start;
-                                        spacing: 8px;
+                                    for m in root.messages: VerticalLayout {
+                                        spacing: 0px;
+                                        Rectangle { height: 4px; }
+                                        HorizontalLayout {
+                                            alignment: m.is-self ? LayoutAlignment.end : LayoutAlignment.start;
+                                            spacing: 8px;
                                         if !m.is-self: VerticalLayout { vertical-stretch: 1; alignment: center;
                                             Rectangle {
                                                 width: 28px;
                                                 height: 28px;
-                                                Avatar { avatar-text: m.avatar-text; avatar-color: m.avatar-color; size: 28px; }
+                                                Avatar { avatar-text: m.avatar-text; avatar-color: m.avatar-color; avatar-image: m.avatar-image; size: 28px; }
                                                 TouchArea {
                                                     width: 100%;
                                                     height: 100%;
@@ -617,8 +674,9 @@ export component MainWindow inherits Window {
                                             }
                                         }
                                         if m.is-self: VerticalLayout { vertical-stretch: 1; alignment: center;
-                                            Avatar { avatar-text: m.avatar-text; avatar-color: m.avatar-color; size: 28px; }
+                                            Avatar { avatar-text: m.avatar-text; avatar-color: m.avatar-color; avatar-image: m.avatar-image; size: 28px; }
                                         }
+                                    }
                                     }
                                 }
                                 HorizontalLayout {
@@ -678,7 +736,7 @@ export component MainWindow inherits Window {
     }
 
     // ------------------------------------------------------------------
-    // Settings dialog
+    // Settings dialog (floating window with all settings)
     // ------------------------------------------------------------------
     if root.settings-open: Rectangle {
         x: 0;
@@ -687,30 +745,79 @@ export component MainWindow inherits Window {
         height: 100%;
         background: #66000000;
         Rectangle {
-            x: (parent.width - 360px) / 2;
-            y: (parent.height - 320px) / 2;
-            width: 360px;
-            border-radius: 24px;
+            x: (parent.width - 420px) / 2;
+            y: (parent.height - 560px) / 2;
+            width: 420px;
+            border-radius: 28px;
             background: root.md3-surface-container-high;
             CloseButton {
-                x: parent.width - 38px;
-                y: 12px;
+                x: parent.width - 40px;
+                y: 14px;
                 text-color: root.md3-on-surface;
                 clicked => { root.settings-open = false; }
             }
             VerticalLayout {
                 spacing: 12px;
-                padding: 20px;
+                padding: 24px;
                 Text {
                     text: "Settings";
-                    font-size: 20px;
+                    font-size: 22px;
                     font-weight: 600;
                     color: root.md3-on-surface;
                 }
-                Text { text: "Server"; color: root.md3-on-surface-variant; }
-                LineEdit { text <=> root.server-input; placeholder-text: "https://your-server.example"; }
+
+                // Profile picture
+                HorizontalLayout {
+                    spacing: 14px;
+                    Rectangle {
+                        width: 72px;
+                        height: 72px;
+                        Avatar { avatar-image: root.my-avatar; avatar-text: "?"; avatar-color: root.md3-primary; size: 72px; }
+                    }
+                    VerticalLayout {
+                        vertical-stretch: 1;
+                        alignment: center;
+                        spacing: 8px;
+                        Text { text: "Profile picture"; font-weight: 600; color: root.md3-on-surface; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button {
+                                text: "Choose image…";
+                                clicked => { root.settings-choose-avatar(); }
+                            }
+                            Button {
+                                text: "Remove";
+                                clicked => { root.settings-remove-avatar(); }
+                            }
+                        }
+                    }
+                }
+
                 Text { text: "Display name (shown to others)"; color: root.md3-on-surface-variant; }
                 LineEdit { text <=> root.display-name-input; placeholder-text: "Your name"; }
+
+                Text { text: "Accent color"; color: root.md3-on-surface-variant; }
+                HorizontalLayout {
+                    spacing: 10px;
+                    for swatch in [ #7C5CE0, #1E88E5, #43A047, #E53935, #FB8C00, #8E24AA, #00ACC1, #D81B60 ]: Rectangle {
+                        width: 28px;
+                        height: 28px;
+                        border-radius: 14px;
+                        background: swatch;
+                        border-width: root.accent-color == swatch ? 3px : 1px;
+                        border-color: root.accent-color == swatch ? root.md3-on-surface : root.md3-outline;
+                        TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            mouse-cursor: pointer;
+                            clicked => { root.accent-color = swatch; }
+                        }
+                    }
+                }
+
+                Text { text: "Server"; color: root.md3-on-surface-variant; }
+                LineEdit { text <=> root.server-input; placeholder-text: "https://your-server.example"; }
+
                 HorizontalLayout {
                     spacing: 8px;
                     Text {
@@ -719,6 +826,7 @@ export component MainWindow inherits Window {
                         horizontal-alignment: center;
                     }
                 }
+
                 Rectangle { height: 0px; horizontal-stretch: 1; }
                 if root.error-message != "": Text {
                     text: root.error-message;
@@ -901,7 +1009,7 @@ export component MainWindow inherits Window {
                     spacing: 10px;
                     padding: 24px;
                     HorizontalLayout { alignment: center;
-                        Avatar { avatar-text: root.profile.avatar-text; avatar-color: root.profile.avatar-color; size: 72px; }
+                        Avatar { avatar-text: root.profile.avatar-text; avatar-color: root.profile.avatar-color; avatar-image: root.profile.avatar-image; size: 72px; }
                     }
                 Text {
                     text: root.profile.display-name;

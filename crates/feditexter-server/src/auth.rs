@@ -17,6 +17,8 @@ pub struct User {
     pub username: String,
     pub display_name: String,
     pub email_verified: bool,
+    #[serde(default)]
+    pub avatar_url: Option<String>,
 }
 
 #[derive(FromRow)]
@@ -95,7 +97,7 @@ impl FromRequestParts<AppState> for AuthUser {
         }
 
         let user: User = sqlx::query_as(
-            "SELECT id, email, username, display_name, email_verified FROM users WHERE id = ?",
+            "SELECT id, email, username, display_name, email_verified, avatar_url FROM users WHERE id = ?",
         )
         .bind(session.user_id)
         .fetch_one(&state.pool)

@@ -73,6 +73,7 @@ pub async fn register(
         username: body.username,
         display_name: String::new(),
         email_verified,
+        avatar_url: None,
     };
 
     let token = create_session(&state, user_id).await?;
@@ -85,8 +86,8 @@ pub async fn login(
     State(state): State<AppState>,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let row: Option<(u64, String, String, String, String, bool)> = sqlx::query_as(
-        "SELECT id, email, username, display_name, password_hash, email_verified
+    let row: Option<(u64, String, String, String, String, bool, Option<String>)> = sqlx::query_as(
+        "SELECT id, email, username, display_name, password_hash, email_verified, avatar_url
          FROM users WHERE email = ?",
     )
     .bind(&body.email)
@@ -94,7 +95,7 @@ pub async fn login(
     .await
     .map_err(|_| ApiError::Internal("db error"))?;
 
-    let (id, email, username, display_name, password_hash, email_verified) = match row {
+    let (id, email, username, display_name, password_hash, email_verified, avatar_url) = match row {
         Some(r) => r,
         None => {
             verify_password(&body.password, DUMMY_PASSWORD_HASH);
@@ -106,7 +107,7 @@ pub async fn login(
         return Err(ApiError::Unauthorized("invalid credentials"));
     }
 
-    let user = User { id, email, username, display_name, email_verified };
+    let user = User { id, email, username, display_name, email_verified, avatar_url };
     let token = create_session(&state, id).await?;
     Ok(Json(json!({ "token": token, "user": user })))
 }
@@ -150,7 +151,7 @@ pub async fn update_me(
         .map_err(|_| ApiError::Internal("db error"))?;
 
     let user: User = sqlx::query_as(
-        "SELECT id, email, username, display_name, email_verified FROM users WHERE id = ?",
+        "SELECT id, email, username, display_name, email_verified, avatar_url FROM users WHERE id = ?",
     )
     .bind(auth.user.id)
     .fetch_one(&state.pool)
@@ -189,7 +190,44 @@ pub async fn verify(
     }
 
     let user: User = sqlx::query_as(
-        "SELECT id, email, username, display_name, email_verified FROM users WHERE id = ?",
+        "SELECT id, email, username, display_name, email_verified, avatar_url FROM users WHERE id = ?",
+    )
+    .bind(auth.user.id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
+
+    Ok(Json(json!({ "user": user })))
+}
+
+#[derive(Deserialize)]
+pub struct SetAvatarRequest {
+    pub avatar: String,
+}
+
+pub async fn set_avatar(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(body): Json<SetAvatarRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let avatar = body.avatar.trim().to_string();
+    if avatar.len() > 2_000_000 {
+        return Err(ApiError::BadRequest("avatar too large (max ~2MB)"));
+    }
+    if !avatar.is_empty() && !avatar.starts_with("data:image/") {
+        return Err(ApiError::BadRequest("avatar must be a data:image/... URL"));
+    }
+    let avatar_url: Option<String> = if avatar.is_empty() { None } else { Some(avatar) };
+
+    sqlx::query("UPDATE users SET avatar_url = ? WHERE id = ?")
+        .bind(&avatar_url)
+        .bind(auth.user.id)
+        .execute(&state.pool)
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?;
+
+    let user: User = sqlx::query_as(
+        "SELECT id, email, username, display_name, email_verified, avatar_url FROM users WHERE id = ?",
     )
     .bind(auth.user.id)
     .fetch_one(&state.pool)

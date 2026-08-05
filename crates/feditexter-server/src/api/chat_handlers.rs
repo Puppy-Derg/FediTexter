@@ -113,8 +113,8 @@ async fn conversation_json(state: &AppState, conversation_id: u64) -> Result<Val
         .await
         .map_err(|_| ApiError::Internal("db error"))?;
 
-    let members: Vec<(u64, String, String, u64, Option<String>)> = sqlx::query_as(
-        "SELECT m.user_id, u.username, u.display_name, u.server_id, s.domain
+    let members: Vec<(u64, String, String, u64, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT m.user_id, u.username, u.display_name, u.server_id, s.domain, u.avatar_url
          FROM conversation_members m
          JOIN users u ON u.id = m.user_id
          LEFT JOIN servers s ON s.id = u.server_id
@@ -131,9 +131,9 @@ async fn conversation_json(state: &AppState, conversation_id: u64) -> Result<Val
         "kind": kind,
         "members": members
             .iter()
-            .map(|(id, username, display_name, _server_id, domain)| {
+            .map(|(id, username, display_name, _server_id, domain, avatar_url)| {
                 let domain = domain.clone().unwrap_or_else(|| state.federation.domain.clone());
-                json!({ "id": id, "username": username, "display_name": display_name, "domain": domain })
+                json!({ "id": id, "username": username, "display_name": display_name, "domain": domain, "avatar_url": avatar_url })
             })
             .collect::<Vec<_>>(),
     }))

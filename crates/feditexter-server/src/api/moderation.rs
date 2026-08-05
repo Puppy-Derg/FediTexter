@@ -49,8 +49,8 @@ async fn ensure_user_exists(state: &AppState, user_id: u64) -> Result<(), ApiErr
 }
 
 async fn profile_value(state: &AppState, viewer_id: u64, target_id: u64) -> Result<Value, ApiError> {
-    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT u.username, u.display_name, s.domain
+    let row: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT u.username, u.display_name, s.domain, u.avatar_url
          FROM users u
          LEFT JOIN servers s ON s.id = u.server_id
          WHERE u.id = ?",
@@ -63,7 +63,7 @@ async fn profile_value(state: &AppState, viewer_id: u64, target_id: u64) -> Resu
         ApiError::Internal("db error")
     })?;
 
-    let (username, display_name, domain) = match row {
+    let (username, display_name, domain, avatar_url) = match row {
         Some(r) => r,
         None => return Err(ApiError::NotFound("user not found")),
     };
@@ -79,6 +79,7 @@ async fn profile_value(state: &AppState, viewer_id: u64, target_id: u64) -> Resu
         "username": username,
         "display_name": display_name,
         "domain": domain,
+        "avatar_url": avatar_url,
         "is_self": is_self,
         "blocked": blocked,
         "muted": muted,
