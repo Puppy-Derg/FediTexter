@@ -32,3 +32,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app).await?;
     Ok(())
 }
+async fn healthz() -> &'static str {
+    concat!("ok v", env!("CARGO_PKG_VERSION"))
+}
