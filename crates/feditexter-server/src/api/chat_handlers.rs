@@ -8,10 +8,12 @@ use crate::api::error::ApiError;
 use crate::auth::AuthUser;
 use crate::chat::Message;
 use crate::db::AppState;
+use crate::federation;
 
 #[derive(Deserialize)]
 pub struct CreateConversationRequest {
-    pub user_id: u64,
+    pub user_id: Option<u64>,
+    pub handle: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -29,6 +31,52 @@ async fn is_member(state: &AppState, conversation_id: u64, user_id: u64) -> Resu
     .await
     .map_err(|_| ApiError::Internal("db error"))?;
     Ok(row.is_some())
+}
+
+pub(crate) async fn ensure_direct_conversation(
+    state: &AppState,
+    a: u64,
+    b: u64,
+) -> Result<u64, ApiError> {
+    let existing: Option<(u64,)> = sqlx::query_as(
+        "SELECT c.id
+         FROM conversations c
+         WHERE c.kind = 'direct'
+           AND EXISTS (SELECT 1 FROM conversation_members WHERE conversation_id = c.id AND user_id = ?)
+           AND EXISTS (SELECT 1 FROM conversation_members WHERE conversation_id = c.id AND user_id = ?)
+           AND (SELECT COUNT(*) FROM conversation_members WHERE conversation_id = c.id) = 2
+         LIMIT 1",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
+
+    if let Some((id,)) = existing {
+        return Ok(id);
+    }
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?;
+    let inserted = sqlx::query("INSERT INTO conversations (kind) VALUES ('direct')")
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?;
+    let conversation_id = inserted.last_insert_id();
+    sqlx::query("INSERT INTO conversation_members (conversation_id, user_id) VALUES (?, ?), (?, ?)")
+        .bind(conversation_id)
+        .bind(a)
+        .bind(conversation_id)
+        .bind(b)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?;
+    tx.commit().await.map_err(|_| ApiError::Internal("db error"))?;
+    Ok(conversation_id)
 }
 
 async fn conversation_json(state: &AppState, conversation_id: u64) -> Result<Value, ApiError> {
@@ -53,17 +101,57 @@ async fn conversation_json(state: &AppState, conversation_id: u64) -> Result<Val
     }))
 }
 
+fn parse_handle(handle: &str) -> Option<(String, String)> {
+    let rest = handle.strip_prefix('@')?;
+    let (username, domain) = rest.split_once('@')?;
+    if username.is_empty() || username.len() > 32 || domain.is_empty() {
+        return None;
+    }
+    if !username.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    if !domain.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == ':') {
+        return None;
+    }
+    Some((username.to_string(), domain.to_string()))
+}
+
+async fn resolve_handle(state: &AppState, handle: &str) -> Result<u64, ApiError> {
+    let (username, domain) = parse_handle(handle)
+        .ok_or(ApiError::BadRequest("handle must look like @username@domain"))?;
+
+    if domain == state.federation.domain {
+        let user: Option<(u64,)> = sqlx::query_as("SELECT id FROM users WHERE username = ? AND server_id = 0")
+            .bind(&username)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| ApiError::Internal("db error"))?;
+        return user.map(|(id,)| id).ok_or(ApiError::NotFound("user not found"));
+    }
+
+    federation::resolve_remote_user(state, &username, &domain).await
+}
+
 pub async fn create_conversation(
     State(state): State<AppState>,
     auth: AuthUser,
     Json(body): Json<CreateConversationRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    if body.user_id == auth.user.id {
+    let other_id = match (body.user_id, body.handle) {
+        (Some(id), None) => id,
+        (None, Some(handle)) => resolve_handle(&state, &handle).await?,
+        (Some(_), Some(_)) => {
+            return Err(ApiError::BadRequest("provide either user_id or handle, not both"));
+        }
+        (None, None) => return Err(ApiError::BadRequest("provide user_id or handle")),
+    };
+
+    if other_id == auth.user.id {
         return Err(ApiError::BadRequest("cannot start a conversation with yourself"));
     }
 
     let exists: Option<(u64,)> = sqlx::query_as("SELECT id FROM users WHERE id = ?")
-        .bind(body.user_id)
+        .bind(other_id)
         .fetch_optional(&state.pool)
         .await
         .map_err(|_| ApiError::Internal("db error"))?;
@@ -71,46 +159,7 @@ pub async fn create_conversation(
         return Err(ApiError::NotFound("user not found"));
     }
 
-    let existing: Option<(u64,)> = sqlx::query_as(
-        "SELECT c.id
-         FROM conversations c
-         WHERE c.kind = 'direct'
-           AND EXISTS (SELECT 1 FROM conversation_members WHERE conversation_id = c.id AND user_id = ?)
-           AND EXISTS (SELECT 1 FROM conversation_members WHERE conversation_id = c.id AND user_id = ?)
-           AND (SELECT COUNT(*) FROM conversation_members WHERE conversation_id = c.id) = 2
-         LIMIT 1",
-    )
-    .bind(auth.user.id)
-    .bind(body.user_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|_| ApiError::Internal("db error"))?;
-
-    let conversation_id = match existing {
-        Some((id,)) => id,
-        None => {
-            let mut tx = state
-                .pool
-                .begin()
-                .await
-                .map_err(|_| ApiError::Internal("db error"))?;
-            let inserted = sqlx::query("INSERT INTO conversations (kind) VALUES ('direct')")
-                .execute(&mut *tx)
-                .await
-                .map_err(|_| ApiError::Internal("db error"))?;
-            let conversation_id = inserted.last_insert_id();
-            sqlx::query("INSERT INTO conversation_members (conversation_id, user_id) VALUES (?, ?), (?, ?)")
-                .bind(conversation_id)
-                .bind(auth.user.id)
-                .bind(conversation_id)
-                .bind(body.user_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|_| ApiError::Internal("db error"))?;
-            tx.commit().await.map_err(|_| ApiError::Internal("db error"))?;
-            conversation_id
-        }
-    };
+    let conversation_id = ensure_direct_conversation(&state, auth.user.id, other_id).await?;
 
     Ok((StatusCode::CREATED, Json(conversation_json(&state, conversation_id).await?)))
 }
@@ -191,6 +240,7 @@ pub async fn send_message(
     .map_err(|_| ApiError::Internal("db error"))?;
 
     state.hub.publish(message.clone());
+    federation::deliver_outbound(&state, &message, &auth.user);
 
     Ok((StatusCode::CREATED, Json(json!({ "message": message }))))
 }

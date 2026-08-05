@@ -1,6 +1,6 @@
 [package]
 name = "feditexter-server"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 
 [dependencies]
@@ -17,6 +17,8 @@ sha2 = "0.11.0"
 hex = "0.4.3"
 chrono = { version = "0.4.45", features = ["serde"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

@@ -34,6 +34,9 @@ pub async fn register(
     if body.username.is_empty() || body.username.len() > 32 {
         return Err(ApiError::BadRequest("username must be 1-32 characters"));
     }
+    if !body.username.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(ApiError::BadRequest("username may only contain letters, numbers, and underscores"));
+    }
 
     let password_hash = hash_password(&body.password)
         .map_err(|_| ApiError::Internal("hashing failed"))?;

@@ -2,7 +2,7 @@ use std::time::SystemTime;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use feditexter_server::{build_app, db::AppState};
+use feditexter_server::{build_app, db::AppState, federation::Federation};
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
@@ -22,7 +22,8 @@ async fn test_state() -> AppState {
             sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
         })
         .await;
-    AppState { pool, hub: Default::default() }
+    let federation = Federation::init(&pool, "localhost").await.unwrap();
+    AppState { pool, hub: Default::default(), federation }
 }
 
 fn unique_nanos() -> u128 {

@@ -20,6 +20,7 @@ SERVICE_USER="${FEDITEXTER_USER:-feditexter}"
 SERVICE_NAME="${FEDITEXTER_SERVICE:-feditexter}"
 PORT="${FEDITEXTER_PORT:-3100}"
 BIND="${FEDITEXTER_BIND:-127.0.0.1}"
+DOMAIN="${FEDITEXTER_DOMAIN:-dergdungeon.com.au}"
 DB_NAME="${FEDITEXTER_DB:-feditexter}"
 DB_USER="${FEDITEXTER_DB_USER:-feditexter}"
 
@@ -129,10 +130,12 @@ if [[ $FIXED_DB -eq 1 ]]; then
 DATABASE_URL=mysql://$DB_USER:$DB_PASSWORD@127.0.0.1:3306/$DB_NAME
 BIND_ADDR=$BIND
 PORT=$PORT
+PUBLIC_DOMAIN=$DOMAIN
 EOF
 else
     grep -q '^BIND_ADDR=' "$ENV_FILE" || printf 'BIND_ADDR=%s\n' "$BIND" >> "$ENV_FILE"
     grep -q '^PORT=' "$ENV_FILE" || printf 'PORT=%s\n' "$PORT" >> "$ENV_FILE"
+    grep -q '^PUBLIC_DOMAIN=' "$ENV_FILE" || printf 'PUBLIC_DOMAIN=%s\n' "$DOMAIN" >> "$ENV_FILE"
 fi
 chown root:root "$ENV_FILE"
 chmod 600 "$ENV_FILE"
