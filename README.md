@@ -13,6 +13,12 @@ Clustered texting platform that works like others on the market. Similar to how 
 
 Decisions should be made with a majority of developers approval, with all devs knowledgeable about what is going on.
 
+## Monetization
+
+My current plans for monetization is to make 90% of the app free with restrictions on large group chats (Discord-like servers over 100 users), how many devices can be logged into one account at once (thinking around 5-10 before restrictions).
+Monetization will allow for servers to be paid something around $0.10-$0.20 per $1 (AUD) towards the main project. If servers are getting monetization then we will message the owners to pay them. This is to help server owners with server costs.
+Thinking either $5-10 Australian/month.
+
 ## Currently Wanting to Implement
 
 - **2FA** — needs to be a requirement; stuff like Google Authenticator should be standard.
@@ -36,8 +42,8 @@ Decisions should be made with a majority of developers approval, with all devs k
 
 - AI features, for example text gen, image gen.
 - Coder UI (unless that UI is not final/shipped, does not include beta testers).
-- Never allow people to ramble like the telegram dev does (just dont put it infront of all users faces without consent)
-- Avoid stuff like electron and be light weight to run
+- Never allow people to ramble like the Telegram dev does (just don't put it in front of all users' faces without consent)
+- Avoid stuff like Electron and be lightweight to run
 
 ## Contact
 

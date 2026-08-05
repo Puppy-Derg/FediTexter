@@ -1,0 +1,1007 @@
+import { Button, LineEdit, ListView, Palette } from "std-widgets.slint";
+
+export struct UiConversation {
+    id: int,
+    title: string,
+    avatar-text: string,
+    avatar-color: color,
+    other-user-id: int,
+}
+
+export struct UiMessage {
+    id: int,
+    sender: string,
+    body: string,
+    created-at: string,
+    is-self: bool,
+    sender-id: int,
+    avatar-text: string,
+    avatar-color: color,
+}
+
+export struct UiContact {
+    id: int,
+    name: string,
+    handle: string,
+    avatar-text: string,
+    avatar-color: color,
+}
+
+export struct UiProfile {
+    id: int,
+    username: string,
+    display-name: string,
+    handle: string,
+    avatar-text: string,
+    avatar-color: color,
+    is-self: bool,
+    blocked: bool,
+    muted: bool,
+    blocked-by: bool,
+}
+
+component Avatar inherits Rectangle {
+    in property <string> avatar-text: "";
+    in property <color> avatar-color: #888888;
+    in property <length> size: 36px;
+    width: root.size;
+    height: root.size;
+    border-radius: root.size / 2;
+    background: root.avatar-color;
+    HorizontalLayout {
+        width: 100%;
+        height: 100%;
+        alignment: center;
+        Text {
+            text: root.avatar-text;
+            color: white;
+            font-size: root.size / 2.6;
+            font-weight: 600;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component CloseButton inherits Rectangle {
+    in property <brush> text-color: #000000;
+    callback clicked;
+    width: 26px;
+    height: 26px;
+    border-radius: 13px;
+    HorizontalLayout {
+        width: 100%;
+        height: 100%;
+        alignment: center;
+        Text {
+            text: "×";
+            color: root.text-color;
+            font-size: 18px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => { root.clicked(); }
+    }
+}
+
+component ContextMenuItem inherits Rectangle {
+    in property <string> text: "";
+    in property <brush> text-color: #000000;
+    in property <brush> item-background: transparent;
+    in property <brush> item-hover-background: transparent;
+    callback clicked;
+    height: 34px;
+    border-radius: 6px;
+    background: root.item-background;
+    states [
+        hover when ta.has-hover: { background: root.item-hover-background; }
+    ]
+    ta := TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => { root.clicked(); }
+    }
+    VerticalLayout {
+        width: 100%;
+        height: 100%;
+        alignment: center;
+        HorizontalLayout {
+            padding-left: 10px;
+            Text {
+                text: root.text;
+                color: root.text-color;
+                font-size: 14px;
+                horizontal-alignment: left;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "FediTexter";
+    width: 1000px;
+    height: 700px;
+
+    // Adaptive Material 3 palette: follows the system light/dark scheme so
+    // text stays readable against the widget backgrounds.
+    property <brush> md3-primary: Palette.accent-background;
+    property <brush> md3-on-primary: Palette.accent-foreground;
+    property <brush> md3-primary-container: Palette.control-background;
+    property <brush> md3-on-primary-container: Palette.control-foreground;
+    property <brush> md3-secondary-container: Palette.selection-background;
+    property <brush> md3-on-secondary-container: Palette.foreground;
+    property <brush> md3-background: Palette.background;
+    property <brush> md3-surface: Palette.background;
+    property <brush> md3-on-surface: Palette.foreground;
+    property <brush> md3-on-surface-variant: Palette.foreground.with-alpha(0.72);
+    property <brush> md3-error: #B3261E;
+    property <brush> md3-outline: Palette.border;
+    property <brush> md3-surface-container: Palette.control-background;
+    property <brush> md3-surface-container-high: Palette.control-background;
+    property <brush> md3-surface-container-low: Palette.alternate-background;
+
+    in property<bool> logged-in;
+    in-out property<string> server-input: "http://localhost:3000";
+    in property<string> user-name;
+    in property<bool> ws-connected;
+    in-out property<string> error-message: "";
+    in-out property<int> selected-conversation: -1;
+    in property<[UiConversation]> conversations;
+    in property<[UiMessage]> messages;
+    in property<[UiContact]> suggestions;
+    in-out property<bool> new-conversation-open: false;
+    in-out property<bool> settings-open: false;
+    in-out property<bool> needs-verify: false;
+    in-out property<bool> profile-open: false;
+    in-out property<UiProfile> profile: { id: -1, username: "", display-name: "", handle: "", avatar-text: "", avatar-color: #888888, is-self: false, blocked: false, muted: false, blocked-by: false };
+    in-out property<bool> context-open: false;
+    in-out property<int> context-user-id: -1;
+    in-out property<int> context-conversation-id: -1;
+    in-out property<length> context-x: 0px;
+    in-out property<length> context-y: 0px;
+    in-out property<bool> context-blocked: false;
+    in-out property<bool> context-muted: false;
+    in-out property<bool> confirm-delete-open: false;
+    in-out property<int> confirm-delete-conversation-id: -1;
+    in-out property<string> confirm-delete-title: "";
+
+    callback login(email: string, password: string);
+    callback register(email: string, username: string, password: string);
+    callback logout();
+    callback select-conversation(id: int);
+    callback send-message(body: string);
+    callback new-conversation(input: string);
+    callback verify(code: string);
+    callback settings-saved();
+    callback suggestion-selected(id: int);
+    callback request-profile(user-id: int);
+    callback request-context(user-id: int, conversation-id: int, x: length, y: length);
+    callback context-profile();
+    callback toggle-block();
+    callback toggle-mute();
+    callback context-delete();
+    callback confirm-delete();
+
+    property<string> login-email: "";
+    property<string> login-password: "";
+    property<string> reg-email: "";
+    property<string> reg-username: "";
+    property<string> reg-password: "";
+    property<bool> register-mode: false;
+    property<string> draft: "";
+    in-out property<string> new-conversation-input: "";
+    property<string> verify-code: "";
+    in-out property<string> display-name-input: "";
+
+    // ------------------------------------------------------------------
+    // Login / register screen
+    // ------------------------------------------------------------------
+    if !root.logged-in: Rectangle {
+        background: root.md3-background;
+        VerticalLayout {
+            spacing: 10px;
+            Rectangle { height: 8%; }
+            HorizontalLayout {
+                alignment: center;
+                VerticalLayout {
+                    spacing: 10px;
+                    width: 360px;
+
+                    Text {
+                        text: "FediTexter";
+                        font-size: 34px;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                        color: root.md3-primary;
+                    }
+
+                    Text {
+                        text: "A federated texting client";
+                        horizontal-alignment: center;
+                        color: root.md3-on-surface-variant;
+                    }
+
+                    if !root.register-mode: VerticalLayout {
+                        spacing: 8px;
+                        Text { text: "Server"; color: root.md3-on-surface; }
+                        LineEdit {
+                            text <=> root.server-input;
+                            placeholder-text: "https://your-server.example";
+                        }
+                        Text { text: "Email"; color: root.md3-on-surface; }
+                        LineEdit { text <=> root.login-email; placeholder-text: "you@example.com"; }
+                        Text { text: "Password"; color: root.md3-on-surface; }
+                        LineEdit {
+                            text <=> root.login-password;
+                            input-type: InputType.password;
+                            accepted(text) => {
+                                root.login(root.login-email, root.login-password);
+                            }
+                        }
+                        Button {
+                            text: "Login";
+                            primary: true;
+                            clicked => {
+                                root.login(root.login-email, root.login-password);
+                            }
+                        }
+                        Button {
+                            text: "Create account";
+                            clicked => { root.register-mode = true; }
+                        }
+                    }
+
+                    if root.register-mode: VerticalLayout {
+                        spacing: 8px;
+                        Text { text: "Server"; color: root.md3-on-surface; }
+                        LineEdit { text <=> root.server-input; placeholder-text: "https://your-server.example"; }
+                        Text { text: "Email"; color: root.md3-on-surface; }
+                        LineEdit { text <=> root.reg-email; placeholder-text: "you@example.com"; }
+                        Text { text: "Username"; color: root.md3-on-surface; }
+                        LineEdit { text <=> root.reg-username; placeholder-text: "alice"; }
+                        Text { text: "Password"; color: root.md3-on-surface; }
+                        LineEdit {
+                            text <=> root.reg-password;
+                            input-type: InputType.password;
+                            accepted(text) => {
+                                root.register(root.reg-email, root.reg-username, root.reg-password);
+                            }
+                        }
+                        Button {
+                            text: "Register";
+                            primary: true;
+                            clicked => {
+                                root.register(root.reg-email, root.reg-username, root.reg-password);
+                            }
+                        }
+                        Button {
+                            text: "Back to login";
+                            clicked => { root.register-mode = false; }
+                        }
+                    }
+
+                    if root.error-message != "": Text {
+                        text: root.error-message;
+                        wrap: word-wrap;
+                        color: root.md3-error;
+                        horizontal-alignment: center;
+                    }
+                }
+            }
+            Rectangle { height: 8%; }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Main screen
+    // ------------------------------------------------------------------
+    if root.logged-in: Rectangle {
+        background: root.md3-surface;
+        VerticalLayout {
+            spacing: 0px;
+            // Top app bar
+            Rectangle {
+                height: 56px;
+                background: root.md3-surface-container;
+                HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 8px;
+                    spacing: 12px;
+                    VerticalLayout { alignment: center;
+                        Text { text: "FediTexter"; font-weight: 700; color: root.md3-on-surface; }
+                    }
+                    Rectangle { height: 100%; }
+                    VerticalLayout { alignment: center;
+                        Text {
+                            text: root.ws-connected ? "live" : "reconnecting…";
+                            color: root.ws-connected ? root.md3-primary : root.md3-on-surface-variant;
+                            font-size: 12px;
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 0px;
+                        Button {
+                            text: "Settings";
+                            clicked => { root.settings-open = true; }
+                        }
+                        Button {
+                            text: "Logout";
+                            clicked => { root.logout(); }
+                        }
+                    }
+                }
+                VerticalLayout {
+                    x: (parent.width - 360px) / 2;
+                    y: 0px;
+                    width: 360px;
+                    height: 56px;
+                    alignment: center;
+                    Text {
+                        text: "Logged in as @" + root.user-name;
+                        horizontal-alignment: center;
+                        overflow: elide;
+                        color: root.md3-on-surface-variant;
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 0px;
+                // Conversation sidebar
+                Rectangle {
+                    width: 280px;
+                    background: root.md3-surface-container-low;
+                    VerticalLayout {
+                        spacing: 0px;
+                        Rectangle {
+                            height: 52px;
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                spacing: 8px;
+                                VerticalLayout { vertical-stretch: 1; alignment: center;
+                                    Text { text: "Conversations"; font-weight: 600; color: root.md3-on-surface; }
+                                }
+                                Rectangle { height: 100%; }
+                                VerticalLayout { vertical-stretch: 1; alignment: center;
+                                    Button {
+                                        text: "New";
+                                        clicked => { root.new-conversation-open = true; }
+                                    }
+                                }
+                            }
+                        }
+                        ListView {
+                            horizontal-stretch: 1;
+                            vertical-stretch: 1;
+                            for c in root.conversations: Rectangle {
+                                height: 48px;
+                                background: root.selected-conversation == c.id ? root.md3-secondary-container : root.md3-surface-container-low;
+                                TouchArea {
+                                    clicked => {
+                                        root.selected-conversation = c.id;
+                                        root.select-conversation(c.id);
+                                    }
+                                    pointer-event(ev) => {
+                                        if (ev.button == PointerEventButton.right && ev.kind == PointerEventKind.down) {
+                                            root.request-context(c.other-user-id, c.id, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                        }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    padding-left: 12px;
+                                    padding-right: 8px;
+                                    spacing: 10px;
+                                    VerticalLayout { vertical-stretch: 1; alignment: center;
+                                        Rectangle {
+                                            width: 32px;
+                                            height: 32px;
+                                            Avatar { avatar-text: c.avatar-text; avatar-color: c.avatar-color; size: 32px; }
+                                            TouchArea {
+                                                width: 100%;
+                                                height: 100%;
+                                                clicked => {
+                                                    root.selected-conversation = c.id;
+                                                    root.select-conversation(c.id);
+                                                    root.request-profile(c.other-user-id);
+                                                }
+                                                pointer-event(ev) => {
+                                                    if (ev.button == PointerEventButton.right && ev.kind == PointerEventKind.down) {
+                                                        root.request-context(c.other-user-id, c.id, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    VerticalLayout { vertical-stretch: 1; alignment: center;
+                                        Text {
+                                            text: c.title;
+                                            color: root.selected-conversation == c.id ? root.md3-on-secondary-container : root.md3-on-surface;
+                                            overflow: elide;
+                                        }
+                                    }
+                                    Rectangle { height: 100%; }
+                                    VerticalLayout { vertical-stretch: 1; alignment: center;
+                                        CloseButton {
+                                            text-color: root.selected-conversation == c.id ? root.md3-on-secondary-container : root.md3-on-surface-variant;
+                                            clicked => {
+                                                root.selected-conversation = -1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if root.error-message != "": Text {
+                            text: root.error-message;
+                            wrap: word-wrap;
+                            color: root.md3-error;
+                        }
+                    }
+                }
+
+                // Chat area
+                Rectangle {
+                    horizontal-stretch: 1;
+                    background: root.md3-surface;
+                    VerticalLayout {
+                        spacing: 4px;
+                        padding: 10px;
+                        if root.selected-conversation < 0: Rectangle {
+                            height: 100%;
+                            VerticalLayout { alignment: center;
+                                Text {
+                                    text: "Select a conversation, or press New to start one.";
+                                    color: root.md3-on-surface-variant;
+                                    horizontal-alignment: center;
+                                }
+                            }
+                        }
+                        if root.selected-conversation >= 0: Rectangle {
+                            horizontal-stretch: 1;
+                            vertical-stretch: 1;
+                            VerticalLayout {
+                                spacing: 8px;
+                                ListView {
+                                    horizontal-stretch: 1;
+                                    vertical-stretch: 1;
+                                    for m in root.messages: HorizontalLayout {
+                                        alignment: m.is-self ? LayoutAlignment.end : LayoutAlignment.start;
+                                        spacing: 8px;
+                                        if !m.is-self: VerticalLayout { vertical-stretch: 1; alignment: center;
+                                            Rectangle {
+                                                width: 28px;
+                                                height: 28px;
+                                                Avatar { avatar-text: m.avatar-text; avatar-color: m.avatar-color; size: 28px; }
+                                                TouchArea {
+                                                    width: 100%;
+                                                    height: 100%;
+                                                    clicked => { root.request-profile(m.sender-id); }
+                                                        pointer-event(ev) => {
+                                                            if (ev.button == PointerEventButton.right && ev.kind == PointerEventKind.down) {
+                                                                root.request-context(m.sender-id, root.selected-conversation, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                                            }
+                                                        }
+                                                }
+                                            }
+                                        }
+                                        Rectangle {
+                                            max-width: 480px;
+                                            min-height: 40px;
+                                            border-radius: 16px;
+                                            background: m.is-self ? root.md3-primary-container : root.md3-surface-container-high;
+                                            VerticalLayout {
+                                                padding: 8px;
+                                                spacing: 2px;
+                                                if !m.is-self: Text {
+                                                    text: m.sender + "  ·  " + m.created-at;
+                                                    font-size: 11px;
+                                                    color: root.md3-on-surface-variant;
+                                                    overflow: elide;
+                                                }
+                                                Text {
+                                                    text: m.body;
+                                                    wrap: word-wrap;
+                                                    color: m.is-self ? root.md3-on-primary-container : root.md3-on-surface;
+                                                }
+                                                if m.is-self: Text {
+                                                    text: "You  ·  " + m.created-at;
+                                                    font-size: 11px;
+                                                    color: root.md3-on-primary-container;
+                                                    horizontal-alignment: right;
+                                                }
+                                            }
+                                        }
+                                        if m.is-self: VerticalLayout { vertical-stretch: 1; alignment: center;
+                                            Avatar { avatar-text: m.avatar-text; avatar-color: m.avatar-color; size: 28px; }
+                                        }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Rectangle {
+                                        horizontal-stretch: 1;
+                                        height: max(48px, min(input.preferred-height + 20px, 160px));
+                                        border-width: 1px;
+                                        border-radius: 8px;
+                                        border-color: input.has-focus ? root.md3-primary : root.md3-outline;
+                                        background: root.md3-surface;
+                                        input := TextInput {
+                                            x: 10px;
+                                            y: 10px;
+                                            width: parent.width - 20px;
+                                            height: parent.height - 20px;
+                                            text <=> root.draft;
+                                            wrap: word-wrap;
+                                            single-line: false;
+                                            color: root.md3-on-surface;
+                                            font-size: 16px;
+                                            key-pressed(event) => {
+                                                if (event.text == Key.Return && !event.modifiers.shift) {
+                                                    root.send-message(root.draft);
+                                                    root.draft = "";
+                                                    return accept;
+                                                }
+                                                reject
+                                            }
+                                        }
+                                        Text {
+                                            x: 12px;
+                                            y: 12px;
+                                            text: root.draft == "" ? "Type a message…" : "";
+                                            color: root.md3-outline;
+                                            font-size: 16px;
+                                        }
+                                    }
+                                    VerticalLayout { vertical-stretch: 1; alignment: end;
+                                        Button {
+                                            text: "Send";
+                                            primary: true;
+                                            enabled: root.draft != "";
+                                            clicked => {
+                                                root.send-message(root.draft);
+                                                root.draft = "";
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // New conversation dialog (modal overlay)
+    // ------------------------------------------------------------------
+    if root.new-conversation-open: Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        background: #66000000;
+        Rectangle {
+            x: (parent.width - 380px) / 2;
+            y: (parent.height - 420px) / 2;
+            width: 380px;
+            height: 420px;
+            border-radius: 24px;
+            background: root.md3-surface-container-high;
+            CloseButton {
+                x: parent.width - 38px;
+                y: 12px;
+                text-color: root.md3-on-surface;
+                clicked => { root.new-conversation-open = false; }
+            }
+            VerticalLayout {
+                spacing: 12px;
+                padding: 20px;
+                Text {
+                    text: "New conversation";
+                    font-size: 20px;
+                    font-weight: 600;
+                    color: root.md3-on-surface;
+                }
+                Text { text: "User id, @handle, or profile URL"; color: root.md3-on-surface-variant; }
+                LineEdit { text <=> root.new-conversation-input; placeholder-text: "@alice@example.com"; }
+                if root.new-conversation-input != "" && root.suggestions.length > 0: Rectangle {
+                    height: 180px;
+                    border-radius: 12px;
+                    background: root.md3-surface-container-low;
+                    ListView {
+                        for c in root.suggestions: Rectangle {
+                            height: 46px;
+                            background: root.md3-surface-container-low;
+                            TouchArea {
+                                clicked => {
+                                    root.suggestion-selected(c.id);
+                                }
+                            }
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                spacing: 10px;
+                                VerticalLayout { vertical-stretch: 1; alignment: center;
+                                    Avatar { avatar-text: c.avatar-text; avatar-color: c.avatar-color; size: 28px; }
+                                }
+                                VerticalLayout { vertical-stretch: 1; alignment: center;
+                                    Text { text: c.name; color: root.md3-on-surface; overflow: elide; }
+                                }
+                                Rectangle { height: 100%; }
+                                VerticalLayout { vertical-stretch: 1; alignment: center;
+                                    Text { text: c.handle; color: root.md3-on-surface-variant; overflow: elide; font-size: 12px; }
+                                }
+                            }
+                        }
+                    }
+                }
+                Rectangle { height: 0px; horizontal-stretch: 1; }
+                if root.error-message != "": Text {
+                    text: root.error-message;
+                    wrap: word-wrap;
+                    color: root.md3-error;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    Button {
+                        text: "Cancel";
+                        clicked => { root.new-conversation-open = false; }
+                    }
+                    Button {
+                        text: "Start";
+                        primary: true;
+                        clicked => {
+                            root.new-conversation(root.new-conversation-input);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Settings dialog
+    // ------------------------------------------------------------------
+    if root.settings-open: Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        background: #66000000;
+        Rectangle {
+            x: (parent.width - 360px) / 2;
+            y: (parent.height - 320px) / 2;
+            width: 360px;
+            border-radius: 24px;
+            background: root.md3-surface-container-high;
+            CloseButton {
+                x: parent.width - 38px;
+                y: 12px;
+                text-color: root.md3-on-surface;
+                clicked => { root.settings-open = false; }
+            }
+            VerticalLayout {
+                spacing: 12px;
+                padding: 20px;
+                Text {
+                    text: "Settings";
+                    font-size: 20px;
+                    font-weight: 600;
+                    color: root.md3-on-surface;
+                }
+                Text { text: "Server"; color: root.md3-on-surface-variant; }
+                LineEdit { text <=> root.server-input; placeholder-text: "https://your-server.example"; }
+                Text { text: "Display name (shown to others)"; color: root.md3-on-surface-variant; }
+                LineEdit { text <=> root.display-name-input; placeholder-text: "Your name"; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "Connection: " + (root.ws-connected ? "live" : "reconnecting…");
+                        color: root.ws-connected ? root.md3-primary : root.md3-on-surface-variant;
+                        horizontal-alignment: center;
+                    }
+                }
+                Rectangle { height: 0px; horizontal-stretch: 1; }
+                if root.error-message != "": Text {
+                    text: root.error-message;
+                    wrap: word-wrap;
+                    color: root.md3-error;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    Button {
+                        text: "Cancel";
+                        clicked => { root.settings-open = false; }
+                    }
+                    Button {
+                        text: "Save";
+                        primary: true;
+                        clicked => {
+                            root.settings-saved();
+                            root.settings-open = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Email verification overlay
+    // ------------------------------------------------------------------
+    if root.needs-verify: Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        background: root.md3-surface;
+        VerticalLayout {
+            spacing: 10px;
+            Rectangle { height: 25%; }
+            HorizontalLayout {
+                alignment: center;
+                VerticalLayout {
+                    spacing: 14px;
+                    width: 360px;
+                    Text {
+                        text: "Verify your email";
+                        font-size: 24px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        color: root.md3-on-surface;
+                    }
+                    Text {
+                        text: "We sent a 6-digit code to your inbox. Enter it below to continue.";
+                        wrap: word-wrap;
+                        horizontal-alignment: center;
+                        color: root.md3-on-surface-variant;
+                    }
+                    LineEdit {
+                        text <=> root.verify-code;
+                        placeholder-text: "000000";
+                        accepted(text) => {
+                            root.verify(root.verify-code);
+                        }
+                    }
+                    if root.error-message != "": Text {
+                        text: root.error-message;
+                        wrap: word-wrap;
+                        color: root.md3-error;
+                        horizontal-alignment: center;
+                    }
+                    Button {
+                        text: "Verify";
+                        primary: true;
+                        enabled: root.verify-code != "";
+                        clicked => {
+                            root.verify(root.verify-code);
+                        }
+                    }
+                    Button {
+                        text: "Log out";
+                        clicked => { root.logout(); }
+                    }
+                }
+            }
+            Rectangle { height: 25%; }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Context menu (right-click on a user)
+    // ------------------------------------------------------------------
+    if root.context-open: Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        TouchArea {
+            width: 100%;
+            height: 100%;
+            clicked => { root.context-open = false; }
+        }
+        Rectangle {
+            x: max(0px, min(root.context-x, root.width - 190px));
+            y: max(0px, min(root.context-y, root.height - 190px));
+            width: 190px;
+            border-radius: 8px;
+            background: root.md3-surface-container-high;
+            VerticalLayout {
+                padding: 6px;
+                spacing: 2px;
+                if root.context-user-id >= 0: ContextMenuItem {
+                    text: "Profile";
+                    text-color: root.md3-on-surface;
+                    item-background: transparent;
+                    item-hover-background: root.md3-surface-container-low;
+                    clicked => {
+                        root.context-open = false;
+                        root.context-profile();
+                    }
+                }
+                if root.context-user-id >= 0: ContextMenuItem {
+                    text: root.context-blocked ? "Unblock" : "Block";
+                    text-color: root.md3-on-surface;
+                    item-background: transparent;
+                    item-hover-background: root.md3-surface-container-low;
+                    clicked => {
+                        root.context-open = false;
+                        root.toggle-block();
+                    }
+                }
+                if root.context-user-id >= 0: ContextMenuItem {
+                    text: root.context-muted ? "Unmute" : "Mute";
+                    text-color: root.md3-on-surface;
+                    item-background: transparent;
+                    item-hover-background: root.md3-surface-container-low;
+                    clicked => {
+                        root.context-open = false;
+                        root.toggle-mute();
+                    }
+                }
+                if root.context-conversation-id >= 0: ContextMenuItem {
+                    text: "Delete conversation";
+                    text-color: root.md3-error;
+                    item-background: transparent;
+                    item-hover-background: root.md3-surface-container-low;
+                    clicked => {
+                        root.context-open = false;
+                        root.context-delete();
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Profile card
+    // ------------------------------------------------------------------
+    if root.profile-open: Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        background: #66000000;
+        Rectangle {
+            x: (parent.width - 340px) / 2;
+            y: (parent.height - 400px) / 2;
+            width: 340px;
+            height: 400px;
+            border-radius: 24px;
+            background: root.md3-surface-container-high;
+            CloseButton {
+                x: parent.width - 38px;
+                y: 12px;
+                text-color: root.md3-on-surface;
+                clicked => { root.profile-open = false; }
+            }
+            VerticalLayout {
+                spacing: 10px;
+                padding: 24px;
+                VerticalLayout { alignment: center;
+                    Avatar { avatar-text: root.profile.avatar-text; avatar-color: root.profile.avatar-color; size: 72px; }
+                }
+                Text {
+                    text: root.profile.display-name;
+                    font-size: 20px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    color: root.md3-on-surface;
+                }
+                Text {
+                    text: root.profile.handle;
+                    horizontal-alignment: center;
+                    color: root.md3-on-surface-variant;
+                }
+                if root.profile.is-self: Text {
+                    text: "This is you";
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                    color: root.md3-primary;
+                }
+                if root.profile.blocked-by: Text {
+                    text: "You are blocked by this user";
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                    color: root.md3-error;
+                }
+                if !root.profile.is-self: Rectangle { height: 6px; }
+                if !root.profile.is-self: HorizontalLayout {
+                    spacing: 8px;
+                    alignment: center;
+                    Button {
+                        text: root.profile.blocked ? "Unblock" : "Block";
+                        clicked => { root.toggle-block(); }
+                    }
+                    Button {
+                        text: root.profile.muted ? "Unmute" : "Mute";
+                        clicked => { root.toggle-mute(); }
+                    }
+                }
+                Rectangle { height: 0px; horizontal-stretch: 1; }
+                if root.error-message != "": Text {
+                    text: root.error-message;
+                    wrap: word-wrap;
+                    color: root.md3-error;
+                    horizontal-alignment: center;
+                }
+                HorizontalLayout {
+                    alignment: center;
+                    Button {
+                        text: "Close";
+                        clicked => { root.profile-open = false; }
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Delete conversation confirmation
+    // ------------------------------------------------------------------
+    if root.confirm-delete-open: Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        background: #66000000;
+        Rectangle {
+            x: (parent.width - 380px) / 2;
+            y: (parent.height - 200px) / 2;
+            width: 380px;
+            height: 200px;
+            border-radius: 20px;
+            background: root.md3-surface-container-high;
+            VerticalLayout {
+                spacing: 12px;
+                padding: 20px;
+                Text {
+                    text: "Delete conversation?";
+                    font-size: 18px;
+                    font-weight: 600;
+                    color: root.md3-on-surface;
+                }
+                Text {
+                    text: "This will remove \"" + root.confirm-delete-title + "\" and its messages for you. This cannot be undone.";
+                    wrap: word-wrap;
+                    color: root.md3-on-surface-variant;
+                }
+                Rectangle { height: 0px; horizontal-stretch: 1; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    Button {
+                        text: "Cancel";
+                        clicked => { root.confirm-delete-open = false; }
+                    }
+                    Button {
+                        text: "Delete";
+                        primary: true;
+                        clicked => {
+                            root.confirm-delete();
+                            root.confirm-delete-open = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Slint attribution (royalty-free license)
+    Text {
+        x: 8px;
+        y: root.height - 24px;
+        text: "Made with Slint";
+        font-size: 10px;
+        color: root.md3-outline;
+    }
+}

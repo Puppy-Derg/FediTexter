@@ -41,12 +41,23 @@ pub async fn register(
     let password_hash = hash_password(&body.password)
         .map_err(|_| ApiError::Internal("hashing failed"))?;
 
-    let result = sqlx::query("INSERT INTO users (email, username, password_hash) VALUES (?, ?, ?)")
-        .bind(&body.email)
-        .bind(&body.username)
-        .bind(&password_hash)
-        .execute(&state.pool)
-        .await;
+    let (email_verified, verification_code) = if state.verify_emails {
+        (false, Some(crate::auth::generate_verification_code()))
+    } else {
+        (true, None)
+    };
+
+    let result = sqlx::query(
+        "INSERT INTO users (email, username, password_hash, email_verified, verification_code)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&body.email)
+    .bind(&body.username)
+    .bind(&password_hash)
+    .bind(email_verified)
+    .bind(&verification_code)
+    .execute(&state.pool)
+    .await;
 
     let user_id = match result {
         Ok(r) => r.last_insert_id(),
@@ -61,6 +72,7 @@ pub async fn register(
         email: body.email,
         username: body.username,
         display_name: String::new(),
+        email_verified,
     };
 
     let token = create_session(&state, user_id).await?;
@@ -73,15 +85,16 @@ pub async fn login(
     State(state): State<AppState>,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let row: Option<(u64, String, String, String, String)> = sqlx::query_as(
-        "SELECT id, email, username, display_name, password_hash FROM users WHERE email = ?",
+    let row: Option<(u64, String, String, String, String, bool)> = sqlx::query_as(
+        "SELECT id, email, username, display_name, password_hash, email_verified
+         FROM users WHERE email = ?",
     )
     .bind(&body.email)
     .fetch_optional(&state.pool)
     .await
     .map_err(|_| ApiError::Internal("db error"))?;
 
-    let (id, email, username, display_name, password_hash) = match row {
+    let (id, email, username, display_name, password_hash, email_verified) = match row {
         Some(r) => r,
         None => {
             verify_password(&body.password, DUMMY_PASSWORD_HASH);
@@ -93,7 +106,7 @@ pub async fn login(
         return Err(ApiError::Unauthorized("invalid credentials"));
     }
 
-    let user = User { id, email, username, display_name };
+    let user = User { id, email, username, display_name, email_verified };
     let token = create_session(&state, id).await?;
     Ok(Json(json!({ "token": token, "user": user })))
 }
@@ -112,6 +125,78 @@ pub async fn logout(
 
 pub async fn me(auth: AuthUser) -> Json<Value> {
     Json(json!({ "user": auth.user }))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateMeRequest {
+    pub display_name: String,
+}
+
+pub async fn update_me(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(body): Json<UpdateMeRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let display_name = body.display_name.trim().to_string();
+    if display_name.len() > 64 {
+        return Err(ApiError::BadRequest("display name too long (max 64)"));
+    }
+
+    sqlx::query("UPDATE users SET display_name = ? WHERE id = ?")
+        .bind(&display_name)
+        .bind(auth.user.id)
+        .execute(&state.pool)
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?;
+
+    let user: User = sqlx::query_as(
+        "SELECT id, email, username, display_name, email_verified FROM users WHERE id = ?",
+    )
+    .bind(auth.user.id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
+
+    Ok(Json(json!({ "user": user })))
+}
+
+#[derive(Deserialize)]
+pub struct VerifyRequest {
+    pub code: String,
+}
+
+pub async fn verify(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(body): Json<VerifyRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let code = body.code.trim().to_string();
+    if code.is_empty() {
+        return Err(ApiError::BadRequest("missing verification code"));
+    }
+
+    let result = sqlx::query(
+        "UPDATE users SET email_verified = TRUE WHERE id = ? AND verification_code = ?",
+    )
+    .bind(auth.user.id)
+    .bind(&code)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
+
+    if result.rows_affected() == 0 {
+        return Err(ApiError::BadRequest("invalid verification code"));
+    }
+
+    let user: User = sqlx::query_as(
+        "SELECT id, email, username, display_name, email_verified FROM users WHERE id = ?",
+    )
+    .bind(auth.user.id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
+
+    Ok(Json(json!({ "user": user })))
 }
 
 async fn create_session(state: &AppState, user_id: u64) -> Result<String, ApiError> {

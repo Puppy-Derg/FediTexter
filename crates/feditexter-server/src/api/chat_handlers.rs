@@ -86,8 +86,13 @@ async fn conversation_json(state: &AppState, conversation_id: u64) -> Result<Val
         .await
         .map_err(|_| ApiError::Internal("db error"))?;
 
-    let members: Vec<(u64,)> = sqlx::query_as(
-        "SELECT user_id FROM conversation_members WHERE conversation_id = ? ORDER BY user_id",
+    let members: Vec<(u64, String, String, u64, Option<String>)> = sqlx::query_as(
+        "SELECT m.user_id, u.username, u.display_name, u.server_id, s.domain
+         FROM conversation_members m
+         JOIN users u ON u.id = m.user_id
+         LEFT JOIN servers s ON s.id = u.server_id
+         WHERE m.conversation_id = ?
+         ORDER BY m.user_id",
     )
     .bind(conversation_id)
     .fetch_all(&state.pool)
@@ -97,7 +102,13 @@ async fn conversation_json(state: &AppState, conversation_id: u64) -> Result<Val
     Ok(json!({
         "id": conversation_id,
         "kind": kind,
-        "members": members.iter().map(|(id,)| json!({ "id": id })).collect::<Vec<_>>(),
+        "members": members
+            .iter()
+            .map(|(id, username, display_name, _server_id, domain)| {
+                let domain = domain.clone().unwrap_or_else(|| state.federation.domain.clone());
+                json!({ "id": id, "username": username, "display_name": display_name, "domain": domain })
+            })
+            .collect::<Vec<_>>(),
     }))
 }
 
@@ -243,4 +254,41 @@ pub async fn send_message(
     federation::deliver_outbound(&state, &message, &auth.user);
 
     Ok((StatusCode::CREATED, Json(json!({ "message": message }))))
+}
+
+/// Remove the current user from a conversation. If no members remain the
+/// conversation (and its messages) are deleted entirely.
+pub async fn delete_conversation(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(conversation_id): Path<u64>,
+) -> Result<StatusCode, ApiError> {
+    if !is_member(&state, conversation_id, auth.user.id).await? {
+        return Err(ApiError::NotFound("conversation not found"));
+    }
+
+    sqlx::query("DELETE FROM conversation_members WHERE conversation_id = ? AND user_id = ?")
+        .bind(conversation_id)
+        .bind(auth.user.id)
+        .execute(&state.pool)
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?;
+
+    let remaining: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM conversation_members WHERE conversation_id = ?",
+    )
+    .bind(conversation_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
+
+    if remaining.0 == 0 {
+        sqlx::query("DELETE FROM conversations WHERE id = ?")
+            .bind(conversation_id)
+            .execute(&state.pool)
+            .await
+            .map_err(|_| ApiError::Internal("db error"))?;
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }

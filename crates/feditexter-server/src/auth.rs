@@ -16,6 +16,7 @@ pub struct User {
     pub email: String,
     pub username: String,
     pub display_name: String,
+    pub email_verified: bool,
 }
 
 #[derive(FromRow)]
@@ -58,6 +59,13 @@ pub(crate) fn generate_token_pair() -> (String, String) {
     (token, hash)
 }
 
+pub(crate) fn generate_verification_code() -> String {
+    let mut bytes = [0u8; 4];
+    OsRng.fill_bytes(&mut bytes);
+    let code = u32::from_le_bytes(bytes) % 1_000_000;
+    format!("{code:06}")
+}
+
 pub(crate) const SESSION_DAYS: i64 = 30;
 
 impl FromRequestParts<AppState> for AuthUser {
@@ -87,7 +95,7 @@ impl FromRequestParts<AppState> for AuthUser {
         }
 
         let user: User = sqlx::query_as(
-            "SELECT id, email, username, display_name FROM users WHERE id = ?",
+            "SELECT id, email, username, display_name, email_verified FROM users WHERE id = ?",
         )
         .bind(session.user_id)
         .fetch_one(&state.pool)
