@@ -35,7 +35,6 @@ Decisions should be made with a majority of developers approval, with all devs k
 ## Never Implement
 
 - AI features, for example text gen, image gen.
-- Avoid using AI to write code (finding bugs is OK; bug reports do need to be written by a person and tested properly by that person).
 - Coder UI (unless that UI is not final/shipped, does not include beta testers).
 - Never allow people to ramble like the telegram dev does (just dont put it infront of all users faces without consent)
 - Avoid stuff like electron and be light weight to run
