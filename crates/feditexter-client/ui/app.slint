@@ -410,7 +410,7 @@ export component MainWindow inherits Window {
     property <brush> md3-error: #B3261E;
     property <brush> md3-outline: Palette.border;
     property <brush> md3-surface-container: root.accent-color.with-alpha(0.16);
-    property <brush> md3-surface-container-high: root.accent-color.with-alpha(0.24);
+    property <brush> md3-surface-container-high: Palette.alternate-background;
     property <brush> md3-surface-container-low: root.accent-color.with-alpha(0.10);
 
     // User-selectable accent color (saved to the settings file).
@@ -452,6 +452,7 @@ export component MainWindow inherits Window {
     in-out property<string> confirm-delete-title: "";
     in-out property<float> ui-scale: 1.0;
     property <float> ui-scale-base: 1.3;
+    property <float> content-scale: root.ui-scale * root.ui-scale-base;
     in-out property<bool> nc-append: false;
     in-out property<int> nc-cursor-len: 0;
     in-out property<int> msg-scroll-tick: 0;
@@ -516,14 +517,14 @@ export component MainWindow inherits Window {
     // Scaleable content: the whole UI is scaled by root.ui-scale so the
     // Ctrl/Cmd + +/- shortcuts can zoom in and out.
     // ------------------------------------------------------------------
-    Rectangle {
+    scaled := Rectangle {
         x: 0px;
         y: 0px;
-        width: parent.width / (root.ui-scale * root.ui-scale-base);
-        height: parent.height / (root.ui-scale * root.ui-scale-base);
+        width: parent.width / root.content-scale;
+        height: parent.height / root.content-scale;
         background: transparent;
-        transform-scale-x: root.ui-scale * root.ui-scale-base * 100%;
-        transform-scale-y: root.ui-scale * root.ui-scale-base * 100%;
+        transform-scale-x: root.content-scale * 100%;
+        transform-scale-y: root.content-scale * 100%;
         transform-origin: { x: 0px, y: 0px };
 
         // Translucent Material-You style backdrop
@@ -831,7 +832,7 @@ export component MainWindow inherits Window {
                                     }
                                     pointer-event(ev) => {
                                         if (ev.button == PointerEventButton.right && ev.kind == PointerEventKind.down) {
-                                            root.request-context(c.other-user-id, c.id, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                            root.request-context(c.other-user-id, c.id, self.absolute-position.x / root.content-scale + self.mouse-x, self.absolute-position.y / root.content-scale + self.mouse-y);
                                         }
                                     }
                                 }
@@ -872,7 +873,7 @@ export component MainWindow inherits Window {
                                                 }
                                                 pointer-event(ev) => {
                                                     if (ev.button == PointerEventButton.right && ev.kind == PointerEventKind.down) {
-                                                        root.request-context(c.other-user-id, c.id, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                                        root.request-context(c.other-user-id, c.id, self.absolute-position.x / root.content-scale + self.mouse-x, self.absolute-position.y / root.content-scale + self.mouse-y);
                                                     }
                                                 }
                                             }
@@ -987,7 +988,7 @@ export component MainWindow inherits Window {
                                                     clicked => { root.request-profile(m.sender-id); }
                                                         pointer-event(ev) => {
                                                             if (ev.button == PointerEventButton.right && ev.kind == PointerEventKind.down) {
-                                                                root.request-context(m.sender-id, root.selected-conversation, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                                                root.request-context(m.sender-id, root.selected-conversation, self.absolute-position.x / root.content-scale + self.mouse-x, self.absolute-position.y / root.content-scale + self.mouse-y);
                                                             }
                                                         }
                                                 }
@@ -1724,8 +1725,8 @@ export component MainWindow inherits Window {
         Rectangle {
             property <int> item-count: (root.context-user-id >= 0 ? 3 : 0) + (root.context-conversation-id >= 0 ? 1 : 0);
             property <length> menu-height: 12px + self.item-count * 34px + max(0, self.item-count - 1) * 2px;
-            x: root.context-x + self.width <= root.width ? root.context-x : max(0px, root.context-x - self.width);
-            y: root.context-y + self.menu-height <= root.height ? root.context-y : max(0px, root.context-y - self.menu-height);
+            x: root.context-x + self.width <= scaled.width ? root.context-x : max(0px, root.context-x - self.width);
+            y: root.context-y + self.menu-height <= scaled.height ? root.context-y : max(0px, root.context-y - self.menu-height);
             width: 190px;
             height: self.menu-height;
             border-radius: 8px;
