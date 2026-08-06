@@ -152,5 +152,9 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*
+          files: |
+            artifacts/feditexter-server/feditexter-server
+            artifacts/feditexter-client-windows-x64.exe/feditexter-client-windows-x64.exe
+            artifacts/feditexter-client-linux-x64/feditexter-client-linux-x64
+            artifacts/feditexter-client-macos-universal/feditexter-client-macos-universal.zip
           generate_release_notes: true
