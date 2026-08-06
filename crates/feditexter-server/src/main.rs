@@ -12,7 +12,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
     let public_domain = env::var("PUBLIC_DOMAIN").unwrap_or_else(|_| "localhost".to_string());
-    let verify_emails = env::var("REQUIRE_EMAIL_VERIFICATION").map(|v| v == "1").unwrap_or(false);
+    // Email verification is on by default; set REQUIRE_EMAIL_VERIFICATION=0 to disable.
+    let verify_emails = env::var("REQUIRE_EMAIL_VERIFICATION").map(|v| v != "0").unwrap_or(true);
     let mailer = if verify_emails {
         let m = feditexter_server::mail::Mailer::from_env();
         if m.is_none() {

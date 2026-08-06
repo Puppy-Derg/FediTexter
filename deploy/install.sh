@@ -24,6 +24,14 @@ DOMAIN="${FEDITEXTER_DOMAIN:-dergdungeon.com.au}"
 DB_NAME="${FEDITEXTER_DB:-feditexter}"
 DB_USER="${FEDITEXTER_DB_USER:-feditexter}"
 
+# Email verification / SMTP (configure via FEDITEXTER_SMTP_* or the prompts below)
+SMTP_HOST="${FEDITEXTER_SMTP_HOST:-}"
+SMTP_PORT="${FEDITEXTER_SMTP_PORT:-587}"
+SMTP_USER="${FEDITEXTER_SMTP_USER:-}"
+SMTP_PASS="${FEDITEXTER_SMTP_PASS:-}"
+SMTP_FROM="${FEDITEXTER_SMTP_FROM:-}"
+SMTP_REPLY_TO="${FEDITEXTER_SMTP_REPLY_TO:-}"
+
 log()  { echo "[install] $*"; }
 die()  { echo "[install] ERROR: $*" >&2; exit 1; }
 
@@ -38,6 +46,58 @@ latest_tag() {
 }
 
 gen_password() { openssl rand -hex 24; }
+
+# Add or update a KEY=VALUE line in .env, escaping & and | for sed.
+set_env() {
+    local key="$1" val="$2"
+    local esc
+    esc="$(printf '%s' "$val" | sed 's/[&|]/\\&/g')"
+    if grep -q "^$key=" "$ENV_FILE"; then
+        sed -i "s|^$key=.*|$key=$esc|" "$ENV_FILE"
+    else
+        printf '%s=%s\n' "$key" "$val" >> "$ENV_FILE"
+    fi
+}
+
+# Ask for a value unless one was already supplied via env var.
+ask() { # var_name prompt
+    local var="$1" prompt="$2"
+    if [[ -n "${!var}" ]]; then
+        return
+    fi
+    read -r -p "$prompt" val
+    eval "$var=\$val"
+}
+
+# Configure email verification + SMTP in .env (prompts when not provided).
+setup_email() {
+    if [[ -z "$SMTP_HOST" && -t 0 ]]; then
+        echo ""
+        echo "Email verification is ON by default and needs an SMTP account."
+        echo "Leave blank to skip (codes will be logged to journalctl instead)."
+        ask SMTP_HOST "SMTP host [e.g. smtp.postmarkapp.com]: "
+        if [[ -n "$SMTP_HOST" ]]; then
+            ask SMTP_PORT "SMTP port [$SMTP_PORT]: "
+            ask SMTP_USER "SMTP username: "
+            ask SMTP_PASS "SMTP password: "
+            ask SMTP_FROM "From email (no-reply preferred) [noreply@$DOMAIN]: "
+            [[ -n "$SMTP_FROM" ]] || SMTP_FROM="noreply@$DOMAIN"
+        fi
+    fi
+    set_env REQUIRE_EMAIL_VERIFICATION 1
+    if [[ -n "$SMTP_HOST" ]]; then
+        set_env SMTP_HOST "$SMTP_HOST"
+        set_env SMTP_PORT "$SMTP_PORT"
+        set_env SMTP_USERNAME "$SMTP_USER"
+        set_env SMTP_PASSWORD "$SMTP_PASS"
+        set_env SMTP_FROM "$SMTP_FROM"
+        [[ -n "$SMTP_REPLY_TO" ]] || SMTP_REPLY_TO="noreply@${SMTP_FROM##*@}"
+        set_env SMTP_REPLY_TO "$SMTP_REPLY_TO"
+        log "email verification enabled (SMTP $SMTP_HOST)"
+    else
+        log "WARNING: email verification is ON but SMTP is not configured; codes will be logged to journalctl -u $SERVICE_NAME"
+    fi
+}
 
 # DATABASE_URL=mysql://user:pass@host:port/db  -> fills DB_URL_* globals
 parse_db_url() {
@@ -140,6 +200,10 @@ fi
 chown root:root "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 log "wrote $ENV_FILE (chmod 600, root-owned)"
+
+setup_email
+chown root:root "$ENV_FILE"
+chmod 600 "$ENV_FILE"
 
 # ---------------------------------------------------------------------------
 # 5. binary download (latest release) + sanity check
