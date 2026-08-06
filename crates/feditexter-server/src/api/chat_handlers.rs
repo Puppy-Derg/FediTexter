@@ -303,11 +303,15 @@ pub async fn send_message(
             return Err(ApiError::BadRequest("attachment requires a mime type"));
         }
         if let Some(thumb) = &body.thumbnail_data {
-            if thumb.len() > 300_000 {
-                return Err(ApiError::BadRequest("thumbnail too large (max ~220KB)"));
-            }
-            if !thumb.starts_with("data:") {
-                return Err(ApiError::BadRequest("thumbnail must be a data: URL"));
+            // An empty thumbnail is fine (format we can't preview) — the
+            // recipient still receives the full file over P2P.
+            if !thumb.is_empty() {
+                if thumb.len() > 300_000 {
+                    return Err(ApiError::BadRequest("thumbnail too large (max ~220KB)"));
+                }
+                if !thumb.starts_with("data:") {
+                    return Err(ApiError::BadRequest("thumbnail must be a data: URL"));
+                }
             }
         }
     }

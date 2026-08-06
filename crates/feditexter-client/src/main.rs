@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use hmac::Mac as _;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel, Weak};
@@ -753,7 +754,9 @@ impl Backend {
                 // thumbnail so the recipient can render the bubble immediately.
                 payload["file_id"] = json!(att.file_id);
                 payload["file_size"] = json!(att.file_size);
-                payload["thumbnail_data"] = json!(att.thumbnail);
+                if !att.thumbnail.is_empty() {
+                    payload["thumbnail_data"] = json!(att.thumbnail);
+                }
             }
             let resp = match http.post(&url).bearer_auth(&token).json(&payload).send().await {
                 Ok(r) => r,
@@ -2240,7 +2243,158 @@ fn logout(sh: &Shared) {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// RFC 6238 TOTP for the bot's 2FA login. `secret` is a base32-encoded shared
+/// secret (same algorithm the server uses via totp_rs).
+fn totp_now(secret_base32: &str) -> String {
+    fn base32_decode(s: &str) -> Vec<u8> {
+        const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        let mut bits: u64 = 0;
+        let mut nbits = 0u32;
+        let mut out = Vec::new();
+        for &c in s.as_bytes() {
+            let c = c.to_ascii_uppercase();
+            let Some(val) = ALPHABET.iter().position(|&a| a == c) else {
+                continue;
+            };
+            bits = (bits << 5) | val as u64;
+            nbits += 5;
+            if nbits >= 8 {
+                nbits -= 8;
+                out.push((bits >> nbits) as u8);
+            }
+        }
+        out
+    }
+
+    let secret = base32_decode(secret_base32);
+    let counter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 30)
+        .unwrap_or(0);
+    let mut mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(&secret).expect("hmac key");
+    mac.update(&counter.to_be_bytes());
+    let digest = mac.finalize().into_bytes();
+    let offset = (digest[19] & 0x0f) as usize;
+    let code = u32::from_be_bytes([
+        digest[offset],
+        digest[offset + 1],
+        digest[offset + 2],
+        digest[offset + 3],
+    ]) & 0x7fff_ffff;
+    format!("{:06}", code % 1_000_000)
+}
+
+/// Headless test bot (`--bot`): logs in, stays online, echoes messages back and
+/// auto-receives P2P file transfers into `~/.feditexter_files`.
+///
+/// Config via env: `FEDITEXTER_BOT_SERVER` (default localhost:3000),
+/// `FEDITEXTER_BOT_EMAIL`, `FEDITEXTER_BOT_PASSWORD`, `FEDITEXTER_BOT_TOTP`
+/// (base32 secret).
+fn run_bot() -> Result<(), slint::PlatformError> {
+    let server = normalize_server(
+        &std::env::var("FEDITEXTER_BOT_SERVER").unwrap_or_else(|_| "localhost:3000".into()),
+    );
+    let email = match std::env::var("FEDITEXTER_BOT_EMAIL") {
+        Ok(e) => e,
+        Err(_) => {
+            eprintln!("[bot] FEDITEXTER_BOT_EMAIL is required");
+            return Ok(());
+        }
+    };
+    let password = match std::env::var("FEDITEXTER_BOT_PASSWORD") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("[bot] FEDITEXTER_BOT_PASSWORD is required");
+            return Ok(());
+        }
+    };
+    let totp_secret = std::env::var("FEDITEXTER_BOT_TOTP").unwrap_or_default();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (token_tx, token_rx) = watch::channel(None);
+    let (ws_tx, ws_rx) = mpsc::unbounded_channel();
+    let device_id = load_or_create_device_id();
+    let backend = Backend::new(tx.clone(), token_tx, ws_tx, device_id.clone());
+    let (_server_tx, server_rx) = watch::channel(server.clone());
+    spawn_ws(&backend.runtime, server_rx, token_rx, tx.clone(), ws_rx, device_id);
+    let p2p = P2pManager::new(backend.runtime.handle().clone(), backend.ws_tx.clone(), tx.clone());
+    let handle = backend.runtime.handle().clone();
+
+    handle.block_on(async move {
+        backend.login(&server, &email, &password, false);
+        let (self_id, token) = loop {
+            match rx.recv().await {
+                Some(Event::TwoFaRequired { pending_token }) => {
+                    if totp_secret.is_empty() {
+                        eprintln!("[bot] 2FA required but FEDITEXTER_BOT_TOTP is not set");
+                        return;
+                    }
+                    let code = totp_now(&totp_secret);
+                    backend.login_2fa(&server, pending_token, code, false);
+                }
+                Some(Event::LoggedIn { token, user }) => {
+                    backend.set_token(Some(token.clone()));
+                    eprintln!("[bot] logged in as {} (user {}) on {server}", user.username, user.id);
+                    break (user.id, token);
+                }
+                Some(Event::AuthFailed(m)) => {
+                    eprintln!("[bot] login failed: {m}; retrying in 5s");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    backend.login(&server, &email, &password, false);
+                }
+                Some(_) => {}
+                None => {
+                    eprintln!("[bot] event channel closed");
+                    return;
+                }
+            }
+        };
+
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                Event::WsMessage(m) => {
+                    if m.sender_id == self_id || !seen.insert(m.id) {
+                        continue;
+                    }
+                    if let Some(fid) = &m.file_id {
+                        p2p.fetch(fid, m.sender_id);
+                    }
+                    let reply = if let Some(fid) = &m.file_id {
+                        let name = m.attachment_name.clone().unwrap_or_else(|| "file".into());
+                        format!("📎 got your file \"{name}\" (id {fid})")
+                    } else if m.body.trim().eq_ignore_ascii_case("ping") {
+                        "pong".to_string()
+                    } else if !m.body.trim().is_empty() {
+                        format!("🤖 echo: {}", m.body.trim())
+                    } else {
+                        String::new()
+                    };
+                    if !reply.is_empty() {
+                        eprintln!("[bot] replying to message {}: {reply}", m.id);
+                        backend.send_message(&server, &token, m.conversation_id, reply, None);
+                    }
+                }
+                Event::P2pComplete { file_id, bytes, .. } => {
+                    if std::fs::create_dir_all(files_cache_dir()).is_ok() {
+                        let _ = std::fs::write(cache_path_for(&file_id), &bytes);
+                    }
+                    eprintln!("[bot] saved received file {file_id} ({} bytes)", bytes.len());
+                }
+                Event::P2pFailed { file_id, reason } => {
+                    eprintln!("[bot] transfer for {file_id} failed: {reason}");
+                }
+                _ => {}
+            }
+        }
+    });
+    Ok(())
+}
+
 fn main() -> Result<(), slint::PlatformError> {
+    if std::env::args().any(|a| a == "--bot") {
+        return run_bot();
+    }
     let backend = i_slint_backend_winit::Backend::builder()
         .with_window_attributes_hook(|attributes| {
             #[cfg(target_os = "macos")]

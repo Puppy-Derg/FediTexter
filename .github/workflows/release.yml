@@ -154,9 +154,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          RELEASE_ID=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${GITHUB_REF_NAME}" \
-            | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+          # A brand-new tag has no release yet (the "Create release" step below
+          # creates it), so the lookup 404s — nothing to clean up in that case.
+          RELEASE_RESP=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${GITHUB_REF_NAME}")
+          RELEASE_ID=$(echo "$RELEASE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
+          if [ -z "$RELEASE_ID" ]; then
+            echo "No existing release for ${GITHUB_REF_NAME}; nothing to clean up"
+            exit 0
+          fi
           ASSETS=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets" \
             | python3 -c "import json,sys; print(' '.join(str(a['id']) for a in json.load(sys.stdin) if a['name'].startswith('feditexter-client-macos-') and not a['name'].endswith('.zip')))")
