@@ -14,4 +14,6 @@ pub struct AppState {
     pub verify_emails: bool,
     /// SMTP mailer, present when SMTP is configured.
     pub mailer: Option<Mailer>,
+    /// Shared HTTP client for outbound fetches (link previews, federation).
+    pub http: reqwest::Client,
 }

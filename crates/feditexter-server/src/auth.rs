@@ -19,6 +19,8 @@ pub struct User {
     pub email_verified: bool,
     #[serde(default)]
     pub avatar_url: Option<String>,
+    #[serde(default)]
+    pub totp_enabled: bool,
 }
 
 #[derive(FromRow)]
@@ -26,6 +28,7 @@ struct Session {
     id: u64,
     user_id: u64,
     expires_at: chrono::NaiveDateTime,
+    is_2fa_pending: bool,
 }
 
 pub struct AuthUser {
@@ -84,7 +87,7 @@ impl FromRequestParts<AppState> for AuthUser {
         let token_hash = sha256(header);
 
         let session: Session = sqlx::query_as(
-            "SELECT id, user_id, expires_at FROM sessions WHERE token_hash = ?",
+            "SELECT id, user_id, expires_at, is_2fa_pending FROM sessions WHERE token_hash = ?",
         )
         .bind(&token_hash)
         .fetch_optional(&state.pool)
@@ -95,9 +98,12 @@ impl FromRequestParts<AppState> for AuthUser {
         if session.expires_at < chrono::Utc::now().naive_utc() {
             return Err(ApiError::Unauthorized("token expired"));
         }
+        if session.is_2fa_pending {
+            return Err(ApiError::Unauthorized("2fa required"));
+        }
 
         let user: User = sqlx::query_as(
-            "SELECT id, email, username, display_name, email_verified, avatar_url FROM users WHERE id = ?",
+            "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled FROM users WHERE id = ?",
         )
         .bind(session.user_id)
         .fetch_one(&state.pool)

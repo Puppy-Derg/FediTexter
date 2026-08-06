@@ -23,6 +23,10 @@ export struct UiMessage {
     attachment-image: image,
     attachment-name: string,
     attachment-mime: string,
+    preview-title: string,
+    preview-description: string,
+    preview-image: image,
+    preview-url: string,
 }
 
 export struct UiContact {
@@ -375,6 +379,14 @@ export component MainWindow inherits Window {
     in property<[UiContact]> suggestions;
     in-out property<bool> settings-open: false;
     in-out property<bool> needs-verify: false;
+    in-out property<bool> needs-2fa: false;
+    in-out property<string> pending-token: "";
+    in-out property<bool> totp-enabled: false;
+    in-out property<image> twofa-qr;
+    in-out property<string> twofa-secret: "";
+    in-out property<bool> twofa-setup-open: false;
+    in-out property<bool> twofa-disable-open: false;
+    in-out property<string> twofa-code: "";
     in-out property<bool> profile-open: false;
     in-out property<UiProfile> profile: { id: -1, username: "", display-name: "", handle: "", avatar-text: "", avatar-color: #888888, is-self: false, blocked: false, muted: false, blocked-by: false };
     in-out property<bool> context-open: false;
@@ -405,11 +417,16 @@ export component MainWindow inherits Window {
     callback new-conversation(input: string);
     callback verify(code: string);
     callback resend-code();
+    callback submit-2fa(code: string);
+    callback twofa-setup();
+    callback twofa-enable(code: string);
+    callback twofa-disable(code: string);
     callback settings-saved();
     callback settings-choose-avatar();
     callback settings-remove-avatar();
     callback choose-attachment();
     callback clear-attachment();
+    callback open-link(url: string);
     callback suggestion-selected(id: int);
     callback request-profile(user-id: int);
     callback request-context(user-id: int, conversation-id: int, x: length, y: length);
@@ -901,6 +918,52 @@ export component MainWindow inherits Window {
                                                     wrap: word-wrap;
                                                     color: m.is-self ? root.md3-on-primary-container : #E8E8E8;
                                                 }
+                                                if m.preview-url != "": Rectangle {
+                                                    width: 260px;
+                                                    border-radius: 10px;
+                                                    background: root.md3-surface-container-low;
+                                                    clip: true;
+                                                    VerticalLayout {
+                                                        spacing: 0px;
+                                                        if m.preview-image.width > 0: Rectangle {
+                                                            width: 260px;
+                                                            height: 130px;
+                                                            clip: true;
+                                                            background: #00000033;
+                                                            Image {
+                                                                width: 100%;
+                                                                height: 100%;
+                                                                source: m.preview-image;
+                                                                image-fit: cover;
+                                                            }
+                                                        }
+                                                        VerticalLayout {
+                                                            padding: 8px;
+                                                            spacing: 2px;
+                                                            if m.preview-title != "": Text {
+                                                                text: m.preview-title;
+                                                                font-size: 13px;
+                                                                font-weight: 600;
+                                                                color: root.md3-on-surface;
+                                                                wrap: word-wrap;
+                                                                max-height: 34px;
+                                                            }
+                                                            if m.preview-description != "": Text {
+                                                                text: m.preview-description;
+                                                                font-size: 12px;
+                                                                color: root.md3-on-surface-variant;
+                                                                wrap: word-wrap;
+                                                                max-height: 32px;
+                                                            }
+                                                        }
+                                                    }
+                                                    TouchArea {
+                                                        width: 100%;
+                                                        height: 100%;
+                                                        mouse-cursor: pointer;
+                                                        clicked => { root.open-link(m.preview-url); }
+                                                    }
+                                                }
                                                 if m.is-self: Text {
                                                     text: "You  ·  " + m.created-at;
                                                     font-size: 11px;
@@ -1032,7 +1095,7 @@ export component MainWindow inherits Window {
         }
         Rectangle {
             x: (parent.width - 420px) / 2;
-            y: (parent.height - 560px) / 2;
+            y: (parent.height - 640px) / 2;
             width: 420px;
             border-radius: 28px;
             background: root.md3-surface-container-high;
@@ -1081,6 +1144,102 @@ export component MainWindow inherits Window {
 
                 Text { text: "Display name (shown to others)"; color: root.md3-on-surface-variant; }
                 LineEdit { text <=> root.display-name-input; placeholder-text: "Your name"; }
+
+                Text { text: "Two-factor authentication"; color: root.md3-on-surface-variant; }
+                if !root.totp-enabled && !root.twofa-setup-open: HorizontalLayout {
+                    spacing: 8px;
+                    Button {
+                        text: "Enable 2FA";
+                        clicked => { root.twofa-setup(); }
+                    }
+                }
+                if root.twofa-setup-open: VerticalLayout {
+                    spacing: 8px;
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Rectangle {
+                            width: 120px;
+                            height: 120px;
+                            border-radius: 8px;
+                            clip: true;
+                            background: #FFFFFF;
+                            Image {
+                                source: root.twofa-qr;
+                                width: 100%;
+                                height: 100%;
+                                image-fit: contain;
+                            }
+                        }
+                        VerticalLayout {
+                            spacing: 4px;
+                            Text {
+                                text: "Scan with your authenticator app, or enter the secret:";
+                                font-size: 12px;
+                                color: root.md3-on-surface-variant;
+                                wrap: word-wrap;
+                            }
+                            Text {
+                                text: root.twofa-secret;
+                                font-size: 12px;
+                                color: root.md3-on-surface;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                    LineEdit {
+                        text <=> root.twofa-code;
+                        placeholder-text: "Enter 6-digit code";
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: end;
+                        Button {
+                            text: "Cancel";
+                            clicked => { root.twofa-setup-open = false; root.twofa-code = ""; }
+                        }
+                        Button {
+                            text: "Confirm";
+                            primary: true;
+                            accent: root.accent-color;
+                            on-accent: root.md3-on-primary;
+                            enabled: root.twofa-code != "";
+                            clicked => { root.twofa-enable(root.twofa-code); root.twofa-code = ""; }
+                        }
+                    }
+                }
+                if root.totp-enabled && !root.twofa-disable-open: HorizontalLayout {
+                    spacing: 8px;
+                    VerticalLayout { vertical-stretch: 1; alignment: center;
+                        Text { text: "2FA is on"; color: root.md3-on-surface-variant; }
+                    }
+                    Button {
+                        text: "Disable";
+                        clicked => { root.twofa-disable-open = true; }
+                    }
+                }
+                if root.twofa-disable-open: VerticalLayout {
+                    spacing: 8px;
+                    LineEdit {
+                        text <=> root.twofa-code;
+                        placeholder-text: "Enter 6-digit code";
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: end;
+                        Button {
+                            text: "Cancel";
+                            clicked => { root.twofa-disable-open = false; root.twofa-code = ""; }
+                        }
+                        Button {
+                            text: "Disable";
+                            primary: true;
+                            accent: root.accent-color;
+                            on-accent: root.md3-on-primary;
+                            enabled: root.twofa-code != "";
+                            clicked => { root.twofa-disable(root.twofa-code); root.twofa-code = ""; }
+                        }
+                    }
+                }
 
                 Text { text: "Accent color"; color: root.md3-on-surface-variant; }
                 HorizontalLayout {
@@ -1209,6 +1368,73 @@ export component MainWindow inherits Window {
                 }
             }
             Rectangle { height: 25%; }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Two-factor authentication (login)
+    // ------------------------------------------------------------------
+    if root.needs-2fa: Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        background: root.md3-surface;
+        TouchArea {
+            width: 100%;
+            height: 100%;
+        }
+        VerticalLayout {
+            spacing: 10px;
+            Rectangle { height: 28%; }
+            HorizontalLayout {
+                alignment: center;
+                VerticalLayout {
+                    spacing: 14px;
+                    width: 360px;
+                    Text {
+                        text: "Two-factor authentication";
+                        font-size: 24px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        color: root.md3-on-surface;
+                    }
+                    Text {
+                        text: "Enter the 6-digit code from your authenticator app to continue.";
+                        wrap: word-wrap;
+                        horizontal-alignment: center;
+                        color: root.md3-on-surface-variant;
+                    }
+                    LineEdit {
+                        text <=> root.twofa-code;
+                        placeholder-text: "000000";
+                        accepted(text) => {
+                            root.submit-2fa(root.twofa-code);
+                        }
+                    }
+                    if root.error-message != "": Text {
+                        text: root.error-message;
+                        wrap: word-wrap;
+                        color: root.md3-error;
+                        horizontal-alignment: center;
+                    }
+                    Button {
+                        text: "Verify";
+                        primary: true;
+                        accent: root.accent-color;
+                        on-accent: root.md3-on-primary;
+                        enabled: root.twofa-code != "";
+                        clicked => {
+                            root.submit-2fa(root.twofa-code);
+                        }
+                    }
+                    Button {
+                        text: "Log out";
+                        clicked => { root.logout(); }
+                    }
+                }
+            }
+            Rectangle { height: 28%; }
         }
     }
 

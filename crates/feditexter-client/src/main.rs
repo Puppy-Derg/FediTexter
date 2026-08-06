@@ -28,6 +28,8 @@ struct User {
     email_verified: bool,
     #[serde(default)]
     avatar_url: Option<String>,
+    #[serde(default)]
+    totp_enabled: bool,
 }
 
 fn default_email_verified() -> bool {
@@ -118,6 +120,17 @@ struct Attachment {
     data: String,
 }
 
+#[derive(Deserialize, Clone, Debug)]
+struct LinkPreview {
+    url: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    image: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Events flowing from background tasks to the UI
 // ---------------------------------------------------------------------------
@@ -140,6 +153,10 @@ enum Event {
     ConversationDeleted(u64),
     UploadAvatar { server: String, token: String, data_url: String },
     AttachmentPicked(Attachment),
+    LinkPreview(LinkPreview),
+    LinkPreviewFailed(String),
+    TwoFaRequired { pending_token: String },
+    TwoFaSetup { secret: String, qr: String },
     Error(String),
 }
 
@@ -175,6 +192,46 @@ impl Backend {
             let url = api_url(&server, "/api/login");
             match http.post(&url).json(&json!({ "email": email, "password": password })).send().await {
                 Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<Value>().await {
+                        Ok(v) => {
+                            if v.get("requires_2fa").and_then(|b| b.as_bool()).unwrap_or(false) {
+                                let pending = v.get("pending_token").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                                let _ = tx.send(Event::TwoFaRequired { pending_token: pending });
+                            } else if let Ok(r) = serde_json::from_value::<AuthResponse>(v.clone()) {
+                                let _ = tx.send(Event::LoggedIn { token: r.token, user: r.user });
+                            } else {
+                                let _ = tx.send(Event::AuthFailed("malformed server response".into()));
+                            }
+                        }
+                        Err(_) => {
+                            let _ = tx.send(Event::AuthFailed("malformed server response".into()));
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    let msg = error_message(resp).await;
+                    let _ = tx.send(Event::AuthFailed(msg));
+                }
+                Err(e) => {
+                    let _ = tx.send(Event::AuthFailed(format!("{e}")));
+                }
+            }
+        });
+    }
+
+    fn login_2fa(&self, server: &str, pending_token: String, code: String) {
+        let tx = self.tx.clone();
+        let http = self.http.clone();
+        let server = server.to_string();
+        self.runtime.spawn(async move {
+            let url = api_url(&server, "/api/login/2fa");
+            match http
+                .post(&url)
+                .json(&json!({ "pending_token": pending_token, "code": code }))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
                     match resp.json::<AuthResponse>().await {
                         Ok(r) => {
                             let _ = tx.send(Event::LoggedIn { token: r.token, user: r.user });
@@ -191,6 +248,89 @@ impl Backend {
                 Err(e) => {
                     let _ = tx.send(Event::AuthFailed(format!("{e}")));
                 }
+            }
+        });
+    }
+
+    fn twofa_setup(&self, server: &str, token: &str) {
+        let tx = self.tx.clone();
+        let http = self.http.clone();
+        let server = server.to_string();
+        let token = token.to_string();
+        self.runtime.spawn(async move {
+            let url = api_url(&server, "/api/me/2fa/setup");
+            let resp = match http.post(&url).bearer_auth(&token).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Event::Error(format!("{e}")));
+                    return;
+                }
+            };
+            if !resp.status().is_success() {
+                let _ = tx.send(Event::Error(error_message(resp).await));
+                return;
+            }
+            match resp.json::<Value>().await {
+                Ok(v) => {
+                    let secret = v.get("secret").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                    let qr = v.get("qr").and_then(|q| q.as_str()).unwrap_or("").to_string();
+                    let _ = tx.send(Event::TwoFaSetup { secret, qr });
+                }
+                Err(_) => {
+                    let _ = tx.send(Event::Error("malformed server response".into()));
+                }
+            }
+        });
+    }
+
+    fn twofa_enable(&self, server: &str, token: &str, code: String) {
+        let tx = self.tx.clone();
+        let http = self.http.clone();
+        let server = server.to_string();
+        let token = token.to_string();
+        self.runtime.spawn(async move {
+            let url = api_url(&server, "/api/me/2fa/enable");
+            let resp = match http.post(&url).bearer_auth(&token).json(&json!({ "code": code })).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Event::Error(format!("{e}")));
+                    return;
+                }
+            };
+            if !resp.status().is_success() {
+                let _ = tx.send(Event::Error(error_message(resp).await));
+                return;
+            }
+            if let Ok(v) = resp.json::<Value>().await
+                && let Ok(u) = serde_json::from_value::<User>(v.get("user").cloned().unwrap_or(Value::Null))
+            {
+                let _ = tx.send(Event::UserUpdated(u));
+            }
+        });
+    }
+
+    fn twofa_disable(&self, server: &str, token: &str, code: String) {
+        let tx = self.tx.clone();
+        let http = self.http.clone();
+        let server = server.to_string();
+        let token = token.to_string();
+        self.runtime.spawn(async move {
+            let url = api_url(&server, "/api/me/2fa/disable");
+            let resp = match http.post(&url).bearer_auth(&token).json(&json!({ "code": code })).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Event::Error(format!("{e}")));
+                    return;
+                }
+            };
+            if !resp.status().is_success() {
+                let _ = tx.send(Event::Error(error_message(resp).await));
+                return;
+            }
+            if let Ok(v) = resp.json::<Value>().await
+                && let Ok(u) = serde_json::from_value::<User>(v.get("user").cloned().unwrap_or(Value::Null))
+            {
+                let _ = tx.send(Event::UserUpdated(u));
             }
         });
     }
@@ -366,6 +506,34 @@ impl Backend {
             };
             if let Ok(u) = serde_json::from_value::<User>(v.get("user").cloned().unwrap_or(Value::Null)) {
                 let _ = tx.send(Event::UserUpdated(u));
+            }
+        });
+    }
+
+    fn fetch_link_preview(&self, server: &str, url: String) {
+        let tx = self.tx.clone();
+        let http = self.http.clone();
+        let server = server.to_string();
+        self.runtime.spawn(async move {
+            let url_api = api_url(&server, "/api/link-preview");
+            let resp = match http.post(&url_api).json(&json!({ "url": url })).send().await {
+                Ok(r) => r,
+                Err(_) => {
+                    let _ = tx.send(Event::LinkPreviewFailed(url));
+                    return;
+                }
+            };
+            if !resp.status().is_success() {
+                let _ = tx.send(Event::LinkPreviewFailed(url));
+                return;
+            }
+            match resp.json::<LinkPreview>().await {
+                Ok(p) => {
+                    let _ = tx.send(Event::LinkPreview(p));
+                }
+                Err(_) => {
+                    let _ = tx.send(Event::LinkPreviewFailed(url));
+                }
             }
         });
     }
@@ -883,6 +1051,8 @@ struct Shared {
     unread: Rc<RefCell<std::collections::HashMap<u64, u32>>>,
     avatar_cache: Rc<RefCell<std::collections::HashMap<u64, slint::Image>>>,
     pending_attach: Rc<RefCell<Option<Attachment>>>,
+    preview_cache: Rc<RefCell<std::collections::HashMap<String, Option<LinkPreview>>>>,
+    preview_requested: Rc<RefCell<std::collections::HashSet<String>>>,
 }
 
 impl Shared {
@@ -1010,6 +1180,22 @@ fn set_error(sh: &Shared, msg: &str) {
     sh.ui().set_error_message(msg.into());
 }
 
+/// Open a URL in the system browser.
+fn open_in_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd").args(["/c", "start", "", url]).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
 /// Scroll the message list to the bottom. The tick triggers a Slint-side
 /// scroll; the delayed second tick re-applies it after the list has relaid out
 /// so `viewport-height` reflects the new messages.
@@ -1122,6 +1308,20 @@ fn format_local_time(created_at: &str) -> String {
     } else {
         local.format("%d %b %H:%M").to_string()
     }
+}
+
+/// Find the first http(s):// URL in a string.
+fn first_url(text: &str) -> Option<String> {
+    for (i, _) in text.match_indices("http") {
+        let rest = &text[i..];
+        if let Some(start) = rest.strip_prefix("https://").or_else(|| rest.strip_prefix("http://")) {
+            let end = start.find(|c: char| c.is_whitespace() || c == '"' || c == '\'').unwrap_or(start.len());
+            if end > 0 {
+                return Some(format!("http{}://{}", if rest.starts_with("https") { "s" } else { "" }, &start[..end]));
+            }
+        }
+    }
+    None
 }
 
 fn refresh_conversations_ui(sh: &Shared) {
@@ -1269,6 +1469,34 @@ fn refresh_messages_ui(sh: &Shared) {
             } else {
                 slint::Image::default()
             };
+
+            let mut preview_title = SharedString::default();
+            let mut preview_desc = SharedString::default();
+            let mut preview_image = slint::Image::default();
+            let mut preview_url = SharedString::default();
+            if let Some(url) = first_url(&m.body) {
+                let cached = sh.preview_cache.borrow().get(&url).cloned();
+                match cached {
+                    Some(p) => {
+                        if let Some(p) = p {
+                            if let Some(img) = &p.image {
+                                preview_image = load_avatar_image(img).unwrap_or_default();
+                            }
+                            preview_title = p.title.clone().unwrap_or_default().into();
+                            preview_desc = p.description.clone().unwrap_or_default().into();
+                            preview_url = p.url.clone().into();
+                        }
+                    }
+                    None => {
+                        let mut requested = sh.preview_requested.borrow_mut();
+                        if requested.insert(url.clone()) {
+                            drop(requested);
+                            sh.backend.fetch_link_preview(&sh.server(), url);
+                        }
+                    }
+                }
+            }
+
             UiMessage {
                 id: m.id as i32,
                 sender: sender.into(),
@@ -1282,6 +1510,10 @@ fn refresh_messages_ui(sh: &Shared) {
                 attachment_image,
                 attachment_name: m.attachment_name.clone().unwrap_or_default().into(),
                 attachment_mime: m.attachment_mime.clone().unwrap_or_default().into(),
+                preview_title,
+                preview_description: preview_desc,
+                preview_image,
+                preview_url,
             }
         })
         .collect();
@@ -1320,6 +1552,8 @@ fn handle_event(sh: &Shared, ev: Event) {
             ui.set_user_name(user.username.clone().into());
             ui.set_display_name_input(user.display_name.clone().into());
             ui.set_needs_verify(!user.email_verified);
+            ui.set_needs_2fa(false);
+            ui.set_totp_enabled(user.totp_enabled);
             ui.set_error_message(SharedString::default());
             ui.set_selected_conversation(-1);
             ui.set_profile_open(false);
@@ -1352,6 +1586,11 @@ fn handle_event(sh: &Shared, ev: Event) {
             let ui = sh.ui();
             ui.set_display_name_input(u.display_name.clone().into());
             ui.set_error_message(SharedString::default());
+            ui.set_totp_enabled(u.totp_enabled);
+            if u.totp_enabled {
+                ui.set_twofa_setup_open(false);
+                ui.set_twofa_disable_open(false);
+            }
             if let Some(url) = &u.avatar_url {
                 if let Some(img) = load_avatar_image(url) {
                     sh.avatar_cache.borrow_mut().insert(u.id, img.clone());
@@ -1461,6 +1700,29 @@ fn handle_event(sh: &Shared, ev: Event) {
             }
             *sh.pending_attach.borrow_mut() = Some(att);
         }
+        Event::LinkPreview(p) => {
+            sh.preview_requested.borrow_mut().remove(&p.url);
+            sh.preview_cache.borrow_mut().insert(p.url.clone(), Some(p));
+            refresh_messages_ui(sh);
+        }
+        Event::LinkPreviewFailed(url) => {
+            sh.preview_requested.borrow_mut().remove(&url);
+            sh.preview_cache.borrow_mut().insert(url, None);
+            refresh_messages_ui(sh);
+        }
+        Event::TwoFaRequired { pending_token } => {
+            let ui = sh.ui();
+            ui.set_pending_token(pending_token.into());
+            ui.set_error_message(SharedString::default());
+            ui.set_needs_2fa(true);
+        }
+        Event::TwoFaSetup { secret, qr } => {
+            let ui = sh.ui();
+            ui.set_twofa_secret(secret.into());
+            ui.set_twofa_qr(load_avatar_image(&qr).unwrap_or_default());
+            ui.set_error_message(SharedString::default());
+            ui.set_twofa_setup_open(true);
+        }
         Event::Error(m) => set_error(sh, &m),
     }
 }
@@ -1477,6 +1739,8 @@ fn logout(sh: &Shared) {
     let ui = sh.ui();
     ui.set_logged_in(false);
     ui.set_needs_verify(false);
+    ui.set_needs_2fa(false);
+    ui.set_pending_token(SharedString::default());
     ui.set_user_name(SharedString::default());
     ui.set_selected_conversation(-1);
     ui.set_error_message(SharedString::default());
@@ -1552,6 +1816,8 @@ fn main() -> Result<(), slint::PlatformError> {
         unread: Rc::new(RefCell::new(std::collections::HashMap::new())),
         avatar_cache: Rc::new(RefCell::new(std::collections::HashMap::new())),
         pending_attach: Rc::new(RefCell::new(None)),
+        preview_cache: Rc::new(RefCell::new(std::collections::HashMap::new())),
+        preview_requested: Rc::new(RefCell::new(std::collections::HashSet::new())),
     });
 
     {
@@ -1679,6 +1945,44 @@ fn main() -> Result<(), slint::PlatformError> {
             if let Some(token) = sh.token.borrow().clone() {
                 sh.backend.resend_verification(&sh.server(), &token);
             }
+        });
+    }
+    {
+        let sh = shared.clone();
+        ui.on_submit_2fa(move |code| {
+            let pending = sh.ui().get_pending_token().to_string();
+            if !pending.is_empty() {
+                sh.backend.login_2fa(&sh.server(), pending, code.trim().to_string());
+            }
+        });
+    }
+    {
+        let sh = shared.clone();
+        ui.on_twofa_setup(move || {
+            if let Some(token) = sh.token.borrow().clone() {
+                sh.backend.twofa_setup(&sh.server(), &token);
+            }
+        });
+    }
+    {
+        let sh = shared.clone();
+        ui.on_twofa_enable(move |code| {
+            if let Some(token) = sh.token.borrow().clone() {
+                sh.backend.twofa_enable(&sh.server(), &token, code.trim().to_string());
+            }
+        });
+    }
+    {
+        let sh = shared.clone();
+        ui.on_twofa_disable(move |code| {
+            if let Some(token) = sh.token.borrow().clone() {
+                sh.backend.twofa_disable(&sh.server(), &token, code.trim().to_string());
+            }
+        });
+    }
+    {
+        ui.on_open_link(move |url| {
+            open_in_browser(&url);
         });
     }
     {

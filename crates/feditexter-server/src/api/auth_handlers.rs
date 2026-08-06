@@ -74,6 +74,7 @@ pub async fn register(
         display_name: String::new(),
         email_verified,
         avatar_url: None,
+        totp_enabled: false,
     };
 
     let token = create_session(&state, user_id).await?;
@@ -105,8 +106,8 @@ pub async fn login(
     State(state): State<AppState>,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let row: Option<(u64, String, String, String, String, bool, Option<String>)> = sqlx::query_as(
-        "SELECT id, email, username, display_name, password_hash, email_verified, avatar_url
+    let row: Option<(u64, String, String, String, String, bool, Option<String>, bool)> = sqlx::query_as(
+        "SELECT id, email, username, display_name, password_hash, email_verified, avatar_url, totp_enabled
          FROM users WHERE email = ?",
     )
     .bind(&body.email)
@@ -114,7 +115,7 @@ pub async fn login(
     .await
     .map_err(|_| ApiError::Internal("db error"))?;
 
-    let (id, email, username, display_name, password_hash, email_verified, avatar_url) = match row {
+    let (id, email, username, display_name, password_hash, email_verified, avatar_url, totp_enabled) = match row {
         Some(r) => r,
         None => {
             verify_password(&body.password, DUMMY_PASSWORD_HASH);
@@ -126,9 +127,187 @@ pub async fn login(
         return Err(ApiError::Unauthorized("invalid credentials"));
     }
 
-    let user = User { id, email, username, display_name, email_verified, avatar_url };
+    let user = User { id, email, username, display_name, email_verified, avatar_url, totp_enabled };
+
+    if totp_enabled {
+        // Create a 2FA-pending session; the client must complete /api/login/2fa.
+        let pending_token = create_pending_session(&state, id).await?;
+        return Ok(Json(json!({
+            "requires_2fa": true,
+            "pending_token": pending_token,
+        })));
+    }
+
     let token = create_session(&state, id).await?;
     Ok(Json(json!({ "token": token, "user": user })))
+}
+
+#[derive(Deserialize)]
+pub struct Login2faRequest {
+    pub pending_token: String,
+    pub code: String,
+}
+
+/// Complete a 2FA login: verify the TOTP code for the pending session.
+pub async fn login_2fa(
+    State(state): State<AppState>,
+    Json(body): Json<Login2faRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let token_hash = crate::auth::sha256(body.pending_token.trim());
+    let row: Option<(u64, u64)> = sqlx::query_as(
+        "SELECT id, user_id FROM sessions WHERE token_hash = ? AND is_2fa_pending = 1",
+    )
+    .bind(&token_hash)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
+
+    let (session_id, user_id) = match row {
+        Some(r) => r,
+        None => return Err(ApiError::Unauthorized("invalid or expired pending token")),
+    };
+
+    let secret: String = sqlx::query_scalar("SELECT totp_secret FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?
+        .ok_or(ApiError::Unauthorized("2fa not enabled"))?;
+
+    if !totp_check(&secret, &body.code) {
+        return Err(ApiError::Unauthorized("invalid code"));
+    }
+
+    sqlx::query("UPDATE sessions SET is_2fa_pending = 0 WHERE id = ?")
+        .bind(session_id)
+        .execute(&state.pool)
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?;
+
+    let user: User = sqlx::query_as(
+        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled FROM users WHERE id = ?",
+    )
+    .bind(user_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
+
+    Ok(Json(json!({ "token": body.pending_token, "user": user })))
+}
+
+/// Generate a TOTP secret for the user and return the otpauth URI + QR PNG.
+pub async fn two_fa_setup(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> Result<Json<Value>, ApiError> {
+    let base32 = totp_generate_base32();
+    sqlx::query("UPDATE users SET totp_secret = ?, totp_enabled = 0 WHERE id = ?")
+        .bind(&base32)
+        .bind(auth.user.id)
+        .execute(&state.pool)
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?;
+
+    let uri = format!(
+        "otpauth://totp/FediTexter:{}?secret={}&issuer=FediTexter&algorithm=SHA1&digits=6&period=30",
+        auth.user.email, base32
+    );
+    let qr = totp_qr_png(&uri);
+
+    Ok(Json(json!({
+        "secret": base32,
+        "uri": uri,
+        "qr": qr,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct TwoFaCodeRequest {
+    pub code: String,
+}
+
+/// Enable 2FA after verifying the current code against the stored secret.
+pub async fn two_fa_enable(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(body): Json<TwoFaCodeRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let secret: Option<String> = sqlx::query_scalar("SELECT totp_secret FROM users WHERE id = ?")
+        .bind(auth.user.id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?;
+
+    match secret {
+        Some(secret) if totp_check(&secret, &body.code) => {
+            sqlx::query("UPDATE users SET totp_enabled = 1 WHERE id = ?")
+                .bind(auth.user.id)
+                .execute(&state.pool)
+                .await
+                .map_err(|_| ApiError::Internal("db error"))?;
+        }
+        _ => return Err(ApiError::BadRequest("invalid code")),
+    }
+
+    let user: User = sqlx::query_as(
+        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled FROM users WHERE id = ?",
+    )
+    .bind(auth.user.id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
+
+    Ok(Json(json!({ "user": user })))
+}
+
+/// Disable 2FA after verifying the current code.
+pub async fn two_fa_disable(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(body): Json<TwoFaCodeRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let secret: Option<String> = sqlx::query_scalar("SELECT totp_secret FROM users WHERE id = ?")
+        .bind(auth.user.id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?;
+
+    match secret {
+        Some(secret) if totp_check(&secret, &body.code) => {
+            sqlx::query("UPDATE users SET totp_enabled = 0, totp_secret = NULL WHERE id = ?")
+                .bind(auth.user.id)
+                .execute(&state.pool)
+                .await
+                .map_err(|_| ApiError::Internal("db error"))?;
+        }
+        _ => return Err(ApiError::BadRequest("invalid code")),
+    }
+
+    let user: User = sqlx::query_as(
+        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled FROM users WHERE id = ?",
+    )
+    .bind(auth.user.id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
+
+    Ok(Json(json!({ "user": user })))
+}
+
+/// Create a session that requires 2FA before it can be used.
+async fn create_pending_session(state: &AppState, user_id: u64) -> Result<String, ApiError> {
+    let (token, token_hash) = crate::auth::generate_token_pair();
+    let expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::minutes(10);
+    sqlx::query(
+        "INSERT INTO sessions (user_id, token_hash, expires_at, is_2fa_pending) VALUES (?, ?, ?, 1)",
+    )
+    .bind(user_id)
+    .bind(&token_hash)
+    .bind(expires_at)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
+    Ok(token)
 }
 
 pub async fn logout(
@@ -170,7 +349,7 @@ pub async fn update_me(
         .map_err(|_| ApiError::Internal("db error"))?;
 
     let user: User = sqlx::query_as(
-        "SELECT id, email, username, display_name, email_verified, avatar_url FROM users WHERE id = ?",
+        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled FROM users WHERE id = ?",
     )
     .bind(auth.user.id)
     .fetch_one(&state.pool)
@@ -209,7 +388,7 @@ pub async fn verify(
     }
 
     let user: User = sqlx::query_as(
-        "SELECT id, email, username, display_name, email_verified, avatar_url FROM users WHERE id = ?",
+        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled FROM users WHERE id = ?",
     )
     .bind(auth.user.id)
     .fetch_one(&state.pool)
@@ -251,7 +430,7 @@ pub async fn resend_verification(
     }
 
     let user: User = sqlx::query_as(
-        "SELECT id, email, username, display_name, email_verified, avatar_url FROM users WHERE id = ?",
+        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled FROM users WHERE id = ?",
     )
     .bind(auth.user.id)
     .fetch_one(&state.pool)
@@ -297,7 +476,7 @@ pub async fn set_avatar(
         .map_err(|_| ApiError::Internal("db error"))?;
 
     let user: User = sqlx::query_as(
-        "SELECT id, email, username, display_name, email_verified, avatar_url FROM users WHERE id = ?",
+        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled FROM users WHERE id = ?",
     )
     .bind(auth.user.id)
     .fetch_one(&state.pool)
@@ -341,4 +520,57 @@ async fn create_session(state: &AppState, user_id: u64) -> Result<String, ApiErr
         .await
         .map_err(|_| ApiError::Internal("db error"))?;
     Ok(token)
+}
+// ---------------------------------------------------------------------------
+// TOTP (2FA) helpers
+// ---------------------------------------------------------------------------
+
+use rand_core::RngCore;
+use totp_rs::{Algorithm, Secret, TOTP};
+
+fn base32_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut out = String::new();
+    let mut buffer: u32 = 0;
+    let mut bits = 0;
+    for &b in data {
+        buffer = (buffer << 8) | b as u32;
+        bits += 8;
+        while bits >= 5 {
+            out.push(ALPHABET[((buffer >> (bits - 5)) & 31) as usize] as char);
+            bits -= 5;
+        }
+    }
+    if bits > 0 {
+        out.push(ALPHABET[((buffer << (5 - bits)) & 31) as usize] as char);
+    }
+    out
+}
+
+fn totp_generate_base32() -> String {
+    let mut bytes = [0u8; 20];
+    rand_core::OsRng.fill_bytes(&mut bytes);
+    base32_encode(&bytes)
+}
+
+fn totp_check(secret_base32: &str, code: &str) -> bool {
+    let code = code.trim();
+    match Secret::Encoded(secret_base32.to_string()).to_bytes() {
+        Ok(raw) => match TOTP::new(Algorithm::SHA1, 6, 1, 30, raw) {
+            Ok(t) => t.check_current(code).unwrap_or(false),
+            Err(_) => false,
+        },
+        Err(_) => false,
+    }
+}
+
+fn totp_qr_png(uri: &str) -> Option<String> {
+    let code = qrcode::QrCode::new(uri.as_bytes()).ok()?;
+    let img: image::ImageBuffer<image::Luma<u8>, Vec<u8>> =
+        code.render::<image::Luma<u8>>().min_dimensions(240, 240).build();
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageLuma8(img).write_to(&mut out, image::ImageFormat::Png).ok()?;
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD.encode(out.into_inner());
+    Some(format!("data:image/png;base64,{data}"))
 }

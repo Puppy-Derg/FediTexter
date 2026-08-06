@@ -37,6 +37,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         federation,
         verify_emails,
         mailer,
+        http: reqwest::Client::builder()
+            .user_agent("FediTexterServer/1.0")
+            .build()
+            .expect("failed to build http client"),
     });
 
     let addr = format!("{bind_addr}:{port}");
