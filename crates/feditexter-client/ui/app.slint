@@ -310,12 +310,13 @@ component DarkInput inherits Rectangle {
     in-out property <string> text;
     in property <string> placeholder: "";
     in property <InputType> input-type: InputType.text;
+    in property <brush> accent: #7C5CE0;
     callback accepted();
     horizontal-stretch: 1;
     height: 44px;
     border-radius: 8px;
     border-width: 1px;
-    border-color: ti.has-focus ? #8AB4F8 : #FFFFFF3D;
+    border-color: ti.has-focus ? root.accent : #FFFFFF3D;
     background: #1C1C1C;
     ti := TextInput {
         x: 12px;
@@ -363,9 +364,9 @@ export component MainWindow inherits Window {
     property <brush> md3-on-surface-variant: Palette.foreground.with-alpha(0.78);
     property <brush> md3-error: #B3261E;
     property <brush> md3-outline: Palette.border;
-    property <brush> md3-surface-container: Palette.control-background.with-alpha(0.9);
-    property <brush> md3-surface-container-high: Palette.control-background.with-alpha(0.9);
-    property <brush> md3-surface-container-low: Palette.alternate-background.with-alpha(0.85);
+    property <brush> md3-surface-container: root.accent-color.with-alpha(0.16);
+    property <brush> md3-surface-container-high: root.accent-color.with-alpha(0.24);
+    property <brush> md3-surface-container-low: root.accent-color.with-alpha(0.10);
 
     // User-selectable accent color (saved to the settings file).
     in-out property <color> accent-color: #7C5CE0;
@@ -375,6 +376,7 @@ export component MainWindow inherits Window {
     in property<string> user-name;
     in property<bool> ws-connected;
     in-out property<string> error-message: "";
+    in-out property<string> info-message: "";
     in-out property<int> selected-conversation: -1;
     in property<[UiConversation]> conversations;
     in property<[UiMessage]> messages;
@@ -383,6 +385,7 @@ export component MainWindow inherits Window {
     in-out property<bool> needs-verify: false;
     in-out property<bool> needs-2fa: false;
     in-out property<bool> needs-2fa-setup: false;
+    in-out property<bool> email-verified: false;
     in-out property<string> pending-token: "";
     in-out property<bool> totp-enabled: false;
     in-out property<image> twofa-qr;
@@ -430,6 +433,7 @@ export component MainWindow inherits Window {
     callback choose-attachment();
     callback clear-attachment();
     callback open-link(url: string);
+    callback open-image(id: int);
     callback suggestion-selected(id: int);
     callback request-profile(user-id: int);
     callback request-context(user-id: int, conversation-id: int, x: length, y: length);
@@ -484,7 +488,7 @@ export component MainWindow inherits Window {
     // Login / register screen (dark grey)
     // ------------------------------------------------------------------
     if !root.logged-in: Rectangle {
-        background: #232323;
+        background: @linear-gradient(160deg, root.accent-color.with-alpha(0.40), #232323 50%, root.accent-color.with-alpha(0.28));
         VerticalLayout {
             spacing: 10px;
             alignment: start;
@@ -526,6 +530,7 @@ export component MainWindow inherits Window {
                             DarkInput {
                                 text <=> root.server-input;
                                 placeholder: "your-server.example";
+                                accent: root.accent-color;
                             }
                         }
                         HorizontalLayout {
@@ -541,6 +546,7 @@ export component MainWindow inherits Window {
                             DarkInput {
                                 text <=> root.login-email;
                                 placeholder: "you@example.com";
+                                accent: root.accent-color;
                             }
                         }
                         HorizontalLayout {
@@ -556,6 +562,7 @@ export component MainWindow inherits Window {
                             DarkInput {
                                 text <=> root.login-password;
                                 input-type: InputType.password;
+                                accent: root.accent-color;
                                 accepted => {
                                     root.login(root.login-email, root.login-password);
                                 }
@@ -592,6 +599,7 @@ export component MainWindow inherits Window {
                             DarkInput {
                                 text <=> root.server-input;
                                 placeholder: "your-server.example";
+                                accent: root.accent-color;
                             }
                         }
                         HorizontalLayout {
@@ -607,6 +615,7 @@ export component MainWindow inherits Window {
                             DarkInput {
                                 text <=> root.reg-email;
                                 placeholder: "you@example.com";
+                                accent: root.accent-color;
                             }
                         }
                         HorizontalLayout {
@@ -622,6 +631,7 @@ export component MainWindow inherits Window {
                             DarkInput {
                                 text <=> root.reg-username;
                                 placeholder: "alice";
+                                accent: root.accent-color;
                             }
                         }
                         HorizontalLayout {
@@ -637,6 +647,7 @@ export component MainWindow inherits Window {
                             DarkInput {
                                 text <=> root.reg-password;
                                 input-type: InputType.password;
+                                accent: root.accent-color;
                                 accepted => {
                                     root.register(root.reg-email, root.reg-username, root.reg-password);
                                 }
@@ -679,13 +690,13 @@ export component MainWindow inherits Window {
             // Top app bar
             Rectangle {
                 height: 56px;
-                background: root.md3-surface-container;
+                background: root.md3-primary.with-alpha(0.20);
                 HorizontalLayout {
                     padding-left: 16px;
                     padding-right: 8px;
                     spacing: 12px;
                     VerticalLayout { alignment: center;
-                        Text { text: "FediTexter"; font-weight: 700; color: root.md3-on-surface; }
+                        Text { text: "FediTexter"; font-weight: 700; color: root.md3-primary; }
                     }
                     Rectangle { height: 100%; }
                     VerticalLayout { alignment: center;
@@ -915,6 +926,12 @@ export component MainWindow inherits Window {
                                                         source: m.attachment-image;
                                                         image-fit: cover;
                                                     }
+                                                    TouchArea {
+                                                        width: 100%;
+                                                        height: 100%;
+                                                        mouse-cursor: pointer;
+                                                        clicked => { root.open-image(m.id); }
+                                                    }
                                                 }
                                                 if m.attachment-name != "" && !(m.attachment-image.width > 0): HorizontalLayout {
                                                     spacing: 6px;
@@ -922,6 +939,12 @@ export component MainWindow inherits Window {
                                                         text: "📎 " + m.attachment-name;
                                                         color: m.is-self ? root.md3-on-primary-container : #E8E8E8;
                                                         overflow: elide;
+                                                    }
+                                                    TouchArea {
+                                                        width: 100%;
+                                                        height: 100%;
+                                                        mouse-cursor: pointer;
+                                                        clicked => { root.open-image(m.id); }
                                                     }
                                                 }
                                                 Text {
@@ -1228,6 +1251,41 @@ export component MainWindow inherits Window {
                             }
                         }
 
+                        Text { text: "Email verification"; color: root.md3-on-surface-variant; }
+                        if root.email-verified: HorizontalLayout {
+                            spacing: 8px;
+                            VerticalLayout { vertical-stretch: 1; alignment: center;
+                                Text { text: "Email verified ✓"; color: #66BB6A; }
+                            }
+                        }
+                        if !root.email-verified: VerticalLayout {
+                            spacing: 8px;
+                            Text { text: "Not verified"; color: root.md3-error; }
+                            LineEdit {
+                                text <=> root.verify-code;
+                                placeholder-text: "000000";
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: end;
+                                Button {
+                                    text: "Resend code";
+                                    clicked => { root.resend-code(); }
+                                }
+                                Button {
+                                    text: "Verify";
+                                    primary: true;
+                                    accent: root.accent-color;
+                                    on-accent: root.md3-on-primary;
+                                    enabled: root.verify-code != "";
+                                    clicked => {
+                                        root.verify(root.verify-code);
+                                        root.verify-code = "";
+                                    }
+                                }
+                            }
+                        }
+
                         Text { text: "Accent color"; color: root.md3-on-surface-variant; }
                         HorizontalLayout {
                             spacing: 10px;
@@ -1260,6 +1318,11 @@ export component MainWindow inherits Window {
                     text: root.error-message;
                     wrap: word-wrap;
                     color: root.md3-error;
+                }
+                if root.info-message != "": Text {
+                    text: root.info-message;
+                    wrap: word-wrap;
+                    color: #66BB6A;
                 }
                 Rectangle { height: 8px; }
                 HorizontalLayout {
@@ -1331,6 +1394,12 @@ export component MainWindow inherits Window {
                         color: root.md3-error;
                         horizontal-alignment: center;
                     }
+                    if root.info-message != "": Text {
+                        text: root.info-message;
+                        wrap: word-wrap;
+                        color: #66BB6A;
+                        horizontal-alignment: center;
+                    }
                     Button {
                         text: "Verify";
                         primary: true;
@@ -1344,6 +1413,13 @@ export component MainWindow inherits Window {
                     Button {
                         text: "Resend code";
                         clicked => { root.resend-code(); }
+                    }
+                    Button {
+                        text: "Later";
+                        clicked => {
+                            root.needs-verify = false;
+                            root.needs-2fa-setup = !root.totp-enabled;
+                        }
                     }
                     Button {
                         text: "Log out";

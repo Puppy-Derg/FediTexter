@@ -157,6 +157,7 @@ enum Event {
     LinkPreviewFailed(String),
     TwoFaRequired { pending_token: String },
     TwoFaSetup { secret: String, qr: String },
+    Info(String),
     Error(String),
 }
 
@@ -422,16 +423,7 @@ impl Backend {
                 let _ = tx.send(Event::Error(error_message(resp).await));
                 return;
             }
-            let v: Value = match resp.json().await {
-                Ok(v) => v,
-                Err(_) => {
-                    let _ = tx.send(Event::Error("malformed server response".into()));
-                    return;
-                }
-            };
-            if let Ok(u) = serde_json::from_value::<User>(v.get("user").cloned().unwrap_or(Value::Null)) {
-                let _ = tx.send(Event::Verified(u));
-            }
+            let _ = tx.send(Event::Info("Verification code sent — check your email".into()));
         });
     }
 
@@ -1196,6 +1188,67 @@ fn open_in_browser(url: &str) {
     }
 }
 
+/// Write an attachment's bytes to a temp file and open it in the OS viewer
+/// (Preview on macOS, the default viewer elsewhere). On mobile the OS viewer
+/// renders fullscreen; on desktop it opens in its own window.
+fn open_attachment(mime: &str, name: &str, data_url: &str) {
+    let Some(b64) = data_url.split_once(";base64,") else { return };
+    use base64::Engine;
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(b64.1) {
+        Ok(b) if !b.is_empty() => b,
+        _ => return,
+    };
+    let ext = match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "audio/mpeg" => "mp3",
+        "audio/wav" => "wav",
+        "application/pdf" => "pdf",
+        "text/plain" => "txt",
+        _ => "bin",
+    };
+    let mut base: String = name
+        .rsplit('.')
+        .next_back()
+        .filter(|_| !name.is_empty())
+        .map(|stem| stem.to_string())
+        .unwrap_or_else(|| "feditexter".to_string());
+    base = base
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(40)
+        .collect();
+    if base.is_empty() {
+        base = "feditexter".to_string();
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("{base}-{stamp}.{ext}"));
+    if std::fs::write(&path, bytes).is_err() {
+        return;
+    }
+    let path = path.to_string_lossy().into_owned();
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(&path).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd").args(["/c", "start", "", &path]).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+    }
+}
+
 /// Scroll the message list to the bottom. The tick triggers a Slint-side
 /// scroll; the delayed second tick re-applies it after the list has relaid out
 /// so `viewport-height` reflects the new messages.
@@ -1552,10 +1605,12 @@ fn handle_event(sh: &Shared, ev: Event) {
             ui.set_user_name(user.username.clone().into());
             ui.set_display_name_input(user.display_name.clone().into());
             ui.set_needs_verify(!user.email_verified);
+            ui.set_email_verified(user.email_verified);
             ui.set_needs_2fa(false);
             ui.set_needs_2fa_setup(user.email_verified && !user.totp_enabled);
             ui.set_totp_enabled(user.totp_enabled);
             ui.set_error_message(SharedString::default());
+            ui.set_info_message(SharedString::default());
             ui.set_selected_conversation(-1);
             ui.set_profile_open(false);
             ui.set_context_open(false);
@@ -1581,7 +1636,9 @@ fn handle_event(sh: &Shared, ev: Event) {
             if u.email_verified {
                 let ui = sh.ui();
                 ui.set_needs_verify(false);
+                ui.set_email_verified(true);
                 ui.set_error_message(SharedString::default());
+                ui.set_info_message(SharedString::default());
                 ui.set_user_name(u.username.clone().into());
                 ui.set_needs_2fa_setup(!u.totp_enabled);
                 if u.totp_enabled {
@@ -1593,6 +1650,8 @@ fn handle_event(sh: &Shared, ev: Event) {
             let ui = sh.ui();
             ui.set_display_name_input(u.display_name.clone().into());
             ui.set_error_message(SharedString::default());
+            ui.set_info_message(SharedString::default());
+            ui.set_email_verified(u.email_verified);
             ui.set_totp_enabled(u.totp_enabled);
             if u.totp_enabled {
                 ui.set_twofa_setup_open(false);
@@ -1731,6 +1790,9 @@ fn handle_event(sh: &Shared, ev: Event) {
             ui.set_error_message(SharedString::default());
             ui.set_twofa_setup_open(true);
         }
+        Event::Info(m) => {
+            sh.ui().set_info_message(m.into());
+        }
         Event::Error(m) => set_error(sh, &m),
     }
 }
@@ -1749,10 +1811,12 @@ fn logout(sh: &Shared) {
     ui.set_needs_verify(false);
     ui.set_needs_2fa(false);
     ui.set_needs_2fa_setup(false);
+    ui.set_email_verified(false);
     ui.set_pending_token(SharedString::default());
     ui.set_user_name(SharedString::default());
     ui.set_selected_conversation(-1);
     ui.set_error_message(SharedString::default());
+    ui.set_info_message(SharedString::default());
     ui.set_ws_connected(false);
     ui.set_conversations(empty_model::<UiConversation>());
     ui.set_messages(empty_model::<UiMessage>());
@@ -1992,6 +2056,22 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         ui.on_open_link(move |url| {
             open_in_browser(&url);
+        });
+    }
+    {
+        let sh = shared.clone();
+        ui.on_open_image(move |id| {
+            if id < 0 {
+                return;
+            }
+            let msg = sh.messages.borrow().iter().find(|m| m.id == id as u64).cloned();
+            if let Some(m) = msg
+                && let Some(data) = m.attachment_data
+            {
+                let mime = m.attachment_mime.unwrap_or_default();
+                let name = m.attachment_name.unwrap_or_default();
+                open_attachment(&mime, &name, &data);
+            }
         });
     }
     {
