@@ -149,6 +149,23 @@ jobs:
         with:
           path: artifacts
 
+      - name: Remove stale macOS binary assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          RELEASE_ID=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${GITHUB_REF_NAME}" \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+          ASSETS=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets" \
+            | python3 -c "import json,sys; print(' '.join(str(a['id']) for a in json.load(sys.stdin) if a['name'].startswith('feditexter-client-macos-') and not a['name'].endswith('.zip')))")
+          for ID in $ASSETS; do
+            echo "Deleting stale asset $ID"
+            curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/assets/$ID" -o /dev/null -w "%{http_code}\n"
+          done
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
