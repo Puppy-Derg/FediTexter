@@ -87,8 +87,67 @@ jobs:
           name: ${{ matrix.name }}
           path: target/${{ matrix.target }}/release/${{ matrix.name }}
 
+  package-macos-app:
+    needs: [build-client]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download macOS arm64
+        uses: actions/download-artifact@v4
+        with:
+          name: feditexter-client-macos-arm64
+          path: dist/arm64
+
+      - name: Download macOS x64
+        uses: actions/download-artifact@v4
+        with:
+          name: feditexter-client-macos-x64
+          path: dist/x64
+
+      - name: Create universal binary + app bundle
+        shell: bash
+        run: |
+          mkdir -p "FediTexter.app/Contents/MacOS"
+          lipo -create \
+            "dist/arm64/feditexter-client-macos-arm64" \
+            "dist/x64/feditexter-client-macos-x64" \
+            -output "FediTexter.app/Contents/MacOS/FediTexter"
+          cat > "FediTexter.app/Contents/Info.plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key><string>FediTexter</string>
+    <key>CFBundleDisplayName</key><string>FediTexter</string>
+    <key>CFBundleIdentifier</key><string>com.feditexter.client</string>
+    <key>CFBundleExecutable</key><string>FediTexter</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>LSMinimumSystemVersion</key><string>12.0</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSPrincipalClass</key><string>NSApplication</string>
+</dict>
+</plist>
+EOF
+          chmod +x "FediTexter.app/Contents/MacOS/FediTexter"
+          codesign --force --deep -s - "FediTexter.app"
+
+      - name: Zip app bundle
+        shell: bash
+        run: |
+          ditto -c -k --keepParent "FediTexter.app" "feditexter-client-macos-universal.zip"
+
+      - name: Upload universal app
+        uses: actions/upload-artifact@v4
+        with:
+          name: feditexter-client-macos-universal
+          path: feditexter-client-macos-universal.zip
+
   release:
-    needs: [build-server, build-client]
+    needs: [build-server, build-client, package-macos-app]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
