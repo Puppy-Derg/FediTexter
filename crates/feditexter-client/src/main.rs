@@ -1,8 +1,9 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel, Weak};
@@ -11,6 +12,10 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+mod p2p;
+
+use p2p::{P2pManager, ServingFile, SignalEvent};
 
 slint::include_modules!();
 
@@ -77,11 +82,20 @@ struct Message {
     attachment_name: Option<String>,
     #[serde(default)]
     attachment_data: Option<String>,
+    #[serde(default)]
+    file_id: Option<String>,
+    #[serde(default)]
+    file_size: Option<i64>,
+    #[serde(default)]
+    thumbnail_data: Option<String>,
 }
 
+/// A HubEvent as pushed over the WebSocket (tagged `kind`).
 #[derive(Deserialize)]
-struct WsEvent {
-    message: Message,
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum WsHubEvent {
+    Message { message: Message },
+    Signal { signal: SignalEvent },
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -117,7 +131,29 @@ struct Contact {
 struct Attachment {
     mime: String,
     name: String,
-    data: String,
+    /// P2P transfer id (uuid v4), generated when the file is picked.
+    file_id: String,
+    /// Full size of the file in bytes.
+    file_size: u64,
+    /// Small image thumbnail as a data: URL (only for image mimes).
+    thumbnail: String,
+    /// The raw file bytes, kept in memory to serve over the data channel.
+    bytes: Vec<u8>,
+}
+
+/// A file we've fully downloaded this session (or loaded from the disk cache).
+#[derive(Clone)]
+struct DownloadedFile {
+    /// data: URL of the full image (images only), built lazily.
+    image_data: Option<String>,
+    /// On-disk cache path for the raw bytes.
+    path: Option<std::path::PathBuf>,
+}
+
+/// A file we sent this session, used to render our own bubbles at full res.
+struct OwnFile {
+    thumbnail: String,
+    bytes: Vec<u8>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -146,6 +182,12 @@ enum Event {
     MessageSent(Message),
     WsMessage(Message),
     WsStatus(bool),
+    P2pSignal(SignalEvent),
+    P2pStatus { file_id: String, status: String },
+    P2pProgress { file_id: String, received: u64, total: u64 },
+    #[allow(dead_code)]
+    P2pComplete { file_id: String, mime: String, name: String, bytes: Vec<u8> },
+    P2pFailed { file_id: String, reason: String },
     Profile(Profile),
     ContextProfile(Profile),
     ModerationResult(Profile),
@@ -170,20 +212,37 @@ struct Backend {
     http: reqwest::Client,
     tx: UnboundedSender<Event>,
     token: watch::Sender<Option<String>>,
+    /// Outgoing P2P signaling frames, forwarded by the WebSocket loop.
+    ws_tx: UnboundedSender<String>,
 }
 
 impl Backend {
-    fn new(tx: UnboundedSender<Event>, token: watch::Sender<Option<String>>) -> Self {
+    fn new(
+        tx: UnboundedSender<Event>,
+        token: watch::Sender<Option<String>>,
+        ws_tx: UnboundedSender<String>,
+        device_id: String,
+    ) -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
-        let http = reqwest::Client::new();
-        Backend { runtime, http, tx, token }
+        // Every request carries the persistent device UUID so the server can
+        // bind the session to this installation and reject replays elsewhere.
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "X-Device-Id",
+            reqwest::header::HeaderValue::from_str(&device_id).expect("valid header value"),
+        );
+        let http = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .expect("failed to build http client");
+        Backend { runtime, http, tx, token, ws_tx }
     }
 
     fn set_token(&self, token: Option<String>) {
         let _ = self.token.send(token);
     }
 
-    fn login(&self, server: &str, email: &str, password: &str) {
+    fn login(&self, server: &str, email: &str, password: &str, remember_me: bool) {
         let tx = self.tx.clone();
         let http = self.http.clone();
         let server = server.to_string();
@@ -191,7 +250,12 @@ impl Backend {
         let password = password.to_string();
         self.runtime.spawn(async move {
             let url = api_url(&server, "/api/login");
-            match http.post(&url).json(&json!({ "email": email, "password": password })).send().await {
+            match http
+                .post(&url)
+                .json(&json!({ "email": email, "password": password, "remember_me": remember_me }))
+                .send()
+                .await
+            {
                 Ok(resp) if resp.status().is_success() => {
                     match resp.json::<Value>().await {
                         Ok(v) => {
@@ -220,7 +284,7 @@ impl Backend {
         });
     }
 
-    fn login_2fa(&self, server: &str, pending_token: String, code: String) {
+    fn login_2fa(&self, server: &str, pending_token: String, code: String, remember_me: bool) {
         let tx = self.tx.clone();
         let http = self.http.clone();
         let server = server.to_string();
@@ -228,7 +292,7 @@ impl Backend {
             let url = api_url(&server, "/api/login/2fa");
             match http
                 .post(&url)
-                .json(&json!({ "pending_token": pending_token, "code": code }))
+                .json(&json!({ "pending_token": pending_token, "code": code, "remember_me": remember_me }))
                 .send()
                 .await
             {
@@ -248,6 +312,50 @@ impl Backend {
                 }
                 Err(e) => {
                     let _ = tx.send(Event::AuthFailed(format!("{e}")));
+                }
+            }
+        });
+    }
+
+    /// Validate a token saved by "remember me" against `/api/me`. Emits
+    /// `LoggedIn` on success (which restores the whole UI state); on a 401/403
+    /// the caller clears the saved session so the user logs in again.
+    fn restore_session(&self, server: String, token: String) {
+        let tx = self.tx.clone();
+        let http = self.http.clone();
+        self.runtime.spawn(async move {
+            let url = api_url(&server, "/api/me");
+            match http.get(&url).bearer_auth(&token).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<Value>().await {
+                        Ok(v) => {
+                            if let Ok(user) =
+                                serde_json::from_value::<User>(v.get("user").cloned().unwrap_or(Value::Null))
+                            {
+                                let _ = tx.send(Event::LoggedIn { token, user });
+                                return;
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                    clear_saved_session();
+                    let _ = tx.send(Event::AuthFailed("session expired, please log in again".into()));
+                }
+                Ok(resp) => {
+                    if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                        || resp.status() == reqwest::StatusCode::FORBIDDEN
+                    {
+                        clear_saved_session();
+                        let _ = tx.send(Event::AuthFailed("session expired, please log in again".into()));
+                    } else {
+                        let msg = error_message(resp).await;
+                        let _ = tx.send(Event::AuthFailed(msg));
+                    }
+                }
+                Err(e) => {
+                    // Server unreachable — keep the saved session and let the
+                    // user retry from the login screen (token stays on disk).
+                    let _ = tx.send(Event::AuthFailed(format!("could not reach server: {e}")));
                 }
             }
         });
@@ -641,7 +749,11 @@ impl Backend {
             if let Some(att) = attachment {
                 payload["attachment_mime"] = json!(att.mime);
                 payload["attachment_name"] = json!(att.name);
-                payload["attachment_data"] = json!(att.data);
+                // The bytes travel P2P; the server only stores metadata + a small
+                // thumbnail so the recipient can render the bubble immediately.
+                payload["file_id"] = json!(att.file_id);
+                payload["file_size"] = json!(att.file_size);
+                payload["thumbnail_data"] = json!(att.thumbnail);
             }
             let resp = match http.post(&url).bearer_auth(&token).json(&payload).send().await {
                 Ok(r) => r,
@@ -846,6 +958,67 @@ fn server_state_path() -> std::path::PathBuf {
     std::path::Path::new(&home).join(".feditexter_server")
 }
 
+/// A "remember me" session persisted between app restarts.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedSession {
+    server: String,
+    token: String,
+}
+
+fn session_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    std::path::Path::new(&home).join(".feditexter_session")
+}
+
+fn save_session(server: &str, token: &str) {
+    if let Ok(json) = serde_json::to_string(&SavedSession { server: server.to_string(), token: token.to_string() })
+        && let Err(e) = std::fs::write(session_path(), json)
+    {
+        eprintln!("[error] failed to save session: {e}");
+    }
+}
+
+fn load_session() -> Option<SavedSession> {
+    let raw = std::fs::read_to_string(session_path()).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn clear_saved_session() {
+    let _ = std::fs::remove_file(session_path());
+}
+
+/// Directory where fully-downloaded P2P files are cached so they survive restarts.
+fn files_cache_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    std::path::Path::new(&home).join(".feditexter_files")
+}
+
+fn cache_path_for(file_id: &str) -> std::path::PathBuf {
+    files_cache_dir().join(file_id)
+}
+
+/// Pre-load files cached on disk from earlier sessions so previously-downloaded
+/// attachments render as complete instead of re-fetching.
+fn load_cached_files(
+    downloaded: &Rc<RefCell<std::collections::HashMap<String, DownloadedFile>>>,
+) {
+    let dir = files_cache_dir();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut map = downloaded.borrow_mut();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && let Some(name) = path.file_name().and_then(|n| n.to_str())
+            {
+                map.insert(
+                    name.to_string(),
+                    DownloadedFile { image_data: None, path: Some(path) },
+                );
+            }
+        }
+    }
+}
+
 fn load_saved_server() -> Option<String> {
     load_settings().map(|s| s.server)
 }
@@ -857,7 +1030,7 @@ fn load_settings() -> Option<LocalSettings> {
         serde_json::from_str::<LocalSettings>(raw).ok()
     } else if !raw.is_empty() {
         // Legacy: the file was just a server URL.
-        Some(LocalSettings { server: raw.to_string(), accent: None })
+        Some(LocalSettings { server: raw.to_string(), accent: None, device_id: None })
     } else {
         None
     }
@@ -868,6 +1041,27 @@ struct LocalSettings {
     server: String,
     #[serde(default)]
     accent: Option<String>,
+    /// Persistent device identifier sent with every authenticated request so
+    /// the server can bind sessions to this installation.
+    #[serde(default)]
+    device_id: Option<String>,
+}
+
+/// Return this installation's persistent device UUID, generating and saving it
+/// the first time the app runs.
+fn load_or_create_device_id() -> String {
+    let mut settings = load_settings().unwrap_or(LocalSettings {
+        server: String::new(),
+        accent: None,
+        device_id: None,
+    });
+    if let Some(d) = &settings.device_id {
+        return d.clone();
+    }
+    let d = uuid::Uuid::new_v4().to_string();
+    settings.device_id = Some(d.clone());
+    save_settings(&settings);
+    d
 }
 
 fn save_settings(settings: &LocalSettings) {
@@ -879,7 +1073,7 @@ fn save_settings(settings: &LocalSettings) {
 }
 
 fn save_server(server: &str) {
-    let mut settings = load_settings().unwrap_or(LocalSettings { server: String::new(), accent: None });
+    let mut settings = load_settings().unwrap_or(LocalSettings { server: String::new(), accent: None, device_id: None });
     settings.server = server.trim().to_string();
     save_settings(&settings);
 }
@@ -950,6 +1144,8 @@ fn spawn_ws(
     mut server_rx: watch::Receiver<String>,
     mut token_rx: watch::Receiver<Option<String>>,
     tx: UnboundedSender<Event>,
+    mut ws_rx: UnboundedReceiver<String>,
+    device_id: String,
 ) {
     runtime.spawn(async move {
         loop {
@@ -978,12 +1174,15 @@ fn spawn_ws(
             if let Ok(header) = HeaderValue::from_str(&format!("Bearer {token}")) {
                 request.headers_mut().insert("authorization", header);
             }
+            if let Ok(header) = HeaderValue::from_str(&device_id) {
+                request.headers_mut().insert("x-device-id", header);
+            }
 
             match tokio_tungstenite::connect_async(request).await {
                 Ok((ws, _)) => {
                     eprintln!("[ws] connected to {url}");
                     let _ = tx.send(Event::WsStatus(true));
-                    let (_sink, mut stream) = ws.split();
+                    let (mut sink, mut stream) = ws.split();
                     loop {
                         tokio::select! {
                             changed = token_rx.changed() => {
@@ -998,11 +1197,28 @@ fn spawn_ws(
                                 }
                                 break;
                             }
+                            outgoing = ws_rx.recv() => {
+                                match outgoing {
+                                    Some(text) => {
+                                        if sink.send(tokio_tungstenite::tungstenite::Message::Text(text.into())).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    None => return,
+                                }
+                            }
                             msg = stream.next() => {
                                 match msg {
                                     Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
-                                        if let Ok(ev) = serde_json::from_str::<WsEvent>(&text) {
-                                            let _ = tx.send(Event::WsMessage(ev.message));
+                                        if let Ok(ev) = serde_json::from_str::<WsHubEvent>(&text) {
+                                            match ev {
+                                                WsHubEvent::Message { message } => {
+                                                    let _ = tx.send(Event::WsMessage(message));
+                                                }
+                                                WsHubEvent::Signal { signal } => {
+                                                    let _ = tx.send(Event::P2pSignal(signal));
+                                                }
+                                            }
                                         }
                                     }
                                     Some(Ok(_)) => {}
@@ -1045,6 +1261,17 @@ struct Shared {
     pending_attach: Rc<RefCell<Option<Attachment>>>,
     preview_cache: Rc<RefCell<std::collections::HashMap<String, Option<LinkPreview>>>>,
     preview_requested: Rc<RefCell<std::collections::HashSet<String>>>,
+    p2p: Arc<P2pManager>,
+    p2p_status: Rc<RefCell<std::collections::HashMap<String, P2pUi>>>,
+    downloaded: Rc<RefCell<std::collections::HashMap<String, DownloadedFile>>>,
+    own_files: Rc<RefCell<std::collections::HashMap<String, OwnFile>>>,
+    /// Whether the user asked to persist this login for 60 days.
+    remember_me: Rc<Cell<bool>>,
+}
+
+/// Transfer state shown under a P2P attachment bubble.
+struct P2pUi {
+    status: String,
 }
 
 impl Shared {
@@ -1105,6 +1332,126 @@ fn load_avatar_image(data_url: &str) -> Option<slint::Image> {
     let (w, h) = rgba.dimensions();
     let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w, h);
     Some(slint::Image::from_rgba8(buffer))
+}
+
+/// Encode raw image bytes as a PNG data: URL so Slint can render them.
+fn image_data_url_from_bytes(bytes: &[u8]) -> Option<String> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png).ok()?;
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD.encode(out.into_inner());
+    Some(format!("data:image/png;base64,{data}"))
+}
+
+fn human_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.1} GB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1} MB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.0} KB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Compute what to show for a message's attachment: the image to render, the
+/// transfer status line, and (for non-image P2P files) the file size. Triggers
+/// a P2P fetch for undownloaded files (deduped by the manager).
+fn p2p_display(sh: &Shared, m: &Message) -> (slint::Image, String, String) {
+    let mime = m.attachment_mime.clone().unwrap_or_default();
+    let is_image = mime.starts_with("image/");
+
+    // Legacy inline attachment: the payload is already in the message.
+    if let Some(data) = &m.attachment_data {
+        let img = if is_image {
+            load_avatar_image(data).unwrap_or_default()
+        } else {
+            slint::Image::default()
+        };
+        return (img, String::new(), String::new());
+    }
+
+    let Some(file_id) = &m.file_id else {
+        return (slint::Image::default(), String::new(), String::new());
+    };
+    let file_id = file_id.clone();
+
+    if self_id_of(sh) == Some(m.sender_id) {
+        // Our own sent file: render the full-res thumbnail we kept.
+        if let Some(own) = sh.own_files.borrow().get(&file_id) {
+            let img = if is_image {
+                load_avatar_image(&own.thumbnail).unwrap_or_default()
+            } else {
+                slint::Image::default()
+            };
+            return (img, String::new(), human_size(own.bytes.len() as u64));
+        }
+    }
+
+    // Fully downloaded (this session or from the on-disk cache).
+    if let Some(dl) = sh.downloaded.borrow().get(&file_id).cloned() {
+        let cached = dl.image_data.clone();
+        let path = dl.path.clone();
+        let mut img = slint::Image::default();
+        if is_image {
+            let data = if let Some(d) = cached {
+                Some(d)
+            } else if let Some(path) = &path {
+                if let Ok(bytes) = std::fs::read(path) {
+                    let d = image_data_url_from_bytes(&bytes);
+                    if let Some(d) = &d
+                        && let Some(map) = sh.downloaded.borrow_mut().get_mut(&file_id)
+                    {
+                        map.image_data = Some(d.clone());
+                    }
+                    d
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(d) = data {
+                img = load_avatar_image(&d).unwrap_or_default();
+            }
+        }
+        let size = path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok().map(|md| md.len()))
+            .unwrap_or(0);
+        return (img, String::new(), human_size(size));
+    }
+
+    // Not available yet: show the thumbnail + status, and ask the sender to
+    // serve the file (the manager dedupes repeated calls).
+    let img = if is_image {
+        m.thumbnail_data.as_deref().and_then(load_avatar_image).unwrap_or_default()
+    } else {
+        slint::Image::default()
+    };
+    let status = sh
+        .p2p_status
+        .borrow()
+        .get(&file_id)
+        .map(|s| s.status.clone())
+        .unwrap_or_default();
+    // Only request transfers from other people — fetching from ourselves after
+    // a restart (when this session no longer holds the bytes) makes no sense.
+    if self_id_of(sh) != Some(m.sender_id) {
+        sh.p2p.fetch(&file_id, m.sender_id);
+    }
+    let size = m.file_size.unwrap_or(0) as u64;
+    (img, status, human_size(size))
+}
+
+fn self_id_of(sh: &Shared) -> Option<u64> {
+    sh.self_id.get()
 }
 
 /// Return a cached (or freshly decoded) avatar image for a user.
@@ -1515,13 +1862,7 @@ fn refresh_messages_ui(sh: &Shared) {
                 .find(|x| x.id == m.sender_id)
                 .and_then(|x| x.avatar_url.clone());
             let local_time = format_local_time(&m.created_at);
-            let attachment_image = if m.attachment_data.is_some()
-                && m.attachment_mime.as_deref().unwrap_or("").starts_with("image/")
-            {
-                m.attachment_data.as_deref().and_then(load_avatar_image).unwrap_or_default()
-            } else {
-                slint::Image::default()
-            };
+            let (attachment_image, file_status, file_size) = p2p_display(sh, m);
 
             let mut preview_title = SharedString::default();
             let mut preview_desc = SharedString::default();
@@ -1550,6 +1891,15 @@ fn refresh_messages_ui(sh: &Shared) {
                 }
             }
 
+            let preview_image_ratio = {
+                let size = preview_image.size();
+                if size.width > 0 {
+                    size.height as f32 / size.width as f32
+                } else {
+                    0.0
+                }
+            };
+
             UiMessage {
                 id: m.id as i32,
                 sender: sender.into(),
@@ -1563,9 +1913,13 @@ fn refresh_messages_ui(sh: &Shared) {
                 attachment_image,
                 attachment_name: m.attachment_name.clone().unwrap_or_default().into(),
                 attachment_mime: m.attachment_mime.clone().unwrap_or_default().into(),
+                file_id: m.file_id.clone().unwrap_or_default().into(),
+                file_status: file_status.into(),
+                file_size: file_size.into(),
                 preview_title,
                 preview_description: preview_desc,
                 preview_image,
+                preview_image_ratio,
                 preview_url,
             }
         })
@@ -1597,6 +1951,11 @@ fn handle_event(sh: &Shared, ev: Event) {
     match ev {
         Event::LoggedIn { token, user } => {
             save_server(&sh.server());
+            if sh.remember_me.get() {
+                save_session(&sh.server(), &token);
+            } else {
+                clear_saved_session();
+            }
             sh.token.replace(Some(token.clone()));
             sh.self_id.replace(Some(user.id));
             sh.backend.set_token(Some(token.clone()));
@@ -1725,6 +2084,52 @@ fn handle_event(sh: &Shared, ev: Event) {
         Event::WsStatus(b) => {
             sh.ui().set_ws_connected(b);
         }
+        Event::P2pSignal(sig) => {
+            sh.p2p.handle_signal(sig);
+        }
+        Event::P2pStatus { file_id, status } => {
+            sh.p2p_status.borrow_mut().insert(file_id, P2pUi { status });
+            refresh_messages_ui(sh);
+        }
+        Event::P2pProgress { file_id, received, total } => {
+            let status = if total > 0 {
+                let pct = ((received as f64 / total as f64) * 100.0) as u64;
+                format!("receiving · {pct}%")
+            } else {
+                "receiving…".to_string()
+            };
+            sh.p2p_status.borrow_mut().insert(file_id, P2pUi { status });
+            refresh_messages_ui(sh);
+        }
+        Event::P2pComplete { file_id, mime, name: _, bytes } => {
+            std::fs::create_dir_all(files_cache_dir()).ok();
+            let path = cache_path_for(&file_id);
+            let _ = std::fs::write(&path, &bytes);
+            sh.downloaded.borrow_mut().insert(
+                file_id.clone(),
+                DownloadedFile {
+                    image_data: if mime.starts_with("image/") {
+                        image_data_url_from_bytes(&bytes)
+                    } else {
+                        None
+                    },
+                    path: Some(path),
+                },
+            );
+            sh.p2p_status.borrow_mut().remove(&file_id);
+            refresh_messages_ui(sh);
+        }
+        Event::P2pFailed { file_id, reason } => {
+            let status = if reason.contains("offline") || reason.contains("cancel") {
+                "offline"
+            } else {
+                "error"
+            };
+            sh.p2p_status
+                .borrow_mut()
+                .insert(file_id, P2pUi { status: status.to_string() });
+            refresh_messages_ui(sh);
+        }
         Event::Profile(p) => {
             apply_profile(sh, &p);
             sh.ui().set_profile_open(true);
@@ -1760,7 +2165,7 @@ fn handle_event(sh: &Shared, ev: Event) {
             ui.set_pending_attach_name(att.name.clone().into());
             if att.mime.starts_with("image/") {
                 ui.set_pending_attach_image(
-                    load_avatar_image(&att.data).unwrap_or_default(),
+                    load_avatar_image(&att.thumbnail).unwrap_or_default(),
                 );
             } else {
                 ui.set_pending_attach_image(slint::Image::default());
@@ -1798,6 +2203,7 @@ fn handle_event(sh: &Shared, ev: Event) {
 }
 
 fn logout(sh: &Shared) {
+    clear_saved_session();
     sh.backend.set_token(None);
     sh.token.replace(None);
     sh.self_id.replace(None);
@@ -1805,6 +2211,8 @@ fn logout(sh: &Shared) {
     sh.messages.borrow_mut().clear();
     sh.contacts.borrow_mut().clear();
     sh.hidden.borrow_mut().clear();
+    sh.p2p_status.borrow_mut().clear();
+    sh.own_files.borrow_mut().clear();
     sh.selected.replace(-1);
     let ui = sh.ui();
     ui.set_logged_in(false);
@@ -1858,10 +2266,17 @@ fn main() -> Result<(), slint::PlatformError> {
     let ui = MainWindow::new()?;
     let (tx, rx) = mpsc::unbounded_channel();
     let (token_tx, token_rx) = watch::channel(None);
-    let backend = Rc::new(Backend::new(tx.clone(), token_tx));
+    let (ws_tx, ws_rx) = mpsc::unbounded_channel();
+    let device_id = load_or_create_device_id();
+    let backend = Rc::new(Backend::new(tx.clone(), token_tx, ws_tx, device_id.clone()));
+    // A remembered session's server takes priority so auto-login targets the
+    // same server the token belongs to.
+    let saved_session = load_session();
     let default_server = normalize_server(
-        &std::env::var("FEDITEXTER_SERVER")
-            .ok()
+        &saved_session
+            .as_ref()
+            .map(|s| s.server.clone())
+            .or_else(|| std::env::var("FEDITEXTER_SERVER").ok())
             .or_else(load_saved_server)
             .unwrap_or_else(|| "localhost:3000".into()),
     );
@@ -1873,7 +2288,15 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         ui.set_accent_color(color);
     }
-    spawn_ws(&backend.runtime, server_rx, token_rx, tx);
+    spawn_ws(&backend.runtime, server_rx, token_rx, tx.clone(), ws_rx, device_id);
+
+    let downloaded = Rc::new(RefCell::new(std::collections::HashMap::new()));
+    load_cached_files(&downloaded);
+    let p2p = P2pManager::new(
+        backend.runtime.handle().clone(),
+        backend.ws_tx.clone(),
+        tx.clone(),
+    );
 
     let shared = Rc::new(Shared {
         backend,
@@ -1891,7 +2314,22 @@ fn main() -> Result<(), slint::PlatformError> {
         pending_attach: Rc::new(RefCell::new(None)),
         preview_cache: Rc::new(RefCell::new(std::collections::HashMap::new())),
         preview_requested: Rc::new(RefCell::new(std::collections::HashSet::new())),
+        p2p,
+        p2p_status: Rc::new(RefCell::new(std::collections::HashMap::new())),
+        downloaded,
+        own_files: Rc::new(RefCell::new(std::collections::HashMap::new())),
+        remember_me: Rc::new(Cell::new(true)),
     });
+
+    // Auto-login from a remembered session: point the UI at the saved server and
+    // validate the token against /api/me. On success the LoggedIn event restores
+    // the full app state; on failure the session is cleared and login shows.
+    if let Some(saved) = saved_session {
+        let _ = server_tx.send(saved.server.clone());
+        ui.set_server_input(saved.server.clone().into());
+        shared.remember_me.replace(true);
+        shared.backend.restore_session(saved.server, saved.token);
+    }
 
     {
         let sh = shared.clone();
@@ -1935,9 +2373,10 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let sh = shared.clone();
         let server_tx = server_tx.clone();
-        ui.on_login(move |email, password| {
+        ui.on_login(move |email, password, remember| {
+            sh.remember_me.replace(remember);
             let _ = server_tx.send(sh.server());
-            sh.backend.login(&sh.server(), &email, &password);
+            sh.backend.login(&sh.server(), &email, &password, remember);
         });
     }
     {
@@ -1976,6 +2415,25 @@ fn main() -> Result<(), slint::PlatformError> {
                     let attachment = sh.pending_attach.borrow_mut().take();
                     let has_attach = attachment.is_some();
                     if !body.is_empty() || has_attach {
+                        if let Some(att) = &attachment {
+                            // Keep the bytes in memory so we can serve them P2P and
+                            // render our own bubble; the message body only carries
+                            // the file_id + thumbnail to the server.
+                            sh.p2p.serve(ServingFile {
+                                file_id: att.file_id.clone(),
+                                mime: att.mime.clone(),
+                                name: att.name.clone(),
+                                size: att.file_size,
+                                bytes: att.bytes.clone(),
+                            });
+                            sh.own_files.borrow_mut().insert(
+                                att.file_id.clone(),
+                                OwnFile {
+                                    thumbnail: att.thumbnail.clone(),
+                                    bytes: att.bytes.clone(),
+                                },
+                            );
+                        }
                         sh.backend.send_message(&sh.server(), &token, conv as u64, body, attachment);
                     }
                     if has_attach {
@@ -2025,7 +2483,8 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.on_submit_2fa(move |code| {
             let pending = sh.ui().get_pending_token().to_string();
             if !pending.is_empty() {
-                sh.backend.login_2fa(&sh.server(), pending, code.trim().to_string());
+                let remember = sh.remember_me.get();
+                sh.backend.login_2fa(&sh.server(), pending, code.trim().to_string(), remember);
             }
         });
     }
@@ -2065,11 +2524,36 @@ fn main() -> Result<(), slint::PlatformError> {
                 return;
             }
             let msg = sh.messages.borrow().iter().find(|m| m.id == id as u64).cloned();
-            if let Some(m) = msg
-                && let Some(data) = m.attachment_data
-            {
-                let mime = m.attachment_mime.unwrap_or_default();
-                let name = m.attachment_name.unwrap_or_default();
+            let Some(m) = msg else { return };
+            let mime = m.attachment_mime.clone().unwrap_or_default();
+            let name = m.attachment_name.clone().unwrap_or_default();
+            if let Some(file_id) = &m.file_id {
+                // P2P file: open the bytes we hold, or (re)request the transfer.
+                let is_own = sh.self_id.get() == Some(m.sender_id);
+                let bytes = if is_own {
+                    sh.own_files.borrow().get(file_id).map(|o| o.bytes.clone())
+                } else {
+                    sh.downloaded
+                        .borrow()
+                        .get(file_id)
+                        .and_then(|d| d.path.clone())
+                        .and_then(|p| std::fs::read(p).ok())
+                };
+                match bytes {
+                    Some(bytes) => {
+                        use base64::Engine;
+                        let data = format!(
+                            "data:{};base64,{}",
+                            mime,
+                            base64::engine::general_purpose::STANDARD.encode(&bytes)
+                        );
+                        open_attachment(&mime, &name, &data);
+                    }
+                    None => {
+                        sh.p2p.retry_fetch(file_id, m.sender_id);
+                    }
+                }
+            } else if let Some(data) = m.attachment_data {
                 open_attachment(&mime, &name, &data);
             }
         });
@@ -2080,7 +2564,7 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.on_settings_saved(move || {
             save_server(&sh.server());
             let accent = sh.ui().get_accent_color();
-            let mut settings = load_settings().unwrap_or(LocalSettings { server: String::new(), accent: None });
+            let mut settings = load_settings().unwrap_or(LocalSettings { server: String::new(), accent: None, device_id: None });
             settings.server = sh.server();
             settings.accent = Some(accent_to_hex(accent));
             save_settings(&settings);
@@ -2155,14 +2639,54 @@ fn main() -> Result<(), slint::PlatformError> {
                 let file = rfd::AsyncFileDialog::new().pick_file().await;
                 let Some(handle) = file else { return };
                 let bytes = handle.read().await;
+                const MAX_FILE: usize = 1024 * 1024 * 1024;
+                if bytes.len() > MAX_FILE {
+                    let _ = tx.send(Event::Error("file too large (max 1 GB)".into()));
+                    return;
+                }
                 let name = handle.file_name();
                 let mime = mime_from_path(handle.path()).to_string();
-                use base64::Engine;
-                let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let file_id = uuid::Uuid::new_v4().to_string();
+                let file_size = bytes.len() as u64;
+                // Small thumbnail so the recipient can render the bubble before
+                // the P2P transfer finishes (only for images). JPEG keeps it well
+                // under the server's ~300KB thumbnail limit.
+                let thumbnail = if mime.starts_with("image/") {
+                    image::load_from_memory(&bytes)
+                        .ok()
+                        .map(|img| {
+                            let max_dim = 480u32;
+                            let img = if img.width() > max_dim || img.height() > max_dim {
+                                let scale = max_dim as f32 / img.width().max(img.height()) as f32;
+                                img.resize(
+                                    ((img.width() as f32) * scale) as u32,
+                                    ((img.height() as f32) * scale) as u32,
+                                    image::imageops::FilterType::Lanczos3,
+                                )
+                            } else {
+                                img
+                            };
+                            let mut out = std::io::Cursor::new(Vec::new());
+                            let _ = img.write_to(
+                                &mut out,
+                                image::ImageFormat::Jpeg,
+                            );
+                            use base64::Engine;
+                            let data =
+                                base64::engine::general_purpose::STANDARD.encode(out.into_inner());
+                            format!("data:image/jpeg;base64,{data}")
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 let _ = tx.send(Event::AttachmentPicked(Attachment {
                     mime: mime.clone(),
                     name,
-                    data: format!("data:{mime};base64,{data}"),
+                    file_id,
+                    file_size,
+                    thumbnail,
+                    bytes,
                 }));
             });
         });
@@ -2360,4 +2884,57 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     ui.run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ws_hub_event_parses_messages_and_signals() {
+        // Message event (the shape the server's HubEvent::Message serializes to).
+        let raw = r#"{"kind":"message","message":{"id":1,"conversation_id":17,"sender_id":31,"body":"hi","created_at":"2026-08-06T00:00:00","attachment_mime":null,"attachment_name":null,"attachment_data":null,"file_id":"abc","file_size":12345,"thumbnail_data":"data:image/jpeg;base64,xx"}}"#;
+        let ev: WsHubEvent = serde_json::from_str(raw).unwrap();
+        match ev {
+            WsHubEvent::Message { message } => {
+                assert_eq!(message.id, 1);
+                assert_eq!(message.file_id.as_deref(), Some("abc"));
+                assert_eq!(message.file_size, Some(12345));
+                assert_eq!(message.thumbnail_data.as_deref(), Some("data:image/jpeg;base64,xx"));
+                assert!(message.attachment_data.is_none());
+            }
+            _ => panic!("expected message event"),
+        }
+
+        // Signal event (HubEvent::Signal). target_user_id is skip_serializing.
+        let raw = r#"{"kind":"signal","signal":{"file_id":"abc","type":"offer","data":"{\"sdp\":\"v=0\"}","from_username":"p2pa","from_user_id":31}}"#;
+        let ev: WsHubEvent = serde_json::from_str(raw).unwrap();
+        match ev {
+            WsHubEvent::Signal { signal } => {
+                assert_eq!(signal.file_id, "abc");
+                assert_eq!(signal.kind, "offer");
+                assert_eq!(signal.data.as_deref(), Some(r#"{"sdp":"v=0"}"#));
+                assert_eq!(signal.from_user_id, Some(31));
+            }
+            _ => panic!("expected signal event"),
+        }
+
+        // Legacy message without P2P fields must still parse.
+        let raw = r#"{"kind":"message","message":{"id":2,"conversation_id":17,"sender_id":31,"body":"old","created_at":"2026-08-06T00:00:00"}}"#;
+        let ev: WsHubEvent = serde_json::from_str(raw).unwrap();
+        match ev {
+            WsHubEvent::Message { message } => {
+                assert!(message.file_id.is_none());
+                assert_eq!(message.body, "old");
+            }
+            _ => panic!("expected message event"),
+        }
+    }
+
+    #[test]
+    fn human_size_formats() {
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(2048), "2 KB");
+        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MB");
+    }
 }

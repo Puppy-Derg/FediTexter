@@ -8,7 +8,7 @@ use tracing::warn;
 
 use crate::api::error::ApiError;
 use crate::auth::User;
-use crate::chat::Message;
+use crate::chat::{Message, SignalKind};
 use crate::db::AppState;
 
 pub const INBOX_PATH: &str = "/api/federation/inbox";
@@ -288,6 +288,54 @@ async fn deliver_to_server(
         "to_id": to_remote_id,
         "body": message.body,
         "sent_at": message.created_at,
+        "attachment_mime": message.attachment_mime,
+        "attachment_name": message.attachment_name,
+        "file_id": message.file_id,
+        "file_size": message.file_size,
+        "thumbnail_data": message.thumbnail_data,
+    });
+    let body = payload.to_string();
+    let auth = state.federation.sign_auth("POST", INBOX_PATH, body.as_bytes());
+    let url = format!("{}{}", base_url(domain), INBOX_PATH);
+
+    let resp = state
+        .federation
+        .client
+        .post(&url)
+        .header(AUTHORIZATION, auth)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("remote responded {}", resp.status()));
+    }
+    Ok(())
+}
+
+/// Forward WebRTC signaling (P2P file transfer) to a remote server so it can
+/// reach the recipient's client. Only metadata + SDP/ICE crosses the server;
+/// file bytes never touch the server.
+pub(crate) async fn deliver_signal_to_remote(
+    state: &AppState,
+    to_remote_id: u64,
+    domain: &str,
+    sender: &User,
+    file_id: &str,
+    kind: &SignalKind,
+    data: Option<&str>,
+) -> Result<(), String> {
+    let payload = json!({
+        "type": "signal",
+        "from_server": state.federation.domain,
+        "from_username": sender.username,
+        "from_id": sender.id,
+        "to_id": to_remote_id,
+        "file_id": file_id,
+        "signal_kind": kind.as_str(),
+        "signal_data": data,
     });
     let body = payload.to_string();
     let auth = state.federation.sign_auth("POST", INBOX_PATH, body.as_bytes());

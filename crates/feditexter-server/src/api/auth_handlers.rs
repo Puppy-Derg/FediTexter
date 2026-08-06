@@ -1,5 +1,5 @@
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -19,10 +19,15 @@ pub struct RegisterRequest {
 pub struct LoginRequest {
     pub email: String,
     pub password: String,
+    /// Persist the session on this device for 60 days instead of the default
+    /// session length.
+    #[serde(default)]
+    pub remember_me: Option<bool>,
 }
 
 pub async fn register(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     if body.password.len() < 8 {
@@ -77,7 +82,10 @@ pub async fn register(
         totp_enabled: false,
     };
 
-    let token = create_session(&state, user_id).await?;
+    let device_id = headers.get("x-device-id").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let login_ip = crate::auth::client_ip(&headers, None);
+
+    let token = create_session(&state, user_id, false, device_id, login_ip).await?;
 
     if state.verify_emails {
         if let Some(code) = &verification_code {
@@ -104,6 +112,7 @@ const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$fAWlNrU+t0yc2h
 
 pub async fn login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let row: Option<(u64, String, String, String, String, bool, Option<String>, bool)> = sqlx::query_as(
@@ -128,17 +137,19 @@ pub async fn login(
     }
 
     let user = User { id, email, username, display_name, email_verified, avatar_url, totp_enabled };
+    let device_id = headers.get("x-device-id").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let login_ip = crate::auth::client_ip(&headers, None);
 
     if totp_enabled {
         // Create a 2FA-pending session; the client must complete /api/login/2fa.
-        let pending_token = create_pending_session(&state, id).await?;
+        let pending_token = create_pending_session(&state, id, device_id, login_ip).await?;
         return Ok(Json(json!({
             "requires_2fa": true,
             "pending_token": pending_token,
         })));
     }
 
-    let token = create_session(&state, id).await?;
+    let token = create_session(&state, id, body.remember_me.unwrap_or(false), device_id, login_ip).await?;
     Ok(Json(json!({ "token": token, "user": user })))
 }
 
@@ -146,6 +157,8 @@ pub async fn login(
 pub struct Login2faRequest {
     pub pending_token: String,
     pub code: String,
+    #[serde(default)]
+    pub remember_me: Option<bool>,
 }
 
 /// Complete a 2FA login: verify the TOTP code for the pending session.
@@ -178,7 +191,16 @@ pub async fn login_2fa(
         return Err(ApiError::Unauthorized("invalid code"));
     }
 
-    sqlx::query("UPDATE sessions SET is_2fa_pending = 0 WHERE id = ?")
+    // The pending session was created with a 10-minute expiry; promote it to a
+    // full session now that 2FA passed.
+    let days = if body.remember_me.unwrap_or(false) {
+        crate::auth::SESSION_DAYS_REMEMBER
+    } else {
+        crate::auth::SESSION_DAYS
+    };
+    let expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::days(days);
+    sqlx::query("UPDATE sessions SET is_2fa_pending = 0, expires_at = ? WHERE id = ?")
+        .bind(expires_at)
         .bind(session_id)
         .execute(&state.pool)
         .await
@@ -297,15 +319,23 @@ pub async fn two_fa_disable(
 }
 
 /// Create a session that requires 2FA before it can be used.
-async fn create_pending_session(state: &AppState, user_id: u64) -> Result<String, ApiError> {
+async fn create_pending_session(
+    state: &AppState,
+    user_id: u64,
+    device_id: Option<String>,
+    login_ip: Option<String>,
+) -> Result<String, ApiError> {
     let (token, token_hash) = crate::auth::generate_token_pair();
     let expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::minutes(10);
     sqlx::query(
-        "INSERT INTO sessions (user_id, token_hash, expires_at, is_2fa_pending) VALUES (?, ?, ?, 1)",
+        "INSERT INTO sessions (user_id, token_hash, expires_at, is_2fa_pending, device_id, login_ip)
+         VALUES (?, ?, ?, 1, ?, ?)",
     )
     .bind(user_id)
     .bind(&token_hash)
     .bind(expires_at)
+    .bind(device_id)
+    .bind(login_ip)
     .execute(&state.pool)
     .await
     .map_err(|_| ApiError::Internal("db error"))?;
@@ -511,16 +541,32 @@ fn downscale_avatar(data_url: &str) -> Option<String> {
     Some(format!("data:image/png;base64,{data}"))
 }
 
-async fn create_session(state: &AppState, user_id: u64) -> Result<String, ApiError> {
+async fn create_session(
+    state: &AppState,
+    user_id: u64,
+    remember_me: bool,
+    device_id: Option<String>,
+    login_ip: Option<String>,
+) -> Result<String, ApiError> {
     let (token, token_hash) = crate::auth::generate_token_pair();
-    let expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::days(crate::auth::SESSION_DAYS);
-    sqlx::query("INSERT INTO sessions (user_id, token_hash, expires_at) VALUES (?, ?, ?)")
-        .bind(user_id)
-        .bind(&token_hash)
-        .bind(expires_at)
-        .execute(&state.pool)
-        .await
-        .map_err(|_| ApiError::Internal("db error"))?;
+    let days = if remember_me {
+        crate::auth::SESSION_DAYS_REMEMBER
+    } else {
+        crate::auth::SESSION_DAYS
+    };
+    let expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::days(days);
+    sqlx::query(
+        "INSERT INTO sessions (user_id, token_hash, expires_at, device_id, login_ip)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(user_id)
+    .bind(&token_hash)
+    .bind(expires_at)
+    .bind(device_id)
+    .bind(login_ip)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
     Ok(token)
 }
 // ---------------------------------------------------------------------------

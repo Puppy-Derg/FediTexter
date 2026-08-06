@@ -13,8 +13,8 @@ pub struct PreviewRequest {
 }
 
 const MAX_PAGE_BYTES: usize = 2_000_000;
-const MAX_IMAGE_BYTES: usize = 1_000_000;
-const IMAGE_MAX_DIM: u32 = 400;
+const MAX_IMAGE_BYTES: usize = 3_000_000;
+const IMAGE_MAX_DIM: u32 = 1024;
 
 /// Basic SSRF guard: reject requests to private/loopback/link-local hosts.
 fn looks_private(url: &str) -> bool {
@@ -91,7 +91,7 @@ fn meta_content(dom: &Html, selector: &Selector, prop: &str) -> Option<String> {
 
 /// Synchronously extract title / description / image URL from HTML.
 /// `scraper::Html` is not `Sync`, so this keeps it out of the async future.
-fn parse_preview(html: &str) -> (Option<String>, Option<String>, Option<String>) {
+fn parse_preview(base_url: &str, html: &str) -> (Option<String>, Option<String>, Option<String>) {
     let dom = Html::parse_document(html);
     let title_sel = Selector::parse("title").unwrap();
     let meta_sel = Selector::parse("meta").unwrap();
@@ -109,9 +109,21 @@ fn parse_preview(html: &str) -> (Option<String>, Option<String>, Option<String>)
         .or_else(|| meta_content(&dom, &meta_sel, "twitter:description"))
         .filter(|s| !s.is_empty());
 
+    // Many pages use protocol-relative (`//cdn/…`) or absolute-path (`/img/…`)
+    // og:image URLs; resolve them against the page's own URL.
     let image_url = meta_content(&dom, &meta_sel, "og:image")
         .or_else(|| meta_content(&dom, &meta_sel, "twitter:image"))
-        .filter(|i| i.starts_with("http") && !looks_private(i));
+        .and_then(|raw| {
+            if raw.starts_with("http://") || raw.starts_with("https://") {
+                return (!looks_private(&raw)).then_some(raw);
+            }
+            let resolved = url::Url::parse(base_url)
+                .ok()
+                .and_then(|base| base.join(&raw).ok())
+                .map(|u| u.to_string());
+            resolved
+                .filter(|u| u.starts_with("http") && !looks_private(u))
+        });
 
     (title, description, image_url)
 }
@@ -144,7 +156,7 @@ pub async fn link_preview(
         return Err(ApiError::BadRequest("page too large"));
     }
 
-    let (title, description, image_url) = parse_preview(&String::from_utf8_lossy(&html));
+    let (title, description, image_url) = parse_preview(&url, &String::from_utf8_lossy(&html));
 
     let image = match image_url {
         Some(img) => fetch_preview_image(&state, &img).await,

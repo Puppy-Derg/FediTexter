@@ -1,11 +1,12 @@
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
-use axum::extract::FromRequestParts;
+use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::request::Parts;
 use rand_core::{OsRng, RngCore};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::FromRow;
+use std::net::SocketAddr;
 
 use crate::api::error::ApiError;
 use crate::db::AppState;
@@ -29,6 +30,8 @@ struct Session {
     user_id: u64,
     expires_at: chrono::NaiveDateTime,
     is_2fa_pending: bool,
+    device_id: Option<String>,
+    login_ip: Option<String>,
 }
 
 pub struct AuthUser {
@@ -83,6 +86,8 @@ pub(crate) fn generate_verification_code() -> String {
 }
 
 pub(crate) const SESSION_DAYS: i64 = 30;
+/// Length of a "remember me" session, in days.
+pub(crate) const SESSION_DAYS_REMEMBER: i64 = 60;
 
 impl FromRequestParts<AppState> for AuthUser {
     type Rejection = ApiError;
@@ -119,7 +124,8 @@ async fn load_auth_user(
     let token_hash = sha256(header);
 
     let session: Session = sqlx::query_as(
-        "SELECT id, user_id, expires_at, is_2fa_pending FROM sessions WHERE token_hash = ?",
+        "SELECT id, user_id, expires_at, is_2fa_pending, device_id, login_ip
+         FROM sessions WHERE token_hash = ?",
     )
     .bind(&token_hash)
     .fetch_optional(&state.pool)
@@ -134,6 +140,8 @@ async fn load_auth_user(
         return Err(ApiError::Unauthorized("2fa required"));
     }
 
+    enforce_session_binding(state, parts, &session).await?;
+
     let user: User = sqlx::query_as(
         "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled FROM users WHERE id = ?",
     )
@@ -143,4 +151,77 @@ async fn load_auth_user(
     .map_err(|_| ApiError::Internal("db error"))?;
 
     Ok((session.id, user))
+}
+
+/// The device UUID presented by the client, if any.
+pub(crate) fn request_device_id(parts: &Parts) -> Option<String> {
+    parts
+        .headers
+        .get("x-device-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Best-effort client IP: forwarded headers first (the server typically sits
+/// behind nginx), then the direct socket address.
+pub(crate) fn client_ip(
+    headers: &axum::http::HeaderMap,
+    connect_info: Option<&ConnectInfo<SocketAddr>>,
+) -> Option<String> {
+    for name in ["x-forwarded-for", "x-real-ip", "cf-connecting-ip"] {
+        if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
+            let first = v.split(',').next().unwrap_or(v).trim();
+            if !first.is_empty() {
+                return Some(first.to_string());
+            }
+        }
+    }
+    connect_info.map(|ci| ci.0.ip().to_string())
+}
+
+/// Reject requests whose device UUID or client IP no longer matches the one the
+/// session was created with, so a stolen token can't be replayed elsewhere.
+/// Legacy sessions (columns NULL) are bound on first use to upgrade them.
+async fn enforce_session_binding(
+    state: &AppState,
+    parts: &Parts,
+    session: &Session,
+) -> Result<(), ApiError> {
+    let presented = request_device_id(parts);
+    match (&session.device_id, &presented) {
+        (Some(expected), Some(actual)) if expected == actual => {}
+        (Some(_), _) => return Err(ApiError::Unauthorized("session is bound to another device")),
+        (None, Some(actual)) => {
+            sqlx::query("UPDATE sessions SET device_id = ? WHERE id = ?")
+                .bind(actual)
+                .bind(session.id)
+                .execute(&state.pool)
+                .await
+                .map_err(|_| ApiError::Internal("db error"))?;
+        }
+        (None, None) => {
+            return Err(ApiError::Unauthorized("missing device id, please log in again"));
+        }
+    }
+
+    let connect_info = parts.extensions.get::<ConnectInfo<SocketAddr>>();
+    if let Some(ip) = client_ip(&parts.headers, connect_info) {
+        match &session.login_ip {
+            Some(expected) if expected != &ip => {
+                return Err(ApiError::Unauthorized("session is bound to another ip"));
+            }
+            Some(_) => {}
+            None => {
+                sqlx::query("UPDATE sessions SET login_ip = ? WHERE id = ?")
+                    .bind(&ip)
+                    .bind(session.id)
+                    .execute(&state.pool)
+                    .await
+                    .map_err(|_| ApiError::Internal("db error"))?;
+            }
+        }
+    }
+
+    Ok(())
 }

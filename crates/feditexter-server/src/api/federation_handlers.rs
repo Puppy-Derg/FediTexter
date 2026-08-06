@@ -65,6 +65,20 @@ pub struct InboxMessage {
     pub body: String,
     #[serde(default)]
     pub sent_at: Option<String>,
+    #[serde(default)]
+    pub file_id: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<i64>,
+    #[serde(default)]
+    pub thumbnail_data: Option<String>,
+    #[serde(default)]
+    pub attachment_mime: Option<String>,
+    #[serde(default)]
+    pub attachment_name: Option<String>,
+    #[serde(default)]
+    pub signal_kind: Option<String>,
+    #[serde(default)]
+    pub signal_data: Option<String>,
 }
 
 pub async fn inbox(
@@ -84,14 +98,8 @@ pub async fn inbox(
     let payload: InboxMessage =
         serde_json::from_slice(&body).map_err(|_| ApiError::BadRequest("invalid payload"))?;
 
-    if payload.kind != "message" {
-        return Err(ApiError::BadRequest("unsupported event type"));
-    }
     if payload.from_server != info.domain {
         return Err(ApiError::Unauthorized("from_server mismatch"));
-    }
-    if payload.body.trim().is_empty() || payload.body.len() > 2000 {
-        return Err(ApiError::BadRequest("invalid message body"));
     }
 
     let recipient: Option<(u64,)> =
@@ -106,27 +114,61 @@ pub async fn inbox(
 
     let sender_id = federation::get_or_create_mirror(&state, info.id, payload.from_id, &payload.from_username).await?;
 
+    // WebRTC signaling for P2P files: relay to the local recipient.
+    if payload.kind == "signal" {
+        let file_id = payload.file_id.ok_or(ApiError::BadRequest("signal requires a file_id"))?;
+        let sig_kind = payload.signal_kind.ok_or(ApiError::BadRequest("signal requires a signal_kind"))?;
+        let kind = crate::chat::SignalKind::from_str(&sig_kind)
+            .ok_or(ApiError::BadRequest("unsupported signal kind"))?;
+        state.hub.publish_signal(crate::chat::SignalEvent {
+            file_id,
+            kind,
+            data: payload.signal_data,
+            from_username: Some(payload.from_username),
+            from_user_id: Some(sender_id),
+            target_user_id: recipient_id,
+        });
+        return Ok(Json(json!({ "status": "ok" })));
+    }
+
+    if payload.kind != "message" {
+        return Err(ApiError::BadRequest("unsupported event type"));
+    }
+    if payload.body.trim().is_empty() || payload.body.len() > 2000 {
+        return Err(ApiError::BadRequest("invalid message body"));
+    }
+
     let conversation_id = crate::api::chat_handlers::ensure_direct_conversation(&state, sender_id, recipient_id).await?;
 
     let created_at = chrono::Utc::now().naive_utc();
-    let inserted = sqlx::query("INSERT INTO messages (conversation_id, sender_id, body, created_at) VALUES (?, ?, ?, ?)")
-        .bind(conversation_id)
-        .bind(sender_id)
-        .bind(&payload.body)
-        .bind(created_at)
-        .execute(&state.pool)
-        .await
-        .map_err(|_| ApiError::Internal("db error"))?;
+    let inserted = sqlx::query(
+        "INSERT INTO messages (conversation_id, sender_id, body, created_at, attachment_mime, attachment_name,
+                               file_id, file_size, thumbnail_data)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(conversation_id)
+    .bind(sender_id)
+    .bind(&payload.body)
+    .bind(created_at)
+    .bind(&payload.attachment_mime)
+    .bind(&payload.attachment_name)
+    .bind(&payload.file_id)
+    .bind(payload.file_size)
+    .bind(&payload.thumbnail_data)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
 
     let message: Message = sqlx::query_as(
-        "SELECT id, conversation_id, sender_id, body, created_at, attachment_mime, attachment_name, attachment_data FROM messages WHERE id = ?",
+        "SELECT id, conversation_id, sender_id, body, created_at, attachment_mime, attachment_name, attachment_data,
+                file_id, file_size, thumbnail_data FROM messages WHERE id = ?",
     )
     .bind(inserted.last_insert_id())
     .fetch_one(&state.pool)
     .await
     .map_err(|_| ApiError::Internal("db error"))?;
 
-    state.hub.publish(message.clone());
+    state.hub.publish_message(message.clone());
 
     Ok(Json(json!({ "status": "ok", "local_id": message.id })))
 }

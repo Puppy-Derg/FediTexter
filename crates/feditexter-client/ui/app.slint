@@ -23,9 +23,13 @@ export struct UiMessage {
     attachment-image: image,
     attachment-name: string,
     attachment-mime: string,
+    file-id: string,
+    file-status: string,
+    file-size: string,
     preview-title: string,
     preview-description: string,
     preview-image: image,
+    preview-image-ratio: float,
     preview-url: string,
 }
 
@@ -150,15 +154,13 @@ component Button inherits Rectangle {
     in property <brush> on-accent: #FFFFFF;
     callback clicked;
 
-    property <brush> bg: root.primary ? root.accent : Palette.control-background;
-    property <brush> label-color: root.primary ? root.on-accent : Palette.control-foreground;
+    property <brush> bg: root.primary ? root.accent : #333333;
+    property <brush> label-color: root.primary ? root.on-accent : Palette.foreground;
 
     min-width: 64px;
     height: 36px;
     border-radius: 8px;
     background: root.bg;
-    border-width: 1px;
-    border-color: Palette.border;
     HorizontalLayout {
         padding-left: 12px;
         padding-right: 12px;
@@ -174,26 +176,68 @@ component Button inherits Rectangle {
     }
     states [
         disabled when !root.enabled : {
-            bg: Palette.control-background.with-alpha(0.4);
-            label-color: Palette.control-foreground.with-alpha(0.4);
+            bg: #333333.with-alpha(0.4);
+            label-color: Palette.foreground.with-alpha(0.4);
         }
         pressed-primary when root.enabled && ta.pressed && root.primary : {
             bg: root.accent.with-alpha(0.72);
         }
         pressed when root.enabled && ta.pressed : {
-            bg: Palette.control-background.with-alpha(0.35);
+            bg: #333333.with-alpha(0.35);
         }
         hover-primary when root.enabled && ta.has-hover && root.primary : {
             bg: root.accent.with-alpha(0.85);
         }
         hover when root.enabled && ta.has-hover : {
-            bg: Palette.control-background.with-alpha(0.55);
+            bg: #333333.with-alpha(0.55);
         }
     ]
     animate bg { duration: 60ms; }
     ta := TouchArea {
         enabled: root.enabled;
         clicked => { root.clicked(); }
+    }
+}
+
+component Checkbox inherits Rectangle {
+    in-out property <bool> checked: false;
+    in property <string> text: "";
+    in property <brush> accent: #7C5CE0;
+    callback toggled(bool);
+    min-height: 24px;
+    HorizontalLayout {
+        spacing: 8px;
+        padding-left: 2px;
+        box := Rectangle {
+            width: 18px;
+            height: 18px;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: root.checked ? root.accent : #888888;
+            background: root.checked ? root.accent : transparent;
+            Text {
+                visible: root.checked;
+                text: "✓";
+                color: white;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+        Text {
+            text: root.text;
+            color: #DDDDDD;
+            font-size: 13px;
+            vertical-alignment: center;
+        }
+    }
+    ta := TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => {
+            root.checked = !root.checked;
+            root.toggled(root.checked);
+        }
     }
 }
 
@@ -415,7 +459,7 @@ export component MainWindow inherits Window {
     in-out property<image> pending-attach-image;
     in property <image> my-avatar;
 
-    callback login(email: string, password: string);
+    callback login(email: string, password: string, remember: bool);
     callback register(email: string, username: string, password: string);
     callback logout();
     callback select-conversation(id: int);
@@ -446,6 +490,7 @@ export component MainWindow inherits Window {
 
     property<string> login-email: "";
     property<string> login-password: "";
+    in-out property<bool> remember-me: true;
     property<string> reg-email: "";
     property<string> reg-username: "";
     property<string> reg-password: "";
@@ -488,7 +533,7 @@ export component MainWindow inherits Window {
     // Login / register screen (dark grey)
     // ------------------------------------------------------------------
     if !root.logged-in: Rectangle {
-        background: @linear-gradient(160deg, root.accent-color.with-alpha(0.40), #232323 50%, root.accent-color.with-alpha(0.28));
+        background: #232323;
         VerticalLayout {
             spacing: 10px;
             alignment: start;
@@ -564,9 +609,14 @@ export component MainWindow inherits Window {
                                 input-type: InputType.password;
                                 accent: root.accent-color;
                                 accepted => {
-                                    root.login(root.login-email, root.login-password);
+                                    root.login(root.login-email, root.login-password, root.remember-me);
                                 }
                             }
+                        }
+                        Checkbox {
+                            checked <=> root.remember-me;
+                            text: "Remember me for 60 days";
+                            accent: root.accent-color;
                         }
                         Rectangle { height: 12px; }
                         Button {
@@ -575,7 +625,7 @@ export component MainWindow inherits Window {
                             accent: root.accent-color;
                             on-accent: root.md3-on-primary;
                             clicked => {
-                                root.login(root.login-email, root.login-password);
+                                root.login(root.login-email, root.login-password, root.remember-me);
                             }
                         }
                         Button {
@@ -932,11 +982,25 @@ export component MainWindow inherits Window {
                                                         mouse-cursor: pointer;
                                                         clicked => { root.open-image(m.id); }
                                                     }
+                                                    if m.file-status != "": Rectangle {
+                                                        width: 100%;
+                                                        height: 100%;
+                                                        background: #00000080;
+                                                        VerticalLayout {
+                                                            alignment: center;
+                                                            Text {
+                                                                text: m.file-status;
+                                                                color: white;
+                                                                font-size: 13px;
+                                                                horizontal-alignment: center;
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                                 if m.attachment-name != "" && !(m.attachment-image.width > 0): HorizontalLayout {
                                                     spacing: 6px;
                                                     Text {
-                                                        text: "📎 " + m.attachment-name;
+                                                        text: "📎 " + m.attachment-name + (m.file-size != "" ? "  ·  " + m.file-size : "");
                                                         color: m.is-self ? root.md3-on-primary-container : #E8E8E8;
                                                         overflow: elide;
                                                     }
@@ -946,6 +1010,11 @@ export component MainWindow inherits Window {
                                                         mouse-cursor: pointer;
                                                         clicked => { root.open-image(m.id); }
                                                     }
+                                                }
+                                                if m.file-status != "" && !(m.attachment-image.width > 0): Text {
+                                                    text: m.file-status;
+                                                    color: m.is-self ? root.md3-on-primary-container : #AAAAAA;
+                                                    font-size: 12px;
                                                 }
                                                 Text {
                                                     text: m.body;
@@ -961,7 +1030,7 @@ export component MainWindow inherits Window {
                                                         spacing: 0px;
                                                         if m.preview-image.width > 0: Rectangle {
                                                             width: 260px;
-                                                            height: 130px;
+                                                            height: max(96px, min(260px * m.preview-image-ratio, 320px));
                                                             clip: true;
                                                             background: #00000033;
                                                             Image {
@@ -1133,7 +1202,7 @@ export component MainWindow inherits Window {
             width: min(460px, parent.width - 48px);
             height: min(580px, parent.height - 96px);
             border-radius: 28px;
-            background: root.md3-surface-container-high;
+            background: root.md3-background;
             CloseButton {
                 x: parent.width - 40px;
                 y: 14px;
