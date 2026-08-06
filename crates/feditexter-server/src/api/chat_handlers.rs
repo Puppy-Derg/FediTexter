@@ -1,4 +1,4 @@
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
@@ -402,4 +402,34 @@ pub async fn delete_conversation(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+pub struct PresenceQuery {
+    /// Comma-separated user ids to report online status for.
+    #[serde(default)]
+    pub ids: Option<String>,
+}
+
+/// Report which of the requested users are currently online (have a live WS).
+pub async fn presence(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Query(q): Query<PresenceQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let ids: Vec<u64> = q
+        .ids
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    let online = state.presence.lock().unwrap();
+    let mut map = serde_json::Map::new();
+    for id in ids {
+        map.insert(id.to_string(), json!(online.contains(&id)));
+    }
+    drop(online);
+    let _ = auth;
+    Ok(Json(json!({ "presence": map })))
 }

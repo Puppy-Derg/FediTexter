@@ -97,6 +97,12 @@ struct Message {
 enum WsHubEvent {
     Message { message: Message },
     Signal { signal: SignalEvent },
+    Typing {
+        conversation_id: u64,
+        from_user_id: u64,
+        from_username: String,
+    },
+    Presence { user_id: u64, online: bool },
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -189,6 +195,11 @@ enum Event {
     #[allow(dead_code)]
     P2pComplete { file_id: String, mime: String, name: String, bytes: Vec<u8> },
     P2pFailed { file_id: String, reason: String },
+    #[allow(dead_code)]
+    Typing { conversation_id: u64, from_user_id: u64, from_username: String },
+    TypingExpired { conversation_id: u64 },
+    Presence { user_id: u64, online: bool },
+    PresenceBatch(std::collections::HashMap<u64, bool>),
     Profile(Profile),
     ContextProfile(Profile),
     ModerationResult(Profile),
@@ -667,6 +678,49 @@ impl Backend {
                 serde_json::from_value(v.get("conversations").cloned().unwrap_or(Value::Null))
                     .unwrap_or_default();
             let _ = tx.send(Event::Conversations(list));
+        });
+    }
+
+    /// Broadcast a typing notification for a conversation over the WebSocket.
+    fn send_typing(&self, conversation_id: u64) {
+        let _ = self.ws_tx.send(
+            json!({ "type": "typing", "conversation_id": conversation_id }).to_string(),
+        );
+    }
+
+    /// Fetch which of the given users are currently online.
+    fn fetch_presence(&self, server: &str, token: &str, ids: Vec<u64>) {
+        let tx = self.tx.clone();
+        let http = self.http.clone();
+        let server = server.to_string();
+        let token = token.to_string();
+        let ids_str = ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.runtime.spawn(async move {
+            let url = api_url(&server, &format!("/api/presence?ids={ids_str}"));
+            let resp = match http.get(&url).bearer_auth(&token).send().await {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            if !resp.status().is_success() {
+                return;
+            }
+            let v: Value = match resp.json().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let mut map = std::collections::HashMap::new();
+            if let Some(obj) = v.get("presence").and_then(|p| p.as_object()) {
+                for (id, online) in obj {
+                    if let (Ok(id), Some(on)) = (id.parse::<u64>(), online.as_bool()) {
+                        map.insert(id, on);
+                    }
+                }
+            }
+            let _ = tx.send(Event::PresenceBatch(map));
         });
     }
 
@@ -1221,6 +1275,16 @@ fn spawn_ws(
                                                 WsHubEvent::Signal { signal } => {
                                                     let _ = tx.send(Event::P2pSignal(signal));
                                                 }
+                                                WsHubEvent::Typing { conversation_id, from_user_id, from_username } => {
+                                                    let _ = tx.send(Event::Typing {
+                                                        conversation_id,
+                                                        from_user_id,
+                                                        from_username,
+                                                    });
+                                                }
+                                                WsHubEvent::Presence { user_id, online } => {
+                                                    let _ = tx.send(Event::Presence { user_id, online });
+                                                }
                                             }
                                         }
                                     }
@@ -1270,6 +1334,13 @@ struct Shared {
     own_files: Rc<RefCell<std::collections::HashMap<String, OwnFile>>>,
     /// Whether the user asked to persist this login for 60 days.
     remember_me: Rc<Cell<bool>>,
+    /// user_id -> online status (presence).
+    presence: Rc<RefCell<std::collections::HashMap<u64, bool>>>,
+    /// conversation_id -> (who is typing, when they last typed) for the
+    /// "… is typing" indicator.
+    typing: Rc<RefCell<std::collections::HashMap<u64, (String, std::time::Instant)>>>,
+    /// Last time we broadcast "I'm typing" to avoid flooding the server.
+    last_typing_sent: Rc<Cell<std::time::Instant>>,
 }
 
 /// Transfer state shown under a P2P attachment bubble.
@@ -1780,12 +1851,75 @@ fn refresh_conversations_ui(sh: &Shared) {
                     .find(|m| Some(m.id) != self_id)
                     .map(|m| m.id as i32)
                     .unwrap_or(-1),
+                online: c
+                    .members
+                    .iter()
+                    .find(|m| Some(m.id) != self_id)
+                    .map(|m| sh.presence.borrow().get(&m.id).copied().unwrap_or(false))
+                    .unwrap_or(false),
             }
         })
         .collect();
     *sh.contacts.borrow_mut() = contacts;
     sh.ui().set_conversations(ModelRc::new(VecModel::from(ui_convs)));
     refresh_suggestions(sh);
+}
+
+/// Update the chat-area header (title + typing/online status) for the selected
+/// conversation.
+fn refresh_chat_header(sh: &Shared) {
+    let self_id = sh.self_id.get();
+    let selected = sh.selected.get();
+    let conv = sh
+        .conversations
+        .borrow()
+        .iter()
+        .find(|c| c.id == selected as u64)
+        .cloned();
+    let ui = sh.ui();
+    match conv {
+        Some(c) => {
+            let title = conversation_title(&c, self_id);
+            ui.set_chat_header_title(title.into());
+            let status = chat_status(sh, &c, self_id);
+            ui.set_chat_header_status(status.into());
+        }
+        None => {
+            ui.set_chat_header_title(SharedString::default());
+            ui.set_chat_header_status(SharedString::default());
+        }
+    }
+}
+
+/// Status line for a conversation: "… is typing" takes priority, then online
+/// status (direct chats) or a count (group chats).
+fn chat_status(sh: &Shared, c: &Conversation, self_id: Option<u64>) -> String {
+    if let Some((name, at)) = sh.typing.borrow().get(&c.id) {
+        if at.elapsed() < Duration::from_secs(3) {
+            return format!("{name} is typing…");
+        }
+    }
+    let others: Vec<u64> = c
+        .members
+        .iter()
+        .map(|m| m.id)
+        .filter(|id| Some(*id) != self_id)
+        .collect();
+    if others.len() == 1 {
+        return match sh.presence.borrow().get(&others[0]) {
+            Some(true) => "online".to_string(),
+            _ => "offline".to_string(),
+        };
+    }
+    let online = others
+        .iter()
+        .filter(|id| *sh.presence.borrow().get(id).unwrap_or(&false))
+        .count();
+    if online > 0 {
+        format!("{online} online")
+    } else {
+        String::new()
+    }
 }
 
 fn refresh_suggestions(sh: &Shared) {
@@ -2036,6 +2170,18 @@ fn handle_event(sh: &Shared, ev: Event) {
                 merge_conversation(sh, c);
             }
             refresh_conversations_ui(sh);
+            // Fetch initial online status for everyone we talk to.
+            let ids: Vec<u64> = sh
+                .conversations
+                .borrow()
+                .iter()
+                .flat_map(|c| c.members.iter().map(|m| m.id))
+                .filter(|id| Some(*id) != sh.self_id.get())
+                .collect();
+            if !ids.is_empty() {
+                sh.backend
+                    .fetch_presence(&sh.server(), &sh.token.borrow().clone().unwrap_or_default(), ids);
+            }
         }
         Event::ConversationCreated(c) => {
             merge_conversation(sh, c.clone());
@@ -2089,6 +2235,41 @@ fn handle_event(sh: &Shared, ev: Event) {
         }
         Event::P2pSignal(sig) => {
             sh.p2p.handle_signal(sig);
+        }
+        Event::Typing { conversation_id, from_username, .. } => {
+            sh.typing.borrow_mut().insert(conversation_id, (from_username, std::time::Instant::now()));
+            refresh_chat_header(sh);
+            let tx = sh.backend.tx.clone();
+            let conv = conversation_id;
+            slint::Timer::single_shot(Duration::from_secs(3), move || {
+                let _ = tx.send(Event::TypingExpired { conversation_id: conv });
+            });
+        }
+        Event::TypingExpired { conversation_id } => {
+            let expired = {
+                let t = sh.typing.borrow();
+                t.get(&conversation_id)
+                    .map(|(_, at)| at.elapsed() >= Duration::from_secs(3))
+                    .unwrap_or(false)
+            };
+            if expired {
+                sh.typing.borrow_mut().remove(&conversation_id);
+                refresh_chat_header(sh);
+            }
+        }
+        Event::Presence { user_id, online } => {
+            sh.presence.borrow_mut().insert(user_id, online);
+            refresh_conversations_ui(sh);
+            refresh_chat_header(sh);
+        }
+        Event::PresenceBatch(map) => {
+            let mut p = sh.presence.borrow_mut();
+            for (id, on) in map {
+                p.insert(id, on);
+            }
+            drop(p);
+            refresh_conversations_ui(sh);
+            refresh_chat_header(sh);
         }
         Event::P2pStatus { file_id, status } => {
             sh.p2p_status.borrow_mut().insert(file_id, P2pUi { status });
@@ -2216,8 +2397,12 @@ fn logout(sh: &Shared) {
     sh.hidden.borrow_mut().clear();
     sh.p2p_status.borrow_mut().clear();
     sh.own_files.borrow_mut().clear();
+    sh.presence.borrow_mut().clear();
+    sh.typing.borrow_mut().clear();
     sh.selected.replace(-1);
     let ui = sh.ui();
+    ui.set_chat_header_title(SharedString::default());
+    ui.set_chat_header_status(SharedString::default());
     ui.set_logged_in(false);
     ui.set_needs_verify(false);
     ui.set_needs_2fa(false);
@@ -2473,6 +2658,9 @@ fn main() -> Result<(), slint::PlatformError> {
         downloaded,
         own_files: Rc::new(RefCell::new(std::collections::HashMap::new())),
         remember_me: Rc::new(Cell::new(true)),
+        presence: Rc::new(RefCell::new(std::collections::HashMap::new())),
+        typing: Rc::new(RefCell::new(std::collections::HashMap::new())),
+        last_typing_sent: Rc::new(Cell::new(std::time::Instant::now())),
     });
 
     // Auto-login from a remembered session: point the UI at the saved server and
@@ -2552,10 +2740,26 @@ fn main() -> Result<(), slint::PlatformError> {
             if id >= 0 {
                 sh.unread.borrow_mut().remove(&(id as u64));
                 refresh_conversations_ui(&sh);
+                refresh_chat_header(&sh);
                 scroll_to_bottom(&sh);
                 if let Some(token) = sh.token.borrow().clone() {
                     sh.backend.refresh_messages(&sh.server(), &token, id as u64);
                 }
+            }
+        });
+    }
+    {
+        let sh = shared.clone();
+        // Broadcast "I'm typing" at most once every 2s per burst. The UI only
+        // calls this when the composer text changes.
+        ui.on_send_typing(move || {
+            let conv = sh.selected.get();
+            if conv < 0 {
+                return;
+            }
+            if sh.last_typing_sent.get().elapsed() >= Duration::from_secs(2) {
+                sh.last_typing_sent.replace(std::time::Instant::now());
+                sh.backend.send_typing(conv as u64);
             }
         });
     }

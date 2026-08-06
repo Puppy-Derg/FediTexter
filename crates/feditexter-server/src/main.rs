@@ -41,6 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .user_agent("FediTexterServer/1.0")
             .build()
             .expect("failed to build http client"),
+        presence: Default::default(),
     });
 
     let addr = format!("{bind_addr}:{port}");

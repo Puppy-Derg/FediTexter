@@ -46,6 +46,17 @@ async fn ws_loop(socket: WebSocket, state: AppState, auth: AuthUser) {
     let mut refresh = tokio::time::interval(std::time::Duration::from_secs(5));
     refresh.tick().await;
 
+    // Mark the user online and announce it.
+    {
+        let mut online = state.presence.lock().unwrap();
+        let was_online = !online.is_empty() && online.contains(&auth.user.id);
+        online.insert(auth.user.id);
+        if !was_online {
+            drop(online);
+            state.hub.publish_presence(auth.user.id, true);
+        }
+    }
+
     let (mut sink, mut stream) = socket.split();
 
     loop {
@@ -77,12 +88,53 @@ async fn ws_loop(socket: WebSocket, state: AppState, auth: AuthUser) {
                             }
                         }
                     }
+                    Ok(HubEvent::Typing { conversation_id, from_user_id, from_username }) => {
+                        // Don't echo a user's own typing back to themselves.
+                        if from_user_id != auth.user.id
+                            && event_belongs_to(&conversation_id, &member_conversations)
+                        {
+                            let payload = match serde_json::to_string(&HubEvent::Typing {
+                                conversation_id,
+                                from_user_id,
+                                from_username,
+                            }) {
+                                Ok(p) => p,
+                                Err(_) => continue,
+                            };
+                            if sink.send(WsMessage::Text(payload.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(HubEvent::Presence { user_id, online }) => {
+                        // Broadcast to every client; each one filters by the
+                        // members of its own conversations.
+                        let payload = match serde_json::to_string(&HubEvent::Presence { user_id, online }) {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        if sink.send(WsMessage::Text(payload.into())).await.is_err() {
+                            break;
+                        }
+                    }
                     Err(_) => break,
                 }
             }
             incoming = stream.next() => {
                 match incoming {
                     Some(Ok(WsMessage::Text(text))) => {
+                        // Typing notifications carry only a type + conversation.
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+                            && v.get("type").and_then(|t| t.as_str()) == Some("typing")
+                            && let Some(conversation_id) = v.get("conversation_id").and_then(|c| c.as_u64())
+                        {
+                            state.hub.publish_typing(
+                                conversation_id,
+                                auth.user.id,
+                                auth.user.username.clone(),
+                            );
+                            continue;
+                        }
                         if let Ok(sig) = serde_json::from_str::<ClientSignal>(&text) {
                             route_signal(&state, &auth, &sig).await;
                         }
@@ -92,6 +144,14 @@ async fn ws_loop(socket: WebSocket, state: AppState, auth: AuthUser) {
                 }
             }
         }
+    }
+
+    // Mark the user offline and announce it.
+    {
+        let mut online = state.presence.lock().unwrap();
+        online.remove(&auth.user.id);
+        drop(online);
+        state.hub.publish_presence(auth.user.id, false);
     }
 }
 

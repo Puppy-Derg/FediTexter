@@ -1,4 +1,6 @@
 use sqlx::MySqlPool;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use crate::chat::ChatHub;
 use crate::federation::Federation;
@@ -16,4 +18,6 @@ pub struct AppState {
     pub mailer: Option<Mailer>,
     /// Shared HTTP client for outbound fetches (link previews, federation).
     pub http: reqwest::Client,
+    /// Users with an active WebSocket connection (presence).
+    pub presence: Arc<Mutex<HashSet<u64>>>,
 }

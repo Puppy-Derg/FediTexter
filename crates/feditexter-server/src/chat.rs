@@ -35,6 +35,14 @@ pub struct ConversationMember {
 pub enum HubEvent {
     Message { message: Message },
     Signal { signal: SignalEvent },
+    /// Someone started (re)typing in a conversation.
+    Typing {
+        conversation_id: u64,
+        from_user_id: u64,
+        from_username: String,
+    },
+    /// A user's online status changed.
+    Presence { user_id: u64, online: bool },
 }
 
 /// WebRTC signaling relayed between clients. `target_user_id` is used by the
@@ -120,5 +128,17 @@ impl ChatHub {
 
     pub fn publish_signal(&self, signal: SignalEvent) {
         let _ = self.tx.send(HubEvent::Signal { signal });
+    }
+
+    pub fn publish_typing(&self, conversation_id: u64, from_user_id: u64, from_username: String) {
+        let _ = self.tx.send(HubEvent::Typing {
+            conversation_id,
+            from_user_id,
+            from_username,
+        });
+    }
+
+    pub fn publish_presence(&self, user_id: u64, online: bool) {
+        let _ = self.tx.send(HubEvent::Presence { user_id, online });
     }
 }
