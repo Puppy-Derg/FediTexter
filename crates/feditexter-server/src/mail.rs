@@ -25,18 +25,11 @@ impl Mailer {
             format!("noreply@{domain}")
         });
 
-        let use_plain = port == 25;
-        let mut builder = if use_plain {
-            // Plain SMTP on port 25: used with a local Postfix relay (loopback),
-            // which handles MX lookups + delivery itself.
-            AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&host)
-        } else {
-            match AsyncSmtpTransport::<Tokio1Executor>::relay(&host) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!("SMTP relay setup failed ({e}); using dangerous builder");
-                    AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&host)
-                }
+        let mut builder = match AsyncSmtpTransport::<Tokio1Executor>::relay(&host) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("SMTP relay setup failed ({e}); using plain builder");
+                AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&host)
             }
         };
         builder = builder.port(port);

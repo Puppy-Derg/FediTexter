@@ -69,46 +69,27 @@ ask() { # var_name prompt
     eval "$var=\$val"
 }
 
-# Install and configure Postfix as a loopback-only outbound mail relay so the
-# server can send verification emails without an external SMTP provider.
-# "loopback-only" means it never accepts mail from the internet (ignore inbound).
-setup_postfix() {
-    log "installing Postfix (loopback-only, outbound)"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y postfix >/dev/null 2>&1 || \
-        DEBIAN_FRONTEND=noninteractive apt-get install -y postfix
-    postconf -e "inet_interfaces = loopback-only"
-    postconf -e "myhostname = $DOMAIN"
-    postconf -e "mydomain = $DOMAIN"
-    postconf -e "myorigin = \$mydomain"
-    postconf -e "mydestination = \$myhostname, localhost"
-    postconf -e "mynetworks = 127.0.0.0/8"
-    postconf -e "inet_protocols = ipv4"
-    systemctl enable --now postfix >/dev/null 2>&1 || true
-    systemctl restart postfix
-    log "Postfix ready on 127.0.0.1:25 (external mail is ignored)"
-}
-
 # Configure email verification + SMTP in .env (prompts when not provided).
 setup_email() {
     if [[ -z "$SMTP_HOST" ]]; then
-        if [[ "${FEDITEXTER_SMTP:-postfix}" == "none" ]]; then
-            log "email verification ON but SMTP skipped; codes will be logged to journalctl -u $SERVICE_NAME"
-            set_env REQUIRE_EMAIL_VERIFICATION 1
-            return
+        if [[ -t 0 ]]; then
+            echo ""
+            echo "Email verification is enabled and needs an email provider (SMTP relay)."
+            echo "Examples: Brevo (smtp-relay.brevo.com), Resend (smtp.resend.com), Mailjet."
+            echo "Leave SMTP host blank to skip (verification codes will be logged to journalctl)."
+            ask SMTP_HOST "SMTP host [e.g. smtp-relay.brevo.com]: "
+            if [[ -n "$SMTP_HOST" ]]; then
+                ask SMTP_PORT "SMTP port [587]: "
+                ask SMTP_USER "SMTP username: "
+                ask SMTP_PASS "SMTP password: "
+                ask SMTP_FROM "From email (no-reply preferred) [noreply@$DOMAIN]: "
+                [[ -n "$SMTP_FROM" ]] || SMTP_FROM="noreply@$DOMAIN"
+            fi
+        else
+            log "no SMTP provided (non-interactive install); codes will be logged to journalctl -u $SERVICE_NAME"
         fi
-        setup_postfix
-        SMTP_HOST="127.0.0.1"
-        SMTP_PORT="25"
-        SMTP_USER=""
-        SMTP_PASS=""
-        SMTP_FROM="noreply@$DOMAIN"
-    elif [[ -t 0 ]]; then
-        echo ""
-        echo "Configuring external SMTP for email verification."
-        ask SMTP_PORT "SMTP port [$SMTP_PORT]: "
-        ask SMTP_USER "SMTP username: "
-        ask SMTP_PASS "SMTP password: "
-        ask SMTP_FROM "From email (no-reply preferred) [noreply@$DOMAIN]: "
+    else
+        [[ -n "$SMTP_PORT" ]] || SMTP_PORT=587
         [[ -n "$SMTP_FROM" ]] || SMTP_FROM="noreply@$DOMAIN"
     fi
     set_env REQUIRE_EMAIL_VERIFICATION 1
@@ -122,7 +103,7 @@ setup_email() {
         set_env SMTP_REPLY_TO "$SMTP_REPLY_TO"
         log "email verification enabled (SMTP $SMTP_HOST:$SMTP_PORT)"
     else
-        log "WARNING: email verification is ON but SMTP is not configured; codes will be logged to journalctl -u $SERVICE_NAME"
+        log "WARNING: email verification is ON but no SMTP provider configured; codes will be logged to journalctl -u $SERVICE_NAME"
     fi
 }
 
