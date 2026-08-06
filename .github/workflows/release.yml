@@ -113,25 +113,17 @@ jobs:
             "dist/arm64/feditexter-client-macos-arm64" \
             "dist/x64/feditexter-client-macos-x64" \
             -output "FediTexter.app/Contents/MacOS/FediTexter"
-          cat > "FediTexter.app/Contents/Info.plist" <<'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleName</key><string>FediTexter</string>
-    <key>CFBundleDisplayName</key><string>FediTexter</string>
-    <key>CFBundleIdentifier</key><string>com.feditexter.client</string>
-    <key>CFBundleExecutable</key><string>FediTexter</string>
-    <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-    <key>CFBundleShortVersionString</key><string>1.0</string>
-    <key>CFBundleVersion</key><string>1</string>
-    <key>LSMinimumSystemVersion</key><string>12.0</string>
-    <key>NSHighResolutionCapable</key><true/>
-    <key>NSPrincipalClass</key><string>NSApplication</string>
-</dict>
-</plist>
-EOF
+          plutil -create xml1 "FediTexter.app/Contents/Info.plist"
+          plutil -insert CFBundleName -string "FediTexter" "FediTexter.app/Contents/Info.plist"
+          plutil -insert CFBundleDisplayName -string "FediTexter" "FediTexter.app/Contents/Info.plist"
+          plutil -insert CFBundleIdentifier -string "com.feditexter.client" "FediTexter.app/Contents/Info.plist"
+          plutil -insert CFBundleExecutable -string "FediTexter" "FediTexter.app/Contents/Info.plist"
+          plutil -insert CFBundlePackageType -string "APPL" "FediTexter.app/Contents/Info.plist"
+          plutil -insert CFBundleShortVersionString -string "1.0" "FediTexter.app/Contents/Info.plist"
+          plutil -insert CFBundleVersion -string "1" "FediTexter.app/Contents/Info.plist"
+          plutil -insert LSMinimumSystemVersion -string "12.0" "FediTexter.app/Contents/Info.plist"
+          plutil -insert NSHighResolutionCapable -bool YES "FediTexter.app/Contents/Info.plist"
+          plutil -insert NSPrincipalClass -string "NSApplication" "FediTexter.app/Contents/Info.plist"
           chmod +x "FediTexter.app/Contents/MacOS/FediTexter"
           codesign --force --deep -s - "FediTexter.app"
 
