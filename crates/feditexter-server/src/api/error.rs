@@ -10,6 +10,8 @@ pub enum ApiError {
     NotFound(&'static str),
     BadGateway(&'static str),
     Internal(&'static str),
+    /// The account has no TOTP secret enabled, which is now mandatory.
+    TwoFaSetupRequired,
 }
 
 impl IntoResponse for ApiError {
@@ -21,6 +23,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::BadGateway(m) => (StatusCode::BAD_GATEWAY, m),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+            ApiError::TwoFaSetupRequired => (StatusCode::FORBIDDEN, "2fa setup required"),
         };
         (status, Json(json!({ "error": message }))).into_response()
     }

@@ -978,7 +978,7 @@ fn spawn_ws(
             let mut request = match url.clone().into_client_request() {
                 Ok(r) => r,
                 Err(_) => {
-                    let _ = tx.send(Event::Error("invalid websocket url".into()));
+                    let _ = tx.send(Event::WsStatus(false));
                     tokio::time::sleep(Duration::from_secs(3)).await;
                     continue;
                 }
@@ -1024,7 +1024,7 @@ fn spawn_ws(
                 }
                 Err(e) => {
                     eprintln!("[ws] connect error to {url}: {e}");
-                    let _ = tx.send(Event::Error(format!("websocket error: {e}")));
+                    let _ = tx.send(Event::WsStatus(false));
                 }
             }
 
@@ -1553,6 +1553,7 @@ fn handle_event(sh: &Shared, ev: Event) {
             ui.set_display_name_input(user.display_name.clone().into());
             ui.set_needs_verify(!user.email_verified);
             ui.set_needs_2fa(false);
+            ui.set_needs_2fa_setup(user.email_verified && !user.totp_enabled);
             ui.set_totp_enabled(user.totp_enabled);
             ui.set_error_message(SharedString::default());
             ui.set_selected_conversation(-1);
@@ -1571,7 +1572,9 @@ fn handle_event(sh: &Shared, ev: Event) {
             sh.selected.replace(-1);
             refresh_conversations_ui(sh);
             refresh_messages_ui(sh);
-            sh.backend.refresh_conversations(&sh.server(), &token);
+            if user.email_verified && user.totp_enabled {
+                sh.backend.refresh_conversations(&sh.server(), &token);
+            }
         }
         Event::AuthFailed(m) => set_error(sh, &m),
         Event::Verified(u) => {
@@ -1580,6 +1583,10 @@ fn handle_event(sh: &Shared, ev: Event) {
                 ui.set_needs_verify(false);
                 ui.set_error_message(SharedString::default());
                 ui.set_user_name(u.username.clone().into());
+                ui.set_needs_2fa_setup(!u.totp_enabled);
+                if u.totp_enabled {
+                    sh.backend.refresh_conversations(&sh.server(), &sh.token.borrow().clone().unwrap_or_default());
+                }
             }
         }
         Event::UserUpdated(u) => {
@@ -1590,6 +1597,7 @@ fn handle_event(sh: &Shared, ev: Event) {
             if u.totp_enabled {
                 ui.set_twofa_setup_open(false);
                 ui.set_twofa_disable_open(false);
+                ui.set_needs_2fa_setup(false);
             }
             if let Some(url) = &u.avatar_url {
                 if let Some(img) = load_avatar_image(url) {
@@ -1740,6 +1748,7 @@ fn logout(sh: &Shared) {
     ui.set_logged_in(false);
     ui.set_needs_verify(false);
     ui.set_needs_2fa(false);
+    ui.set_needs_2fa_setup(false);
     ui.set_pending_token(SharedString::default());
     ui.set_user_name(SharedString::default());
     ui.set_selected_conversation(-1);

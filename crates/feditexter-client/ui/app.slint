@@ -1,4 +1,4 @@
-import { LineEdit, ListView, Palette } from "std-widgets.slint";
+import { LineEdit, ListView, Palette, ScrollView } from "std-widgets.slint";
 
 export struct UiConversation {
     id: int,
@@ -344,8 +344,10 @@ component DarkInput inherits Rectangle {
 
 export component MainWindow inherits Window {
     title: "FediTexter";
-    width: 1000px;
-    height: 700px;
+    preferred-width: 1000px;
+    preferred-height: 700px;
+    min-width: 760px;
+    min-height: 560px;
 
     // Adaptive Material 3 palette: accent color is user-selectable; the
     // on-colors adapt to the light/dark scheme so text stays readable.
@@ -380,6 +382,7 @@ export component MainWindow inherits Window {
     in-out property<bool> settings-open: false;
     in-out property<bool> needs-verify: false;
     in-out property<bool> needs-2fa: false;
+    in-out property<bool> needs-2fa-setup: false;
     in-out property<string> pending-token: "";
     in-out property<bool> totp-enabled: false;
     in-out property<image> twofa-qr;
@@ -447,6 +450,14 @@ export component MainWindow inherits Window {
     in-out property<string> new-conversation-input: "";
     property<string> verify-code: "";
     in-out property<string> display-name-input: "";
+
+    // When the mandatory-2FA gate opens, ask the server for a fresh TOTP
+    // secret + QR code so the setup overlay has something to show.
+    changed needs-2fa-setup => {
+        if self.needs-2fa-setup {
+            self.twofa-setup();
+        }
+    }
 
     // ------------------------------------------------------------------
     // Scaleable content: the whole UI is scaled by root.ui-scale so the
@@ -1094,9 +1105,10 @@ export component MainWindow inherits Window {
             height: 100%;
         }
         Rectangle {
-            x: (parent.width - 420px) / 2;
-            y: (parent.height - 640px) / 2;
-            width: 420px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(460px, parent.width - 48px);
+            height: min(580px, parent.height - 96px);
             border-radius: 28px;
             background: root.md3-surface-container-high;
             CloseButton {
@@ -1106,178 +1118,150 @@ export component MainWindow inherits Window {
                 clicked => { root.settings-open = false; }
             }
             VerticalLayout {
-                spacing: 12px;
+                spacing: 0px;
                 padding: 24px;
+                padding-bottom: 16px;
                 Text {
                     text: "Settings";
                     font-size: 22px;
                     font-weight: 600;
                     color: root.md3-on-surface;
                 }
-
-                // Profile picture
-                HorizontalLayout {
-                    spacing: 14px;
-                    Rectangle {
-                        width: 72px;
-                        height: 72px;
-                        Avatar { avatar-image: root.my-avatar; avatar-text: "?"; avatar-color: root.md3-primary; size: 72px; }
-                    }
+                Rectangle { height: 8px; }
+                ScrollView {
+                    vertical-stretch: 1;
                     VerticalLayout {
-                        vertical-stretch: 1;
-                        alignment: center;
-                        spacing: 8px;
-                        Text { text: "Profile picture"; font-weight: 600; color: root.md3-on-surface; }
+                        spacing: 14px;
+
+                        // Profile picture
                         HorizontalLayout {
+                            spacing: 14px;
+                            Rectangle {
+                                width: 72px;
+                                height: 72px;
+                                Avatar { avatar-image: root.my-avatar; avatar-text: "?"; avatar-color: root.md3-primary; size: 72px; }
+                            }
+                            VerticalLayout {
+                                vertical-stretch: 1;
+                                alignment: center;
+                                spacing: 8px;
+                                Text { text: "Profile picture"; font-weight: 600; color: root.md3-on-surface; }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Button {
+                                        text: "Choose image…";
+                                        clicked => { root.settings-choose-avatar(); }
+                                    }
+                                    Button {
+                                        text: "Remove";
+                                        clicked => { root.settings-remove-avatar(); }
+                                    }
+                                }
+                            }
+                        }
+
+                        Text { text: "Display name (shown to others)"; color: root.md3-on-surface-variant; }
+                        LineEdit { text <=> root.display-name-input; placeholder-text: "Your name"; }
+
+                        Text { text: "Two-factor authentication"; color: root.md3-on-surface-variant; }
+                        if root.twofa-setup-open: VerticalLayout {
                             spacing: 8px;
-                            Button {
-                                text: "Choose image…";
-                                clicked => { root.settings-choose-avatar(); }
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Rectangle {
+                                    width: 120px;
+                                    height: 120px;
+                                    border-radius: 8px;
+                                    clip: true;
+                                    background: #FFFFFF;
+                                    Image {
+                                        source: root.twofa-qr;
+                                        width: 100%;
+                                        height: 100%;
+                                        image-fit: contain;
+                                    }
+                                }
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    Text {
+                                        text: "Scan with your authenticator app, or enter the secret:";
+                                        font-size: 12px;
+                                        color: root.md3-on-surface-variant;
+                                        wrap: word-wrap;
+                                    }
+                                    Text {
+                                        text: root.twofa-secret;
+                                        font-size: 12px;
+                                        color: root.md3-on-surface;
+                                        wrap: word-wrap;
+                                    }
+                                }
                             }
-                            Button {
-                                text: "Remove";
-                                clicked => { root.settings-remove-avatar(); }
+                            LineEdit {
+                                text <=> root.twofa-code;
+                                placeholder-text: "Enter 6-digit code";
                             }
-                        }
-                    }
-                }
-
-                Text { text: "Display name (shown to others)"; color: root.md3-on-surface-variant; }
-                LineEdit { text <=> root.display-name-input; placeholder-text: "Your name"; }
-
-                Text { text: "Two-factor authentication"; color: root.md3-on-surface-variant; }
-                if !root.totp-enabled && !root.twofa-setup-open: HorizontalLayout {
-                    spacing: 8px;
-                    Button {
-                        text: "Enable 2FA";
-                        clicked => { root.twofa-setup(); }
-                    }
-                }
-                if root.twofa-setup-open: VerticalLayout {
-                    spacing: 8px;
-                    HorizontalLayout {
-                        spacing: 10px;
-                        Rectangle {
-                            width: 120px;
-                            height: 120px;
-                            border-radius: 8px;
-                            clip: true;
-                            background: #FFFFFF;
-                            Image {
-                                source: root.twofa-qr;
-                                width: 100%;
-                                height: 100%;
-                                image-fit: contain;
-                            }
-                        }
-                        VerticalLayout {
-                            spacing: 4px;
-                            Text {
-                                text: "Scan with your authenticator app, or enter the secret:";
-                                font-size: 12px;
-                                color: root.md3-on-surface-variant;
-                                wrap: word-wrap;
-                            }
-                            Text {
-                                text: root.twofa-secret;
-                                font-size: 12px;
-                                color: root.md3-on-surface;
-                                wrap: word-wrap;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: end;
+                                Button {
+                                    text: "Cancel";
+                                    clicked => { root.twofa-setup-open = false; root.twofa-code = ""; }
+                                }
+                                Button {
+                                    text: "Confirm";
+                                    primary: true;
+                                    accent: root.accent-color;
+                                    on-accent: root.md3-on-primary;
+                                    enabled: root.twofa-code != "";
+                                    clicked => { root.twofa-enable(root.twofa-code); root.twofa-code = ""; }
+                                }
                             }
                         }
-                    }
-                    LineEdit {
-                        text <=> root.twofa-code;
-                        placeholder-text: "Enter 6-digit code";
-                    }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        alignment: end;
-                        Button {
-                            text: "Cancel";
-                            clicked => { root.twofa-setup-open = false; root.twofa-code = ""; }
+                        if !root.twofa-setup-open: HorizontalLayout {
+                            spacing: 8px;
+                            VerticalLayout { vertical-stretch: 1; alignment: center;
+                                Text {
+                                    text: root.totp-enabled ? "2FA is on · required for this account" : "2FA is required to use FediTexter";
+                                    color: root.totp-enabled ? #66BB6A : root.md3-on-surface-variant;
+                                }
+                            }
                         }
-                        Button {
-                            text: "Confirm";
-                            primary: true;
-                            accent: root.accent-color;
-                            on-accent: root.md3-on-primary;
-                            enabled: root.twofa-code != "";
-                            clicked => { root.twofa-enable(root.twofa-code); root.twofa-code = ""; }
-                        }
-                    }
-                }
-                if root.totp-enabled && !root.twofa-disable-open: HorizontalLayout {
-                    spacing: 8px;
-                    VerticalLayout { vertical-stretch: 1; alignment: center;
-                        Text { text: "2FA is on"; color: root.md3-on-surface-variant; }
-                    }
-                    Button {
-                        text: "Disable";
-                        clicked => { root.twofa-disable-open = true; }
-                    }
-                }
-                if root.twofa-disable-open: VerticalLayout {
-                    spacing: 8px;
-                    LineEdit {
-                        text <=> root.twofa-code;
-                        placeholder-text: "Enter 6-digit code";
-                    }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        alignment: end;
-                        Button {
-                            text: "Cancel";
-                            clicked => { root.twofa-disable-open = false; root.twofa-code = ""; }
-                        }
-                        Button {
-                            text: "Disable";
-                            primary: true;
-                            accent: root.accent-color;
-                            on-accent: root.md3-on-primary;
-                            enabled: root.twofa-code != "";
-                            clicked => { root.twofa-disable(root.twofa-code); root.twofa-code = ""; }
-                        }
-                    }
-                }
 
-                Text { text: "Accent color"; color: root.md3-on-surface-variant; }
-                HorizontalLayout {
-                    spacing: 10px;
-                    for swatch in [ #7C5CE0, #1E88E5, #43A047, #E53935, #FB8C00, #8E24AA, #00ACC1, #D81B60 ]: Rectangle {
-                        width: 28px;
-                        height: 28px;
-                        border-radius: 14px;
-                        background: swatch;
-                        border-width: root.accent-color == swatch ? 3px : 1px;
-                        border-color: root.accent-color == swatch ? root.md3-on-surface : root.md3-outline;
-                        TouchArea {
-                            width: 100%;
-                            height: 100%;
-                            mouse-cursor: pointer;
-                            clicked => { root.accent-color = swatch; }
+                        Text { text: "Accent color"; color: root.md3-on-surface-variant; }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            for swatch in [ #7C5CE0, #1E88E5, #43A047, #E53935, #FB8C00, #8E24AA, #00ACC1, #D81B60 ]: Rectangle {
+                                width: 28px;
+                                height: 28px;
+                                border-radius: 14px;
+                                background: swatch;
+                                border-width: root.accent-color == swatch ? 3px : 1px;
+                                border-color: root.accent-color == swatch ? root.md3-on-surface : root.md3-outline;
+                                TouchArea {
+                                    width: 100%;
+                                    height: 100%;
+                                    mouse-cursor: pointer;
+                                    clicked => { root.accent-color = swatch; }
+                                }
+                            }
+                        }
+
+                        Text { text: "Server"; color: root.md3-on-surface-variant; }
+                        LineEdit { text <=> root.server-input; placeholder-text: "your-server.example"; }
+
+                        Text {
+                            text: "Connection: " + (root.ws-connected ? "live" : "reconnecting…");
+                            color: root.ws-connected ? #66BB6A : root.md3-on-surface-variant;
                         }
                     }
                 }
-
-                Text { text: "Server"; color: root.md3-on-surface-variant; }
-                LineEdit { text <=> root.server-input; placeholder-text: "your-server.example"; }
-
-                HorizontalLayout {
-                    spacing: 8px;
-                    Text {
-                        text: "Connection: " + (root.ws-connected ? "live" : "reconnecting…");
-                        color: root.ws-connected ? #66BB6A : root.md3-on-surface-variant;
-                        horizontal-alignment: center;
-                    }
-                }
-
-                Rectangle { height: 0px; horizontal-stretch: 1; }
                 if root.error-message != "": Text {
                     text: root.error-message;
                     wrap: word-wrap;
                     color: root.md3-error;
                 }
+                Rectangle { height: 8px; }
                 HorizontalLayout {
                     spacing: 8px;
                     alignment: end;
@@ -1368,6 +1352,101 @@ export component MainWindow inherits Window {
                 }
             }
             Rectangle { height: 25%; }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Mandatory 2FA setup (shown after login/verify until enabled)
+    // ------------------------------------------------------------------
+    if root.logged-in && !root.needs-verify && root.needs-2fa-setup: Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        background: root.md3-surface;
+        TouchArea {
+            width: 100%;
+            height: 100%;
+        }
+        VerticalLayout {
+            spacing: 10px;
+            Rectangle { height: 12%; }
+            HorizontalLayout {
+                alignment: center;
+                VerticalLayout {
+                    spacing: 14px;
+                    width: 400px;
+                    Text {
+                        text: "Enable two-factor authentication";
+                        font-size: 24px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        color: root.md3-on-surface;
+                    }
+                    Text {
+                        text: "FediTexter requires 2FA for all accounts. Scan the QR code with your authenticator app (e.g. Google Authenticator), or enter the secret manually.";
+                        wrap: word-wrap;
+                        horizontal-alignment: center;
+                        color: root.md3-on-surface-variant;
+                    }
+                    if root.twofa-qr.width > 0: HorizontalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 180px;
+                            height: 180px;
+                            border-radius: 12px;
+                            clip: true;
+                            background: #FFFFFF;
+                            Image {
+                                source: root.twofa-qr;
+                                width: 100%;
+                                height: 100%;
+                                image-fit: contain;
+                            }
+                        }
+                    }
+                    if root.twofa-qr.width <= 0: Text {
+                        text: "Generating QR code…";
+                        horizontal-alignment: center;
+                        color: root.md3-on-surface-variant;
+                    }
+                    if root.twofa-secret != "": Text {
+                        text: root.twofa-secret;
+                        horizontal-alignment: center;
+                        color: root.md3-on-surface;
+                        wrap: word-wrap;
+                    }
+                    LineEdit {
+                        text <=> root.twofa-code;
+                        placeholder-text: "000000";
+                        accepted(text) => {
+                            root.twofa-enable(root.twofa-code);
+                        }
+                    }
+                    if root.error-message != "": Text {
+                        text: root.error-message;
+                        wrap: word-wrap;
+                        color: root.md3-error;
+                        horizontal-alignment: center;
+                    }
+                    Button {
+                        text: "Confirm";
+                        primary: true;
+                        accent: root.accent-color;
+                        on-accent: root.md3-on-primary;
+                        enabled: root.twofa-code != "";
+                        clicked => {
+                            root.twofa-enable(root.twofa-code);
+                            root.twofa-code = "";
+                        }
+                    }
+                    Button {
+                        text: "Log out";
+                        clicked => { root.logout(); }
+                    }
+                }
+            }
+            Rectangle { height: 12%; }
         }
     }
 

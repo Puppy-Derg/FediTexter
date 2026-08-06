@@ -36,6 +36,17 @@ pub struct AuthUser {
     pub(crate) session_id: u64,
 }
 
+/// Same as `AuthUser`, but skips the "2FA enabled" check so users who have
+/// not configured 2FA yet can still reach the setup/verify/logout endpoints.
+pub struct AuthUserLax(pub AuthUser);
+
+impl std::ops::Deref for AuthUserLax {
+    type Target = AuthUser;
+    fn deref(&self) -> &AuthUser {
+        &self.0
+    }
+}
+
 pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
@@ -77,39 +88,59 @@ impl FromRequestParts<AppState> for AuthUser {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
-        let header = parts
-            .headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .ok_or(ApiError::Unauthorized("missing bearer token"))?;
-
-        let token_hash = sha256(header);
-
-        let session: Session = sqlx::query_as(
-            "SELECT id, user_id, expires_at, is_2fa_pending FROM sessions WHERE token_hash = ?",
-        )
-        .bind(&token_hash)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|_| ApiError::Internal("db error"))?
-        .ok_or(ApiError::Unauthorized("invalid token"))?;
-
-        if session.expires_at < chrono::Utc::now().naive_utc() {
-            return Err(ApiError::Unauthorized("token expired"));
+        let (session_id, user) = load_auth_user(state, parts).await?;
+        if !user.totp_enabled {
+            return Err(ApiError::TwoFaSetupRequired);
         }
-        if session.is_2fa_pending {
-            return Err(ApiError::Unauthorized("2fa required"));
-        }
-
-        let user: User = sqlx::query_as(
-            "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled FROM users WHERE id = ?",
-        )
-        .bind(session.user_id)
-        .fetch_one(&state.pool)
-        .await
-        .map_err(|_| ApiError::Internal("db error"))?;
-
-        Ok(AuthUser { user, session_id: session.id })
+        Ok(AuthUser { user, session_id })
     }
+}
+
+impl FromRequestParts<AppState> for AuthUserLax {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        let (session_id, user) = load_auth_user(state, parts).await?;
+        Ok(AuthUserLax(AuthUser { user, session_id }))
+    }
+}
+
+async fn load_auth_user(
+    state: &AppState,
+    parts: &Parts,
+) -> Result<(u64, User), ApiError> {
+    let header = parts
+        .headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(ApiError::Unauthorized("missing bearer token"))?;
+
+    let token_hash = sha256(header);
+
+    let session: Session = sqlx::query_as(
+        "SELECT id, user_id, expires_at, is_2fa_pending FROM sessions WHERE token_hash = ?",
+    )
+    .bind(&token_hash)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?
+    .ok_or(ApiError::Unauthorized("invalid token"))?;
+
+    if session.expires_at < chrono::Utc::now().naive_utc() {
+        return Err(ApiError::Unauthorized("token expired"));
+    }
+    if session.is_2fa_pending {
+        return Err(ApiError::Unauthorized("2fa required"));
+    }
+
+    let user: User = sqlx::query_as(
+        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled FROM users WHERE id = ?",
+    )
+    .bind(session.user_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
+
+    Ok((session.id, user))
 }

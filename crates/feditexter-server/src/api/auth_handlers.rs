@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::api::error::ApiError;
-use crate::auth::{hash_password, verify_password, AuthUser, User};
+use crate::auth::{hash_password, verify_password, AuthUser, AuthUserLax, User};
 use crate::db::AppState;
 
 #[derive(Deserialize)]
@@ -196,9 +196,10 @@ pub async fn login_2fa(
 }
 
 /// Generate a TOTP secret for the user and return the otpauth URI + QR PNG.
+/// Uses the lax extractor so accounts without 2FA can still set it up.
 pub async fn two_fa_setup(
     State(state): State<AppState>,
-    auth: AuthUser,
+    auth: AuthUserLax,
 ) -> Result<Json<Value>, ApiError> {
     let base32 = totp_generate_base32();
     sqlx::query("UPDATE users SET totp_secret = ?, totp_enabled = 0 WHERE id = ?")
@@ -227,9 +228,10 @@ pub struct TwoFaCodeRequest {
 }
 
 /// Enable 2FA after verifying the current code against the stored secret.
+/// Uses the lax extractor so accounts without 2FA can still enable it.
 pub async fn two_fa_enable(
     State(state): State<AppState>,
-    auth: AuthUser,
+    auth: AuthUserLax,
     Json(body): Json<TwoFaCodeRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let secret: Option<String> = sqlx::query_scalar("SELECT totp_secret FROM users WHERE id = ?")
@@ -312,7 +314,7 @@ async fn create_pending_session(state: &AppState, user_id: u64) -> Result<String
 
 pub async fn logout(
     State(state): State<AppState>,
-    auth: AuthUser,
+    auth: AuthUserLax,
 ) -> Result<StatusCode, ApiError> {
     sqlx::query("DELETE FROM sessions WHERE id = ?")
         .bind(auth.session_id)
@@ -366,7 +368,7 @@ pub struct VerifyRequest {
 
 pub async fn verify(
     State(state): State<AppState>,
-    auth: AuthUser,
+    auth: AuthUserLax,
     Json(body): Json<VerifyRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let code = body.code.trim().to_string();
@@ -401,7 +403,7 @@ pub async fn verify(
 /// Generate a fresh verification code and (re)send it to the user's email.
 pub async fn resend_verification(
     State(state): State<AppState>,
-    auth: AuthUser,
+    auth: AuthUserLax,
 ) -> Result<Json<Value>, ApiError> {
     let email: String = sqlx::query_scalar("SELECT email FROM users WHERE id = ?")
         .bind(auth.user.id)
