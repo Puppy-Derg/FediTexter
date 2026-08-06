@@ -219,6 +219,48 @@ pub async fn verify(
     Ok(Json(json!({ "user": user })))
 }
 
+/// Generate a fresh verification code and (re)send it to the user's email.
+pub async fn resend_verification(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> Result<Json<Value>, ApiError> {
+    let email: String = sqlx::query_scalar("SELECT email FROM users WHERE id = ?")
+        .bind(auth.user.id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?;
+
+    let code = crate::auth::generate_verification_code();
+    sqlx::query("UPDATE users SET verification_code = ? WHERE id = ?")
+        .bind(&code)
+        .bind(auth.user.id)
+        .execute(&state.pool)
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?;
+
+    match &state.mailer {
+        Some(mailer) => {
+            if let Err(e) = mailer.send_verification_code(&email, &code).await {
+                tracing::warn!("failed to send verification email to {email}: {e}");
+                tracing::warn!("verification code for {email} is {code}");
+            }
+        }
+        None => {
+            tracing::warn!("no SMTP configured; verification code for {email} is {code}");
+        }
+    }
+
+    let user: User = sqlx::query_as(
+        "SELECT id, email, username, display_name, email_verified, avatar_url FROM users WHERE id = ?",
+    )
+    .bind(auth.user.id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
+
+    Ok(Json(json!({ "user": user })))
+}
+
 #[derive(Deserialize)]
 pub struct SetAvatarRequest {
     pub avatar: String,

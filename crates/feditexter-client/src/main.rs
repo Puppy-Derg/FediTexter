@@ -264,6 +264,37 @@ impl Backend {
         });
     }
 
+    fn resend_verification(&self, server: &str, token: &str) {
+        let tx = self.tx.clone();
+        let http = self.http.clone();
+        let server = server.to_string();
+        let token = token.to_string();
+        self.runtime.spawn(async move {
+            let url = api_url(&server, "/api/verify/resend");
+            let resp = match http.post(&url).bearer_auth(&token).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Event::Error(format!("{e}")));
+                    return;
+                }
+            };
+            if !resp.status().is_success() {
+                let _ = tx.send(Event::Error(error_message(resp).await));
+                return;
+            }
+            let v: Value = match resp.json().await {
+                Ok(v) => v,
+                Err(_) => {
+                    let _ = tx.send(Event::Error("malformed server response".into()));
+                    return;
+                }
+            };
+            if let Ok(u) = serde_json::from_value::<User>(v.get("user").cloned().unwrap_or(Value::Null)) {
+                let _ = tx.send(Event::Verified(u));
+            }
+        });
+    }
+
     fn update_display_name(&self, server: &str, token: &str, display_name: &str) {
         let tx = self.tx.clone();
         let http = self.http.clone();
@@ -1639,6 +1670,14 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.on_verify(move |code| {
             if let Some(token) = sh.token.borrow().clone() {
                 sh.backend.verify(&sh.server(), &token, code.trim());
+            }
+        });
+    }
+    {
+        let sh = shared.clone();
+        ui.on_resend_code(move || {
+            if let Some(token) = sh.token.borrow().clone() {
+                sh.backend.resend_verification(&sh.server(), &token);
             }
         });
     }

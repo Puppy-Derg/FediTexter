@@ -1706,7 +1706,7 @@ dependencies = [
 
 [[package]]
 name = "feditexter-server"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "argon2",
  "axum",

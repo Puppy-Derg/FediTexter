@@ -266,6 +266,42 @@ systemctl restart "$SERVICE_NAME"
 systemctl is-active --quiet "$SERVICE_NAME" || die "service failed to start"
 
 # ---------------------------------------------------------------------------
+# 6b. auto-update timer (daily)
+# ---------------------------------------------------------------------------
+log "installing auto-update timer"
+UPDATER="$INSTALL_DIR/update.sh"
+curl -fsSL -o "$UPDATER" "https://raw.githubusercontent.com/$REPO/main/deploy/update.sh"
+chmod 700 "$UPDATER"
+chown root:root "$UPDATER"
+
+cat > "/etc/systemd/system/$SERVICE_NAME-update.service" <<EOF
+[Unit]
+Description=FediTexter auto-updater
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=$UPDATER
+EOF
+
+cat > "/etc/systemd/system/$SERVICE_NAME-update.timer" <<EOF
+[Unit]
+Description=Run FediTexter auto-updater daily
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable "$SERVICE_NAME-update.timer" >/dev/null 2>&1 || true
+systemctl start "$SERVICE_NAME-update.timer"
+log "auto-update timer enabled (daily 04:00)"
+
+# ---------------------------------------------------------------------------
 # 7. verify
 # ---------------------------------------------------------------------------
 sleep 1

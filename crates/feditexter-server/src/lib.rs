@@ -7,7 +7,7 @@ pub mod mail;
 
 use axum::routing::{delete, get, post};
 use axum::Router;
-use api::auth_handlers::{login, logout, me, register, set_avatar, update_me, verify};
+use api::auth_handlers::{login, logout, me, register, resend_verification, set_avatar, update_me, verify};
 use api::chat_handlers::{
     create_conversation, delete_conversation, list_conversations, list_messages, send_message,
 };
@@ -26,6 +26,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/me", get(me).patch(update_me))
         .route("/api/me/avatar", post(set_avatar))
         .route("/api/verify", post(verify))
+        .route("/api/verify/resend", post(resend_verification))
         .route("/api/users/{id}", get(user_profile))
         .route("/api/users/{id}/block", post(block_user))
         .route("/api/users/{id}/unblock", post(unblock_user))

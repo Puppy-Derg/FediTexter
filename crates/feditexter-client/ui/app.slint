@@ -404,6 +404,7 @@ export component MainWindow inherits Window {
     callback send-message(body: string);
     callback new-conversation(input: string);
     callback verify(code: string);
+    callback resend-code();
     callback settings-saved();
     callback settings-choose-avatar();
     callback settings-remove-avatar();
@@ -1149,6 +1150,10 @@ export component MainWindow inherits Window {
         width: 100%;
         height: 100%;
         background: root.md3-surface;
+        TouchArea {
+            width: 100%;
+            height: 100%;
+        }
         VerticalLayout {
             spacing: 10px;
             Rectangle { height: 25%; }
@@ -1192,6 +1197,10 @@ export component MainWindow inherits Window {
                         clicked => {
                             root.verify(root.verify-code);
                         }
+                    }
+                    Button {
+                        text: "Resend code";
+                        clicked => { root.resend-code(); }
                     }
                     Button {
                         text: "Log out";
