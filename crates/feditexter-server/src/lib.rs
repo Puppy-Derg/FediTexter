@@ -12,8 +12,8 @@ use api::auth_handlers::{
     two_fa_enable, two_fa_setup, update_me, verify,
 };
 use api::chat_handlers::{
-    create_conversation, delete_conversation, list_conversations, list_messages, presence,
-    send_message,
+    create_conversation, delete_conversation, delete_message, edit_message, list_conversations,
+    list_messages, presence, send_message,
 };
 use api::federation_handlers::{inbox, user_lookup, well_known};
 use api::moderation::{block_user, mute_user, unblock_user, unmute_user, user_profile};
@@ -47,6 +47,8 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/conversations/{id}", delete(delete_conversation))
         .route("/api/conversations/{id}/messages", get(list_messages))
         .route("/api/conversations/{id}/messages", post(send_message))
+        .route("/api/conversations/{id}/messages/{msg_id}", axum::routing::patch(edit_message))
+        .route("/api/conversations/{id}/messages/{msg_id}", delete(delete_message))
         .route("/api/presence", get(presence))
         .route("/api/federation/users/lookup", get(user_lookup))
         .route("/api/federation/inbox", post(inbox))

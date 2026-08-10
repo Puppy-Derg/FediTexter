@@ -302,6 +302,12 @@ systemctl start "$SERVICE_NAME-update.timer"
 log "auto-update timer enabled (daily 04:00)"
 
 # ---------------------------------------------------------------------------
+# 6c. convenience symlink
+# ---------------------------------------------------------------------------
+ln -sf "$UPDATER" /usr/local/bin/feditexter-update
+log "symlinked /usr/local/bin/feditexter-update -> $UPDATER"
+
+# ---------------------------------------------------------------------------
 # 7. verify
 # ---------------------------------------------------------------------------
 sleep 1

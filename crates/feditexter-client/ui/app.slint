@@ -32,6 +32,8 @@ export struct UiMessage {
     preview-image: image,
     preview-image-ratio: float,
     preview-url: string,
+    is-edited: bool,
+    original-body: string,
 }
 
 export struct UiContact {
@@ -450,6 +452,16 @@ export component MainWindow inherits Window {
     in-out property<bool> confirm-delete-open: false;
     in-out property<int> confirm-delete-conversation-id: -1;
     in-out property<string> confirm-delete-title: "";
+    in-out property<bool> msg-context-open: false;
+    in-out property<int> msg-context-id: -1;
+    in-out property<int> msg-context-sender-id: -1;
+    in-out property<length> msg-context-x: 0px;
+    in-out property<length> msg-context-y: 0px;
+    in-out property<bool> editing-message: false;
+    in-out property<int> editing-message-id: -1;
+    in-out property<string> editing-message-body: "";
+    in-out property<bool> original-open: false;
+    in-out property<string> original-body-text: "";
     in-out property<float> ui-scale: 1.0;
     property <float> ui-scale-base: 1.3;
     property <float> content-scale: root.ui-scale * root.ui-scale-base;
@@ -492,6 +504,11 @@ export component MainWindow inherits Window {
     callback context-delete();
     callback confirm-delete();
     callback open-chat(user-id: int);
+    callback msg-context-edit(id: int);
+    callback msg-context-delete(id: int);
+    callback cancel-edit();
+    callback confirm-edit(body: string);
+    callback show-original(body: string);
 
     property<string> login-email: "";
     property<string> login-password: "";
@@ -500,7 +517,7 @@ export component MainWindow inherits Window {
     property<string> reg-username: "";
     property<string> reg-password: "";
     property<bool> register-mode: false;
-    property<string> draft: "";
+    in-out property<string> draft: "";
     in-out property<string> new-conversation-input: "";
     property<string> verify-code: "";
     in-out property<string> display-name-input: "";
@@ -999,14 +1016,44 @@ export component MainWindow inherits Window {
                                             min-height: 40px;
                                             border-radius: 16px;
                                             background: m.is-self ? root.md3-primary-container : #333333;
+                                            TouchArea {
+                                                width: 100%;
+                                                height: 100%;
+                                                pointer-event(ev) => {
+                                                    if (ev.button == PointerEventButton.right && ev.kind == PointerEventKind.down && m.is-self) {
+                                                        root.msg-context-id = m.id;
+                                                        root.msg-context-sender-id = m.sender-id;
+                                                        root.msg-context-x = self.absolute-position.x / root.content-scale + self.mouse-x;
+                                                        root.msg-context-y = self.absolute-position.y / root.content-scale + self.mouse-y;
+                                                        root.msg-context-open = true;
+                                                    }
+                                                }
+                                            }
                                             VerticalLayout {
                                                 padding: 8px;
                                                 spacing: 2px;
-                                                if !m.is-self: Text {
-                                                    text: m.sender + "  ·  " + m.created-at;
-                                                    font-size: 11px;
-                                                    color: #AAAAAA;
-                                                    overflow: elide;
+                                                if !m.is-self: HorizontalLayout {
+                                                    spacing: 4px;
+                                                    Text {
+                                                        text: m.sender + "  ·  " + m.created-at;
+                                                        font-size: 11px;
+                                                        color: #AAAAAA;
+                                                        overflow: elide;
+                                                    }
+                                                    if m.is-edited: Text {
+                                                        text: "edited";
+                                                        font-size: 10px;
+                                                        color: #AAAAAA;
+                                                        opacity: 0.6;
+                                                    }
+                                                    if m.is-edited && m.original-body != "": TouchArea {
+                                                        clicked => { root.show-original(m.original-body); }
+                                                        Text {
+                                                            text: "original";
+                                                            font-size: 10px;
+                                                            color: root.md3-primary;
+                                                        }
+                                                    }
                                                 }
                                                 if m.attachment-image.width > 0: Rectangle {
                                                     width: 260px;
@@ -1111,11 +1158,28 @@ export component MainWindow inherits Window {
                                                         clicked => { root.open-link(m.preview-url); }
                                                     }
                                                 }
-                                                if m.is-self: Text {
-                                                    text: "You  ·  " + m.created-at;
-                                                    font-size: 11px;
-                                                    color: root.md3-on-primary-container;
-                                                    horizontal-alignment: right;
+                                                if m.is-self: HorizontalLayout {
+                                                    spacing: 4px;
+                                                    alignment: end;
+                                                    if m.is-edited: Text {
+                                                        text: "edited";
+                                                        font-size: 10px;
+                                                        color: root.md3-on-primary-container;
+                                                        opacity: 0.6;
+                                                    }
+                                                    if m.is-edited && m.original-body != "": TouchArea {
+                                                        clicked => { root.show-original(m.original-body); }
+                                                        Text {
+                                                            text: "original";
+                                                            font-size: 10px;
+                                                            color: root.md3-primary;
+                                                        }
+                                                    }
+                                                    Text {
+                                                        text: "You  ·  " + m.created-at;
+                                                        font-size: 11px;
+                                                        color: root.md3-on-primary-container;
+                                                    }
                                                 }
                                             }
                                         }
@@ -1127,6 +1191,31 @@ export component MainWindow inherits Window {
                                 }
                                 VerticalLayout {
                                     spacing: 6px;
+                                    if root.editing-message: Rectangle {
+                                        height: 40px;
+                                        border-radius: 8px;
+                                        background: root.md3-primary.with-alpha(0.16);
+                                        HorizontalLayout {
+                                            padding-left: 12px;
+                                            padding-right: 8px;
+                                            spacing: 8px;
+                                            VerticalLayout { vertical-stretch: 1; alignment: center;
+                                                Text {
+                                                    text: "Editing message";
+                                                    color: root.md3-primary;
+                                                    font-size: 13px;
+                                                    font-weight: 500;
+                                                }
+                                            }
+                                            Rectangle { height: 100%; }
+                                            VerticalLayout { vertical-stretch: 1; alignment: center;
+                                                CloseButton {
+                                                    text-color: root.md3-on-surface;
+                                                    clicked => { root.cancel-edit(); }
+                                                }
+                                            }
+                                        }
+                                    }
                                     if root.pending-attach-name != "": Rectangle {
                                         height: 56px;
                                         border-radius: 8px;
@@ -1191,7 +1280,16 @@ export component MainWindow inherits Window {
                                                 }
                                                 key-pressed(event) => {
                                                     if (event.text == Key.Return && !event.modifiers.shift) {
-                                                        root.send-message(root.draft);
+                                                        if (root.editing-message) {
+                                                            root.confirm-edit(root.draft);
+                                                        } else {
+                                                            root.send-message(root.draft);
+                                                        }
+                                                        root.draft = "";
+                                                        return accept;
+                                                    }
+                                                    if (event.text == Key.Escape && root.editing-message) {
+                                                        root.cancel-edit();
                                                         root.draft = "";
                                                         return accept;
                                                     }
@@ -1931,6 +2029,114 @@ export component MainWindow inherits Window {
                             root.confirm-delete();
                             root.confirm-delete-open = false;
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Message context menu (right-click on own message bubble)
+    // ------------------------------------------------------------------
+    if root.msg-context-open: Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        TouchArea {
+            width: 100%;
+            height: 100%;
+            clicked => { root.msg-context-open = false; }
+        }
+        Rectangle {
+            property <length> menu-height: 12px + 2 * 34px + 2px;
+            x: root.msg-context-x + self.width <= scaled.width ? root.msg-context-x : max(0px, root.msg-context-x - self.width);
+            y: root.msg-context-y + self.menu-height <= scaled.height ? root.msg-context-y : max(0px, root.msg-context-y - self.menu-height);
+            width: 190px;
+            height: self.menu-height;
+            border-radius: 8px;
+            background: root.md3-surface-container-high;
+            VerticalLayout {
+                padding: 6px;
+                spacing: 2px;
+                ContextMenuItem {
+                    text: "Edit message";
+                    text-color: root.md3-on-surface;
+                    item-background: transparent;
+                    item-hover-background: root.md3-primary.with-alpha(0.16);
+                    clicked => {
+                        root.msg-context-open = false;
+                        root.msg-context-edit(root.msg-context-id);
+                    }
+                }
+                ContextMenuItem {
+                    text: "Delete message";
+                    text-color: root.md3-error;
+                    item-background: transparent;
+                    item-hover-background: root.md3-primary.with-alpha(0.16);
+                    clicked => {
+                        root.msg-context-open = false;
+                        root.msg-context-delete(root.msg-context-id);
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // View original message (for edited messages)
+    // ------------------------------------------------------------------
+    if root.original-open: Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        background: #66000000;
+        TouchArea {
+            width: 100%;
+            height: 100%;
+            clicked => { root.original-open = false; }
+        }
+        Rectangle {
+            x: (parent.width - 400px) / 2;
+            y: (parent.height - 300px) / 2;
+            width: 400px;
+            height: 300px;
+            border-radius: 20px;
+            background: root.md3-surface-container-high;
+            VerticalLayout {
+                spacing: 12px;
+                padding: 20px;
+                Text {
+                    text: "Original message";
+                    font-size: 18px;
+                    font-weight: 600;
+                    color: root.md3-on-surface;
+                }
+                Rectangle {
+                    vertical-stretch: 1;
+                    border-radius: 8px;
+                    background: root.md3-surface-container-low;
+                    clip: true;
+                    VerticalLayout {
+                        padding: 12px;
+                        Flickable {
+                            vertical-stretch: 1;
+                            Text {
+                                text: root.original-body-text;
+                                wrap: word-wrap;
+                                color: root.md3-on-surface;
+                                font-size: 15px;
+                            }
+                        }
+                    }
+                }
+                Rectangle { height: 0px; horizontal-stretch: 1; }
+                HorizontalLayout {
+                    alignment: end;
+                    Button {
+                        text: "Close";
+                        clicked => { root.original-open = false; }
                     }
                 }
             }

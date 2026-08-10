@@ -89,6 +89,12 @@ struct Message {
     file_size: Option<i64>,
     #[serde(default)]
     thumbnail_data: Option<String>,
+    #[serde(default)]
+    edited_at: Option<String>,
+    #[serde(default)]
+    original_body: Option<String>,
+    #[serde(default)]
+    deleted_at: Option<String>,
 }
 
 /// A HubEvent as pushed over the WebSocket (tagged `kind`).
@@ -96,6 +102,10 @@ struct Message {
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum WsHubEvent {
     Message { message: Message },
+    #[serde(rename = "message_edited")]
+    MessageEdited { message: Message },
+    #[serde(rename = "message_deleted")]
+    MessageDeleted { conversation_id: u64, message_id: u64 },
     Signal { signal: SignalEvent },
     Typing {
         conversation_id: u64,
@@ -188,6 +198,8 @@ enum Event {
     Messages { conversation_id: u64, messages: Vec<Message> },
     MessageSent(Message),
     WsMessage(Message),
+    WsMessageEdited(Message),
+    WsMessageDeleted { conversation_id: u64, message_id: u64 },
     WsStatus(bool),
     P2pSignal(SignalEvent),
     P2pStatus { file_id: String, status: String },
@@ -836,6 +848,73 @@ impl Backend {
         });
     }
 
+    fn edit_message(
+        &self,
+        server: &str,
+        token: &str,
+        conversation_id: u64,
+        message_id: u64,
+        body: String,
+    ) {
+        let tx = self.tx.clone();
+        let http = self.http.clone();
+        let server = server.to_string();
+        let token = token.to_string();
+        self.runtime.spawn(async move {
+            let url = api_url(&server, &format!("/api/conversations/{conversation_id}/messages/{message_id}"));
+            let payload = json!({ "body": body });
+            let resp = match http.patch(&url).bearer_auth(&token).json(&payload).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Event::Error(format!("{e}")));
+                    return;
+                }
+            };
+            if !resp.status().is_success() {
+                let _ = tx.send(Event::Error(error_message(resp).await));
+                return;
+            }
+            match resp.json::<Value>().await {
+                Ok(v) => {
+                    if let Some(m) = serde_json::from_value::<Message>(v.get("message").cloned().unwrap_or(Value::Null)).ok() {
+                        let _ = tx.send(Event::WsMessageEdited(m));
+                    }
+                }
+                Err(_) => {
+                    let _ = tx.send(Event::Error("malformed server response".into()));
+                }
+            }
+        });
+    }
+
+    fn delete_message(
+        &self,
+        server: &str,
+        token: &str,
+        conversation_id: u64,
+        message_id: u64,
+    ) {
+        let tx = self.tx.clone();
+        let http = self.http.clone();
+        let server = server.to_string();
+        let token = token.to_string();
+        self.runtime.spawn(async move {
+            let url = api_url(&server, &format!("/api/conversations/{conversation_id}/messages/{message_id}"));
+            let resp = match http.delete(&url).bearer_auth(&token).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Event::Error(format!("{e}")));
+                    return;
+                }
+            };
+            if !resp.status().is_success() {
+                let _ = tx.send(Event::Error(error_message(resp).await));
+                return;
+            }
+            let _ = tx.send(Event::WsMessageDeleted { conversation_id, message_id });
+        });
+    }
+
     fn fetch_profile(&self, server: &str, token: &str, user_id: u64) {
         let tx = self.tx.clone();
         let http = self.http.clone();
@@ -1271,6 +1350,12 @@ fn spawn_ws(
                                             match ev {
                                                 WsHubEvent::Message { message } => {
                                                     let _ = tx.send(Event::WsMessage(message));
+                                                }
+                                                WsHubEvent::MessageEdited { message } => {
+                                                    let _ = tx.send(Event::WsMessageEdited(message));
+                                                }
+                                                WsHubEvent::MessageDeleted { conversation_id, message_id } => {
+                                                    let _ = tx.send(Event::WsMessageDeleted { conversation_id, message_id });
                                                 }
                                                 WsHubEvent::Signal { signal } => {
                                                     let _ = tx.send(Event::P2pSignal(signal));
@@ -2058,6 +2143,8 @@ fn refresh_messages_ui(sh: &Shared) {
                 preview_image,
                 preview_image_ratio,
                 preview_url,
+                is_edited: m.edited_at.is_some(),
+                original_body: m.original_body.clone().unwrap_or_default().into(),
             }
         })
         .collect();
@@ -2078,10 +2165,19 @@ fn merge_message(sh: &Shared, m: Message) {
         return;
     }
     let mut msgs = sh.messages.borrow_mut();
-    if !msgs.iter().any(|x| x.id == m.id) {
+    if let Some(existing) = msgs.iter_mut().find(|x| x.id == m.id) {
+        *existing = m;
+    } else {
         msgs.push(m);
         msgs.sort_by_key(|m| m.id);
     }
+}
+
+fn merge_message_deleted(sh: &Shared, conversation_id: u64, message_id: u64) {
+    if sh.selected.get() != conversation_id as i32 {
+        return;
+    }
+    sh.messages.borrow_mut().retain(|m| m.id != message_id);
 }
 
 fn handle_event(sh: &Shared, ev: Event) {
@@ -2229,6 +2325,18 @@ fn handle_event(sh: &Shared, ev: Event) {
             if at_bottom {
                 scroll_to_bottom(sh);
             }
+        }
+        Event::WsMessageEdited(m) => {
+            merge_message(sh, m.clone());
+            let at_bottom = sh.ui().get_msg_at_bottom();
+            refresh_messages_ui(sh);
+            if at_bottom {
+                scroll_to_bottom(sh);
+            }
+        }
+        Event::WsMessageDeleted { conversation_id, message_id } => {
+            merge_message_deleted(sh, conversation_id, message_id);
+            refresh_messages_ui(sh);
         }
         Event::WsStatus(b) => {
             sh.ui().set_ws_connected(b);
@@ -2766,6 +2874,9 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let sh = shared.clone();
         ui.on_send_message(move |body| {
+            if sh.ui().get_editing_message() {
+                return;
+            }
             if let Some(token) = sh.token.borrow().clone() {
                 let conv = sh.selected.get();
                 if conv >= 0 {
@@ -3241,6 +3352,82 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
+    // ------------------------------------------------------------------
+    // Message context menu callbacks (edit / delete)
+    // ------------------------------------------------------------------
+    {
+        let sh = shared.clone();
+        ui.on_msg_context_edit(move |msg_id| {
+            let ui = sh.ui();
+            let self_id = sh.self_id.get();
+            // Find the message in the current conversation.
+            let msg = sh.messages.borrow().iter().find(|m| m.id == msg_id as u64).cloned();
+            if let Some(m) = msg {
+                if self_id != Some(m.sender_id) {
+                    return;
+                }
+                ui.set_editing_message(true);
+                ui.set_editing_message_id(msg_id);
+                ui.set_editing_message_body(m.body.as_str().into());
+                ui.set_draft(m.body.as_str().into());
+            }
+        });
+    }
+    {
+        let sh = shared.clone();
+        ui.on_msg_context_delete(move |msg_id| {
+            if let Some(token) = sh.token.borrow().clone() {
+                let conv = sh.selected.get();
+                if conv >= 0 {
+                    sh.backend.delete_message(&sh.server(), &token, conv as u64, msg_id as u64);
+                }
+            }
+        });
+    }
+    {
+        let sh = shared.clone();
+        ui.on_cancel_edit(move || {
+            let ui = sh.ui();
+            ui.set_editing_message(false);
+            ui.set_editing_message_id(-1);
+            ui.set_editing_message_body(SharedString::default());
+            ui.set_draft(SharedString::default());
+        });
+    }
+    {
+        let sh = shared.clone();
+        ui.on_confirm_edit(move |body| {
+            let ui = sh.ui();
+            let msg_id = ui.get_editing_message_id();
+            let body = body.trim().to_string();
+            if body.is_empty() || msg_id < 0 {
+                ui.set_editing_message(false);
+                ui.set_editing_message_id(-1);
+                ui.set_editing_message_body(SharedString::default());
+                ui.set_draft(SharedString::default());
+                return;
+            }
+            if let Some(token) = sh.token.borrow().clone() {
+                let conv = sh.selected.get();
+                if conv >= 0 {
+                    sh.backend.edit_message(&sh.server(), &token, conv as u64, msg_id as u64, body);
+                }
+            }
+            ui.set_editing_message(false);
+            ui.set_editing_message_id(-1);
+            ui.set_editing_message_body(SharedString::default());
+            ui.set_draft(SharedString::default());
+        });
+    }
+    {
+        let sh = shared.clone();
+        ui.on_show_original(move |body| {
+            let ui = sh.ui();
+            ui.set_original_body_text(body);
+            ui.set_original_open(true);
+        });
+    }
+
     ui.run()
 }
 
@@ -3286,6 +3473,30 @@ mod tests {
                 assert_eq!(message.body, "old");
             }
             _ => panic!("expected message event"),
+        }
+
+        // MessageEdited event.
+        let raw = r#"{"kind":"message_edited","message":{"id":3,"conversation_id":17,"sender_id":31,"body":"edited text","created_at":"2026-08-06T00:00:00","edited_at":"2026-08-06T01:00:00","original_body":"old text"}}"#;
+        let ev: WsHubEvent = serde_json::from_str(raw).unwrap();
+        match ev {
+            WsHubEvent::MessageEdited { message } => {
+                assert_eq!(message.id, 3);
+                assert_eq!(message.body, "edited text");
+                assert!(message.edited_at.is_some());
+                assert_eq!(message.original_body.as_deref(), Some("old text"));
+            }
+            _ => panic!("expected message_edited event"),
+        }
+
+        // MessageDeleted event.
+        let raw = r#"{"kind":"message_deleted","conversation_id":17,"message_id":5}"#;
+        let ev: WsHubEvent = serde_json::from_str(raw).unwrap();
+        match ev {
+            WsHubEvent::MessageDeleted { conversation_id, message_id } => {
+                assert_eq!(conversation_id, 17);
+                assert_eq!(message_id, 5);
+            }
+            _ => panic!("expected message_deleted event"),
         }
     }
 

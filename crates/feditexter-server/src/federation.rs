@@ -211,6 +211,55 @@ pub(crate) fn deliver_outbound(state: &AppState, message: &Message, sender: &Use
     });
 }
 
+pub(crate) fn deliver_edit_outbound(state: &AppState, message: &Message, sender: &User) {
+    let state = state.clone();
+    let message = message.clone();
+    let sender = sender.clone();
+    tokio::spawn(async move {
+        let recipients: Vec<(u64, String)> = sqlx::query_as(
+            "SELECT u.remote_id, s.domain
+             FROM conversation_members cm
+             JOIN users u ON u.id = cm.user_id AND u.is_remote = TRUE
+             JOIN servers s ON s.id = u.server_id
+             WHERE cm.conversation_id = ?",
+        )
+        .bind(message.conversation_id)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap_or_default();
+
+        for (remote_id, domain) in recipients {
+            if let Err(e) = deliver_edit_to_server(&state, &message, &sender, remote_id, &domain).await {
+                warn!("federation: edit delivery to {domain} failed: {e}");
+            }
+        }
+    });
+}
+
+pub(crate) fn deliver_delete_outbound(state: &AppState, conversation_id: u64, message_id: u64, sender: &User) {
+    let state = state.clone();
+    let sender = sender.clone();
+    tokio::spawn(async move {
+        let recipients: Vec<(u64, String)> = sqlx::query_as(
+            "SELECT u.remote_id, s.domain
+             FROM conversation_members cm
+             JOIN users u ON u.id = cm.user_id AND u.is_remote = TRUE
+             JOIN servers s ON s.id = u.server_id
+             WHERE cm.conversation_id = ?",
+        )
+        .bind(conversation_id)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap_or_default();
+
+        for (remote_id, domain) in recipients {
+            if let Err(e) = deliver_delete_to_server(&state, message_id, &sender, remote_id, &domain).await {
+                warn!("federation: delete delivery to {domain} failed: {e}");
+            }
+        }
+    });
+}
+
 pub(crate) async fn get_or_create_mirror(
     state: &AppState,
     server_id: u64,
@@ -293,6 +342,81 @@ async fn deliver_to_server(
         "file_id": message.file_id,
         "file_size": message.file_size,
         "thumbnail_data": message.thumbnail_data,
+    });
+    let body = payload.to_string();
+    let auth = state.federation.sign_auth("POST", INBOX_PATH, body.as_bytes());
+    let url = format!("{}{}", base_url(domain), INBOX_PATH);
+
+    let resp = state
+        .federation
+        .client
+        .post(&url)
+        .header(AUTHORIZATION, auth)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("remote responded {}", resp.status()));
+    }
+    Ok(())
+}
+
+async fn deliver_edit_to_server(
+    state: &AppState,
+    message: &Message,
+    sender: &User,
+    to_remote_id: u64,
+    domain: &str,
+) -> Result<(), String> {
+    let payload = json!({
+        "type": "message_edit",
+        "from_server": state.federation.domain,
+        "from_username": sender.username,
+        "from_id": sender.id,
+        "to_id": to_remote_id,
+        "message_id": message.id,
+        "body": message.body,
+        "original_body": message.original_body,
+        "edited_at": message.edited_at,
+    });
+    let body = payload.to_string();
+    let auth = state.federation.sign_auth("POST", INBOX_PATH, body.as_bytes());
+    let url = format!("{}{}", base_url(domain), INBOX_PATH);
+
+    let resp = state
+        .federation
+        .client
+        .post(&url)
+        .header(AUTHORIZATION, auth)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("remote responded {}", resp.status()));
+    }
+    Ok(())
+}
+
+async fn deliver_delete_to_server(
+    state: &AppState,
+    message_id: u64,
+    sender: &User,
+    to_remote_id: u64,
+    domain: &str,
+) -> Result<(), String> {
+    let payload = json!({
+        "type": "message_delete",
+        "from_server": state.federation.domain,
+        "from_username": sender.username,
+        "from_id": sender.id,
+        "to_id": to_remote_id,
+        "message_id": message_id,
     });
     let body = payload.to_string();
     let auth = state.federation.sign_auth("POST", INBOX_PATH, body.as_bytes());

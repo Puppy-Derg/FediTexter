@@ -266,8 +266,8 @@ pub async fn list_messages(
 
     let messages: Vec<Message> = sqlx::query_as(
         "SELECT id, conversation_id, sender_id, body, created_at, attachment_mime, attachment_name, attachment_data,
-                file_id, file_size, thumbnail_data
-         FROM messages WHERE conversation_id = ? ORDER BY id ASC",
+                file_id, file_size, thumbnail_data, edited_at, original_body, deleted_at
+         FROM messages WHERE conversation_id = ? AND deleted_at IS NULL ORDER BY id ASC",
     )
     .bind(conversation_id)
     .fetch_all(&state.pool)
@@ -354,7 +354,7 @@ pub async fn send_message(
 
     let message: Message = sqlx::query_as(
         "SELECT id, conversation_id, sender_id, body, created_at, attachment_mime, attachment_name, attachment_data,
-                file_id, file_size, thumbnail_data FROM messages WHERE id = ?",
+                file_id, file_size, thumbnail_data, edited_at, original_body, deleted_at FROM messages WHERE id = ?",
     )
     .bind(inserted_id)
     .fetch_one(&state.pool)
@@ -432,4 +432,127 @@ pub async fn presence(
     drop(online);
     let _ = auth;
     Ok(Json(json!({ "presence": map })))
+}
+
+#[derive(Deserialize)]
+pub struct EditMessageRequest {
+    pub body: String,
+}
+
+/// Edit a message. Only the sender may edit their own message.
+/// The previous body is saved in `original_body` so it remains viewable.
+pub async fn edit_message(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((conversation_id, message_id)): Path<(u64, u64)>,
+    Json(body): Json<EditMessageRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if !is_member(&state, conversation_id, auth.user.id).await? {
+        return Err(ApiError::NotFound("conversation not found"));
+    }
+    if body.body.trim().is_empty() {
+        return Err(ApiError::BadRequest("message body cannot be empty"));
+    }
+    if body.body.len() > 2000 {
+        return Err(ApiError::BadRequest("message body too long (max 2000)"));
+    }
+
+    // Verify the message exists, belongs to the user, and is in this conversation.
+    let existing: Option<(u64, u64, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, sender_id, body, original_body FROM messages WHERE id = ? AND conversation_id = ?",
+    )
+    .bind(message_id)
+    .bind(conversation_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
+
+    let (msg_id, sender_id, current_body, existing_original) = match existing {
+        Some(row) => row,
+        None => return Err(ApiError::NotFound("message not found")),
+    };
+    if sender_id != auth.user.id {
+        return Err(ApiError::Forbidden("you can only edit your own messages"));
+    }
+    // If the body hasn't changed, skip the update.
+    if current_body == body.body {
+        let message: Message = sqlx::query_as(
+            "SELECT id, conversation_id, sender_id, body, created_at, attachment_mime, attachment_name, attachment_data,
+                    file_id, file_size, thumbnail_data, edited_at, original_body, deleted_at FROM messages WHERE id = ?",
+        )
+        .bind(msg_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?;
+        return Ok(Json(json!({ "message": message })));
+    }
+
+    let now = chrono::Utc::now().naive_utc();
+    // Preserve the very first original body so repeated edits don't overwrite it.
+    let orig = existing_original.unwrap_or(current_body);
+    sqlx::query(
+        "UPDATE messages SET body = ?, edited_at = ?, original_body = ? WHERE id = ?",
+    )
+    .bind(&body.body)
+    .bind(now)
+    .bind(&orig)
+    .bind(msg_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
+
+    let message: Message = sqlx::query_as(
+        "SELECT id, conversation_id, sender_id, body, created_at, attachment_mime, attachment_name, attachment_data,
+                file_id, file_size, thumbnail_data, edited_at, original_body, deleted_at FROM messages WHERE id = ?",
+    )
+    .bind(msg_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
+
+    state.hub.publish_message_edited(message.clone());
+    federation::deliver_edit_outbound(&state, &message, &auth.user);
+
+    Ok(Json(json!({ "message": message })))
+}
+
+/// Soft-delete a message. Only the sender may delete their own message.
+pub async fn delete_message(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((conversation_id, message_id)): Path<(u64, u64)>,
+) -> Result<StatusCode, ApiError> {
+    if !is_member(&state, conversation_id, auth.user.id).await? {
+        return Err(ApiError::NotFound("conversation not found"));
+    }
+
+    let existing: Option<(u64, u64)> = sqlx::query_as(
+        "SELECT id, sender_id FROM messages WHERE id = ? AND conversation_id = ?",
+    )
+    .bind(message_id)
+    .bind(conversation_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
+
+    let (msg_id, sender_id) = match existing {
+        Some(row) => row,
+        None => return Err(ApiError::NotFound("message not found")),
+    };
+    if sender_id != auth.user.id {
+        return Err(ApiError::Forbidden("you can only delete your own messages"));
+    }
+
+    let now = chrono::Utc::now().naive_utc();
+    sqlx::query("UPDATE messages SET deleted_at = ? WHERE id = ?")
+        .bind(now)
+        .bind(msg_id)
+        .execute(&state.pool)
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?;
+
+    state.hub.publish_message_deleted(conversation_id, msg_id);
+    federation::deliver_delete_outbound(&state, conversation_id, msg_id, &auth.user);
+
+    Ok(StatusCode::NO_CONTENT)
 }

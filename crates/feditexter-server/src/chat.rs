@@ -21,6 +21,12 @@ pub struct Message {
     pub file_size: Option<i64>,
     #[serde(default)]
     pub thumbnail_data: Option<String>,
+    #[serde(default)]
+    pub edited_at: Option<chrono::NaiveDateTime>,
+    #[serde(default)]
+    pub original_body: Option<String>,
+    #[serde(default)]
+    pub deleted_at: Option<chrono::NaiveDateTime>,
 }
 
 #[derive(FromRow, Debug, Clone)]
@@ -34,6 +40,10 @@ pub struct ConversationMember {
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum HubEvent {
     Message { message: Message },
+    #[serde(rename = "message_edited")]
+    MessageEdited { message: Message },
+    #[serde(rename = "message_deleted")]
+    MessageDeleted { conversation_id: u64, message_id: u64 },
     Signal { signal: SignalEvent },
     /// Someone started (re)typing in a conversation.
     Typing {
@@ -124,6 +134,14 @@ impl ChatHub {
 
     pub fn publish_message(&self, message: Message) {
         let _ = self.tx.send(HubEvent::Message { message });
+    }
+
+    pub fn publish_message_edited(&self, message: Message) {
+        let _ = self.tx.send(HubEvent::MessageEdited { message });
+    }
+
+    pub fn publish_message_deleted(&self, conversation_id: u64, message_id: u64) {
+        let _ = self.tx.send(HubEvent::MessageDeleted { conversation_id, message_id });
     }
 
     pub fn publish_signal(&self, signal: SignalEvent) {

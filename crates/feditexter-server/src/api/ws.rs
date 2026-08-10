@@ -77,6 +77,28 @@ async fn ws_loop(socket: WebSocket, state: AppState, auth: AuthUser) {
                             }
                         }
                     }
+                    Ok(HubEvent::MessageEdited { message }) => {
+                        if event_belongs_to(&message.conversation_id, &member_conversations) {
+                            let payload = match serde_json::to_string(&HubEvent::MessageEdited { message }) {
+                                Ok(p) => p,
+                                Err(_) => continue,
+                            };
+                            if sink.send(WsMessage::Text(payload.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(HubEvent::MessageDeleted { conversation_id, message_id }) => {
+                        if event_belongs_to(&conversation_id, &member_conversations) {
+                            let payload = match serde_json::to_string(&HubEvent::MessageDeleted { conversation_id, message_id }) {
+                                Ok(p) => p,
+                                Err(_) => continue,
+                            };
+                            if sink.send(WsMessage::Text(payload.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
                     Ok(HubEvent::Signal { signal }) => {
                         if signal.target_user_id == auth.user.id {
                             let payload = match serde_json::to_string(&HubEvent::Signal { signal }) {
