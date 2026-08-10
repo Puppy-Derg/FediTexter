@@ -77,6 +77,120 @@ async fn fetch_preview_image(state: &AppState, img: &str) -> Option<String> {
     Some(format!("data:image/jpeg;base64,{data}"))
 }
 
+/// Parse a Bluesky post URL (bsky.app or fxbsky.app) into
+/// (handle, post_rkey). Returns None for anything else.
+fn parse_bsky_post_url(url: &str) -> Option<(String, String)> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    if !(host == "bsky.app" || host == "fxbsky.app" || host.ends_with(".bsky.app") || host.ends_with(".fxbsky.app")) {
+        return None;
+    }
+    let path = parsed.path();
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let (handle, rkey): (String, String) = if host == "bsky.app" || host.ends_with(".bsky.app") {
+        if segments.len() >= 4 && segments[0] == "profile" && segments[2] == "post" {
+            (segments[1].to_string(), segments[3].to_string())
+        } else {
+            return None;
+        }
+    } else if segments.len() >= 3 && segments[0].starts_with('@') && segments[1] == "post" {
+        // fxbsky.app/@bsky.app@bsky.social/post/{rkey} -> handle "bsky.app"
+        let handle = segments[0]
+            .trim_start_matches('@')
+            .split('@')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        (handle, segments[2].to_string())
+    } else {
+        return None;
+    };
+    Some((handle, rkey))
+}
+
+/// Fetch a Bluesky post via its public API and extract an image URL.
+/// Kept separate from async futures because it's called inside async.
+async fn bsky_post_image(state: &AppState, url: &str) -> Option<String> {
+    let (handle, rkey) = parse_bsky_post_url(url)?;
+    let uri = format!("at://{handle}/app.bsky.feed.post/{rkey}");
+    let api = format!("https://public.api.bsky.app/xrpc/app.bsky.feed.getPostThread?uri={}&depth=0", urlencoding(&uri));
+    let text = state
+        .http
+        .get(&api)
+        .timeout(std::time::Duration::from_secs(6))
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let embed = v
+        .get("thread")?
+        .get("post")?
+        .get("embed")?;
+
+    let img = if let Some(images) = embed.get("images") {
+        images.get(0)?.get("fullsize")?.as_str().map(str::to_string)
+    } else if let Some(external) = embed.get("external") {
+        external.get("thumb")?.as_str().map(str::to_string)
+    } else if let Some(video) = embed.get("video") {
+        video.get("thumbnail")?.as_str().map(str::to_string)
+    } else if let Some(media) = embed.get("media") {
+        media.get("thumbnail")?.as_str().map(str::to_string)
+    } else {
+        None
+    }?;
+    if looks_private(&img) {
+        return None;
+    }
+    Some(img)
+}
+
+fn urlencoding(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            ':' | '/' | '#' => format!("%{:02X}", c as u32),
+            c => c.to_string(),
+        })
+        .collect()
+}
+
+async fn bsky_post_title(state: &AppState, handle: &str, rkey: &str) -> Option<String> {
+    let uri = format!("at://{handle}/app.bsky.feed.post/{rkey}");
+    let api = format!("https://public.api.bsky.app/xrpc/app.bsky.feed.getPostThread?uri={}&depth=0", urlencoding(&uri));
+    let text = state
+        .http
+        .get(&api)
+        .timeout(std::time::Duration::from_secs(6))
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let post = v.get("thread")?.get("post")?;
+    let author = post.get("author")?;
+    let name = author
+        .get("displayName")
+        .and_then(|s| s.as_str())
+        .unwrap_or_else(|| author.get("handle").and_then(|s| s.as_str()).unwrap_or(handle));
+    let body = post
+        .get("record")
+        .and_then(|r| r.get("text"))
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .trim();
+    let preview = if body.is_empty() {
+        name.to_string()
+    } else {
+        let truncated = if body.len() > 80 { format!("{}…", &body[..80]) } else { body.to_string() };
+        format!("{name}: {truncated}")
+    };
+    Some(preview)
+}
+
 fn meta_content(dom: &Html, selector: &Selector, prop: &str) -> Option<String> {
     dom.select(selector).find_map(|m| {
         let property = m.value().attr("property").unwrap_or("");
@@ -163,10 +277,52 @@ pub async fn link_preview(
         None => None,
     };
 
+    // fxbsky.app / bsky.app pages are JS-rendered with no og:image; the
+    // actual post media lives in Bluesky's public API.
+    let image = if image.is_some() {
+        image
+    } else if let Some(img) = bsky_post_image(&state, &url).await {
+        fetch_preview_image(&state, &img).await
+    } else {
+        None
+    };
+
+    let title = if title.is_some() { title } else {
+        // The fxbsky embed page only gives a placeholder title.
+        if let Some((handle, rkey)) = parse_bsky_post_url(&url) {
+            let _ = rkey;
+            bsky_post_title(&state, &handle, &rkey).await.or(title)
+        } else {
+            title
+        }
+    };
+
     Ok(Json(json!({
         "url": url,
         "title": title,
         "description": description,
         "image": image,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bsky_post_url;
+
+    #[test]
+    fn parses_fxbsky() {
+        assert_eq!(
+            parse_bsky_post_url("https://fxbsky.app/@bsky.app@bsky.social/post/3mqafridzgk2e"),
+            Some(("bsky.app".to_string(), "3mqafridzgk2e".to_string()))
+        );
+        assert_eq!(
+            parse_bsky_post_url("https://bsky.app/profile/bsky.app/post/3mqafridzgk2e"),
+            Some(("bsky.app".to_string(), "3mqafridzgk2e".to_string()))
+        );
+        assert_eq!(
+            parse_bsky_post_url("https://fxbsky.app/@bluesky@bsky.social/post/3kjt2ak2dmp26"),
+            Some(("bluesky".to_string(), "3kjt2ak2dmp26".to_string()))
+        );
+        assert_eq!(parse_bsky_post_url("https://example.com/foo"), None);
+    }
 }

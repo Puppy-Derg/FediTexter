@@ -1,14 +1,15 @@
 [package]
-name = "feditexter-client"
+name = "feditexter-iced"
 version = "0.1.0"
 edition = "2024"
-build = "build.rs"
 
 [dependencies]
-slint = { version = "1.15", features = ["backend-winit", "renderer-femtovg", "std", "unstable-winit-030"] }
-i-slint-backend-winit = "=1.17.1"
+env_logger = "0.11"
+iced = { version = "0.14", features = ["tokio", "image", "svg", "canvas", "lazy"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+scraper = "0.20"
+url = "2"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -23,6 +24,6 @@ bytes = "1"
 async-trait = "0.1"
 hmac = "0.12"
 sha1 = "0.10"
-
-[build-dependencies]
-slint-build = "1.15"
+dirs-next = "2"
+infer = "0.16"
+open = "5"
