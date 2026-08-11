@@ -52,7 +52,8 @@ pub struct SignalEvent {
 pub enum P2pEvent {
     Status { file_id: String, status: String },
     Progress { file_id: String, received: u64, total: u64 },
-    Complete { file_id: String, mime: String, name: String, bytes: Vec<u8> },
+    /// The transfer finished; `path` is the finalized file on disk.
+    Complete { file_id: String, mime: String, name: String, path: std::path::PathBuf },
     Failed { file_id: String, reason: String },
 }
 
@@ -445,9 +446,10 @@ impl P2pManager {
         self.finish_peer(&file_id, peer_id);
     }
 
-    /// Receiver side: read control/chunk/done frames off the channel.
+    /// Receiver side: read control/chunk/done frames off the channel, streaming
+    /// the bytes straight to disk so large transfers don't accumulate in RAM.
     async fn run_receiver(&self, dc: Arc<dyn DataChannel>, file_id: &str, peer_id: u64) {
-        let mut download: Option<(String, u64, String, String, Vec<u8>, u64)> = None;
+        let mut download: Option<(String, u64, String, String, std::fs::File, u64, std::path::PathBuf)> = None;
         while let Some(event) = dc.poll().await {
             match event {
                 DataChannelEvent::OnMessage(msg) => {
@@ -460,8 +462,13 @@ impl P2pManager {
                                     let size = v.get("size").and_then(|x| x.as_u64()).unwrap_or(0);
                                     let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("file").to_string();
                                     let mime = v.get("mime").and_then(|x| x.as_str()).unwrap_or("application/octet-stream").to_string();
-                                    download = Some((fid, size, name, mime, Vec::new(), 0));
-                                    if let Some((fid, _, _, _, _, _)) = &download {
+                                    // Open a temp file in the cache dir to stream into.
+                                    let dir = cache_dir();
+                                    let _ = std::fs::create_dir_all(&dir);
+                                    let tmp = dir.join(format!("{fid}.part"));
+                                    let file = std::fs::File::create(&tmp).ok();
+                                    download = file.map(|f| (fid, size, name, mime, f, 0, tmp));
+                                    if let Some((fid, _, _, _, _, _, _)) = &download {
                                         let _ = self.ui_tx.send(P2pEvent::Status {
                                             file_id: fid.clone(),
                                             status: "downloading".into(),
@@ -469,17 +476,21 @@ impl P2pManager {
                                     }
                                 }
                                 Some("done") => {
-                                    if let Some((fid, expected, name, mime, mut bytes, _)) = download.take() {
-                                        if !bytes.is_empty() && bytes.len() as u64 >= expected {
-                                            bytes.truncate(expected as usize);
-                                        }
+                                    if let Some((fid, _expected, name, mime, mut file, received, tmp)) = download.take() {
+                                        // Flush and finalize: rename the .part file to its
+                                        // final cache path (keyed by file_id).
+                                        let _ = file.sync_all();
+                                        drop(file);
+                                        let final_path = cache_dir().join(&fid);
+                                        let _ = std::fs::rename(&tmp, &final_path);
                                         self.complete(&fid);
                                         let _ = self.ui_tx.send(P2pEvent::Complete {
                                             file_id: fid,
                                             mime,
                                             name,
-                                            bytes,
+                                            path: final_path,
                                         });
+                                        let _ = received;
                                         // Tell the sender the transfer finished so it can
                                         // tear down without dropping in-flight data.
                                         let _ = dc.send_text(r#"{"type":"ack"}"#).await;
@@ -504,12 +515,15 @@ impl P2pManager {
                                 _ => {}
                             }
                         }
-                    } else if let Some((fid, expected, _name, _mime, bytes, last_emitted)) = download.as_mut() {
-                        bytes.extend_from_slice(&msg.data);
-                        let received = bytes.len() as u64;
+                    } else if let Some((fid, expected, _name, _mime, file, last_emitted, _tmp)) = download.as_mut() {
+                        use std::io::Write;
+                        if file.write_all(&msg.data).is_err() {
+                            break;
+                        }
+                        let received = *last_emitted + msg.data.len() as u64;
+                        *last_emitted = received;
                         // Throttle progress events to ~once per 512 KiB.
-                        if received - *last_emitted >= 512 * 1024 {
-                            *last_emitted = received;
+                        if received % (512 * 1024) < msg.data.len() as u64 {
                             let _ = self.ui_tx.send(P2pEvent::Progress {
                                 file_id: fid.clone(),
                                 received,
@@ -523,7 +537,9 @@ impl P2pManager {
             }
         }
         self.finish_peer(file_id, peer_id);
-        if let Some((fid, _, _, _, _, _)) = download.take() {
+        // Clean up a partial .part file if the transfer was interrupted.
+        if let Some((fid, _, _, _, _file, _received, tmp)) = download.take() {
+            let _ = std::fs::remove_file(&tmp);
             let _ = self.ui_tx.send(P2pEvent::Failed {
                 file_id: fid,
                 reason: "transfer interrupted".into(),
@@ -627,6 +643,13 @@ async fn build_peer(
 /// The machine's primary outbound IPv4 address. `connect()` on a UDP socket does
 /// not transmit anything — it only selects a route and lets `local_addr()` report
 /// the address a real connection to that destination would use.
+/// The on-disk directory where received P2P files land (final cache) and where
+/// in-progress `.part` files are streamed.
+fn cache_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    std::path::Path::new(&home).join(".feditexter_files")
+}
+
 fn primary_ipv4() -> Option<std::net::Ipv4Addr> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
@@ -699,17 +722,18 @@ mod tests {
         rt.block_on(async {
             let timeout = tokio::time::sleep(Duration::from_secs(90));
             tokio::pin!(timeout);
-            let (file_id, bytes) = loop {
+            let (file_id, path) = loop {
                 tokio::select! {
                     _ = &mut timeout => panic!("transfer timed out"),
                     msg = b_ui_rx.recv() => match msg {
-                        Some(P2pEvent::Complete { file_id, bytes, .. }) => break (file_id, bytes),
+                        Some(P2pEvent::Complete { file_id, path, .. }) => break (file_id, path),
                         Some(_) => continue,
                         None => panic!("receiver ui channel closed"),
                     }
                 }
             };
             assert_eq!(file_id, "testfile-1");
+            let bytes = std::fs::read(&path).expect("completed file should exist on disk");
             assert_eq!(bytes.len(), payload.len());
             assert_eq!(bytes, payload);
         });

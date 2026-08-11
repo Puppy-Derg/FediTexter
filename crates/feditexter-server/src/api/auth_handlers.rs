@@ -1,9 +1,10 @@
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -198,6 +199,8 @@ pub async fn login_2fa(
     headers: HeaderMap,
     Json(body): Json<Login2faRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    let ip = client_ip(&headers, None).unwrap_or_else(|| "unknown".to_string());
+    rate_limit(&ip, "2fa", 5)?;
     let token_hash = crate::auth::sha256(body.pending_token.trim());
     let session: crate::auth::Session = sqlx::query_as(
         "SELECT id, user_id, expires_at, is_2fa_pending, device_id, login_ip
@@ -305,8 +308,10 @@ pub struct TwoFaCodeRequest {
 pub async fn two_fa_enable(
     State(state): State<AppState>,
     auth: AuthUserLax,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<TwoFaCodeRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    rate_limit(&addr.ip().to_string(), "twofa", 5)?;
     let secret: Option<String> = sqlx::query_scalar("SELECT totp_secret FROM users WHERE id = ?")
         .bind(auth.user.id)
         .fetch_one(&state.pool)
@@ -316,40 +321,6 @@ pub async fn two_fa_enable(
     match secret {
         Some(secret) if totp_check(&secret, &body.code) => {
             sqlx::query("UPDATE users SET totp_enabled = 1 WHERE id = ?")
-                .bind(auth.user.id)
-                .execute(&state.pool)
-                .await
-                .map_err(|_| ApiError::Internal("db error"))?;
-        }
-        _ => return Err(ApiError::BadRequest("invalid code")),
-    }
-
-    let user: User = sqlx::query_as(
-        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot FROM users WHERE id = ?",
-    )
-    .bind(auth.user.id)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|_| ApiError::Internal("db error"))?;
-
-    Ok(Json(json!({ "user": user })))
-}
-
-/// Disable 2FA after verifying the current code.
-pub async fn two_fa_disable(
-    State(state): State<AppState>,
-    auth: AuthUser,
-    Json(body): Json<TwoFaCodeRequest>,
-) -> Result<Json<Value>, ApiError> {
-    let secret: Option<String> = sqlx::query_scalar("SELECT totp_secret FROM users WHERE id = ?")
-        .bind(auth.user.id)
-        .fetch_one(&state.pool)
-        .await
-        .map_err(|_| ApiError::Internal("db error"))?;
-
-    match secret {
-        Some(secret) if totp_check(&secret, &body.code) => {
-            sqlx::query("UPDATE users SET totp_enabled = 0, totp_secret = NULL WHERE id = ?")
                 .bind(auth.user.id)
                 .execute(&state.pool)
                 .await
@@ -450,8 +421,10 @@ pub struct VerifyRequest {
 pub async fn verify(
     State(state): State<AppState>,
     auth: AuthUserLax,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<VerifyRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    rate_limit(&addr.ip().to_string(), "verify", 5)?;
     let code = body.code.trim().to_string();
     if code.is_empty() {
         return Err(ApiError::BadRequest("missing verification code"));
@@ -485,7 +458,9 @@ pub async fn verify(
 pub async fn resend_verification(
     State(state): State<AppState>,
     auth: AuthUserLax,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<Json<Value>, ApiError> {
+    rate_limit(&addr.ip().to_string(), "resend", 3)?;
     let email: String = sqlx::query_scalar("SELECT email FROM users WHERE id = ?")
         .bind(auth.user.id)
         .fetch_one(&state.pool)

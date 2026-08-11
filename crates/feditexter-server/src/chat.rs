@@ -130,7 +130,9 @@ impl Default for ChatHub {
 
 impl ChatHub {
     pub fn new() -> Self {
-        let (tx, _) = broadcast::channel(256);
+        // Generous buffer so a slow client doesn't lag out and get disconnected
+        // during bursts (e.g. presence flushes, large conversation loads).
+        let (tx, _) = broadcast::channel(1024);
         Self { tx }
     }
 

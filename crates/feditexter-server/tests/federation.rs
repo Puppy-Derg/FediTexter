@@ -39,7 +39,15 @@ async fn start_instance(db_url: &str) -> TestInstance {
     let addr = listener.local_addr().unwrap();
     let domain = addr.to_string();
     let federation = Federation::init(&pool, &domain).await.unwrap();
-    let state = AppState { pool, hub: Default::default(), federation };
+    let state = AppState {
+        pool,
+        hub: Default::default(),
+        federation,
+        verify_emails: false,
+        mailer: None,
+        http: reqwest::Client::new(),
+        presence: Default::default(),
+    };
     let app = build_app(state.clone());
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();

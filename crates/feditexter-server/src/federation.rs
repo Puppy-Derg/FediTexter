@@ -72,7 +72,11 @@ impl Federation {
             domain: domain.to_string(),
             public_key: pk,
             secret: SigningKey::from_bytes(&sk),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default(),
         })
     }
 

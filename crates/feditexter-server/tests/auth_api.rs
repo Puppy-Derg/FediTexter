@@ -21,7 +21,15 @@ async fn test_state() -> AppState {
         })
         .await;
     let federation = Federation::init(&pool, "localhost").await.unwrap();
-    AppState { pool, hub: Default::default(), federation }
+    AppState {
+        pool,
+        hub: Default::default(),
+        federation,
+        verify_emails: false,
+        mailer: None,
+        http: reqwest::Client::new(),
+        presence: Default::default(),
+    }
 }
 
 fn unique_nanos() -> u128 {

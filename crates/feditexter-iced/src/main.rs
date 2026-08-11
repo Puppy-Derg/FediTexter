@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use hmac::Mac as _;
 use iced::widget::{button, column, container, mouse_area, row, rule, scrollable, space, text, text_input};
 use iced::widget::scrollable::Viewport;
 use iced::widget::Id;
@@ -134,6 +135,13 @@ struct ApiMsg {
     original_body: Option<String>,
     #[serde(default)]
     deleted_at: Option<String>,
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+struct TwoFaSetupInfo {
+    secret: String,
+    uri: String,
+    qr: String,
 }
 
 #[derive(serde::Deserialize, Clone, Debug)]
@@ -329,6 +337,11 @@ enum Msg {
     ToggleBlock(u64),
     ToggleMute(u64),
     ModerationResult(Result<Profile, String>),
+    TwoFaSetup,
+    TwoFaSetupResult(Result<TwoFaSetupInfo, String>),
+    TwoFaEnable,
+    TwoFaToggleResult(Result<User, String>),
+    TwoFaCodeInput(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +354,7 @@ enum Screen {
     Register,
     Verify,
     TwoFa,
+    TwoFaSetup,
     Chat,
 }
 
@@ -371,8 +385,12 @@ struct AppState {
     profile_open: bool,
     settings_open: bool,
     display_name_input: String,
+    twofa_setup: Option<TwoFaSetupInfo>,
+    twofa_toggle_code: String,
+    twofa_busy: bool,
     presence: HashMap<u64, bool>,
     typing: HashMap<u64, (String, std::time::Instant)>,
+    last_typing_sent: std::time::Instant,
     msg_scroll_id: Id,
     scrolled_away: bool,
     context_menu_msg: Option<u64>,
@@ -441,8 +459,12 @@ impl Default for AppState {
             profile_open: false,
             settings_open: false,
             display_name_input: String::new(),
+            twofa_setup: None,
+            twofa_toggle_code: String::new(),
+            twofa_busy: false,
             presence: HashMap::new(),
             typing: HashMap::new(),
+            last_typing_sent: std::time::Instant::now(),
             msg_scroll_id: Id::unique(),
             scrolled_away: false,
             context_menu_msg: None,
@@ -646,7 +668,222 @@ fn boot() -> (AppState, Task<Msg>) {
     (state, Task::perform(restore_session(), Msg::SessionRestored))
 }
 
+/// RFC 6238 TOTP for the bot's 2FA login. `secret` is a base32-encoded shared
+/// secret (same algorithm the server uses via totp_rs).
+fn totp_now(secret_base32: &str) -> String {
+    fn base32_decode(s: &str) -> Vec<u8> {
+        const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        let mut bits: u64 = 0;
+        let mut nbits = 0u32;
+        let mut out = Vec::new();
+        for &c in s.as_bytes() {
+            let c = c.to_ascii_uppercase();
+            let Some(val) = ALPHABET.iter().position(|&a| a == c) else {
+                continue;
+            };
+            bits = (bits << 5) | val as u64;
+            nbits += 5;
+            if nbits >= 8 {
+                nbits -= 8;
+                out.push((bits >> nbits) as u8);
+            }
+        }
+        out
+    }
+
+    let secret = base32_decode(secret_base32);
+    let counter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 30)
+        .unwrap_or(0);
+    let mut mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(&secret).expect("hmac key");
+    mac.update(&counter.to_be_bytes());
+    let digest = mac.finalize().into_bytes();
+    let offset = (digest[19] & 0x0f) as usize;
+    let code = u32::from_be_bytes([
+        digest[offset],
+        digest[offset + 1],
+        digest[offset + 2],
+        digest[offset + 3],
+    ]) & 0x7fff_ffff;
+    format!("{:06}", code % 1_000_000)
+}
+
+/// Headless test bot (`--bot`): logs in, stays online, echoes messages back and
+/// auto-receives P2P file transfers into `~/.feditexter_files`.
+///
+/// Config via env: `FEDITEXTER_BOT_SERVER` (default localhost:3000),
+/// `FEDITEXTER_BOT_EMAIL`, `FEDITEXTER_BOT_PASSWORD`, `FEDITEXTER_BOT_TOTP`
+/// (base32 secret).
+fn run_bot() -> Result<(), Box<dyn std::error::Error>> {
+    let server = normalize_server(
+        &std::env::var("FEDITEXTER_BOT_SERVER").unwrap_or_else(|_| "localhost:3000".into()),
+    );
+    let email = match std::env::var("FEDITEXTER_BOT_EMAIL") {
+        Ok(e) => e,
+        Err(_) => {
+            eprintln!("[bot] FEDITEXTER_BOT_EMAIL is required");
+            return Ok(());
+        }
+    };
+    let password = match std::env::var("FEDITEXTER_BOT_PASSWORD") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("[bot] FEDITEXTER_BOT_PASSWORD is required");
+            return Ok(());
+        }
+    };
+    let totp_secret = std::env::var("FEDITEXTER_BOT_TOTP").unwrap_or_default();
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        // Login (handles 2FA via the TOTP secret when required).
+        let client = make_client();
+        let token = loop {
+            let resp = client
+                .post(format!("{server}/api/login"))
+                .json(&serde_json::json!({ "email": email, "password": password, "remember_me": false }))
+                .send()
+                .await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    if v.get("requires_2fa").and_then(|b| b.as_bool()).unwrap_or(false) {
+                        if totp_secret.is_empty() {
+                            eprintln!("[bot] 2FA required but FEDITEXTER_BOT_TOTP is not set");
+                            return;
+                        }
+                        let pending = v.get("pending_token").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                        let code = totp_now(&totp_secret);
+                        let r2 = client
+                            .post(format!("{server}/api/login/2fa"))
+                            .json(&serde_json::json!({ "pending_token": pending, "code": code, "remember_me": false }))
+                            .send()
+                            .await;
+                        match r2 {
+                            Ok(r) if r.status().is_success() => {
+                                let v2: serde_json::Value = r.json().await.unwrap_or_default();
+                                break v2.get("token").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                            }
+                            _ => {
+                                eprintln!("[bot] 2fa failed, retrying in 5s");
+                            }
+                        }
+                    } else {
+                        break v.get("token").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                    }
+                }
+                Ok(r) => {
+                    eprintln!("[bot] login failed: {}; retrying in 5s", r.status());
+                }
+                Err(e) => {
+                    eprintln!("[bot] login error: {e}; retrying in 5s");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        };
+        eprintln!("[bot] logged in on {server}");
+
+        let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (p2p_tx, mut p2p_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
+        let handle = tokio::runtime::Handle::current();
+        let p2p = P2pManager::new(handle, ws_tx.clone(), p2p_tx);
+        let device = device_id();
+
+        let url = ws_url(&server);
+        let mut request = match url.clone().into_client_request() {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        if let Ok(header) = HeaderValue::from_str(&format!("Bearer {token}")) {
+            request.headers_mut().insert("authorization", header);
+        }
+        if let Ok(header) = HeaderValue::from_str(&device) {
+            request.headers_mut().insert("x-device-id", header);
+        }
+        let (ws, _) = match tokio_tungstenite::connect_async(request).await {
+            Ok((ws, _)) => (ws, true),
+            Err(e) => {
+                eprintln!("[bot] ws connect failed: {e}");
+                return;
+            }
+        };
+        eprintln!("[bot] ws connected");
+        let (mut sink, mut stream) = ws.split();
+
+        let mut seen: HashSet<u64> = HashSet::new();
+        loop {
+            tokio::select! {
+                outgoing = ws_rx.recv() => {
+                    if let Some(text) = outgoing {
+                        if sink.send(Message::Text(text.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                ev = p2p_rx.recv() => {
+                    if let Some(P2pEvent::Complete { file_id, path, .. }) = ev {
+                        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                        eprintln!("[bot] saved received file {file_id} ({} bytes)", size);
+                    }
+                }
+                incoming = stream.next() => {
+                    match incoming {
+                        Some(Ok(Message::Text(text))) => {
+                            let Ok(ev) = serde_json::from_str::<WsHubEvent>(&text) else { continue };
+                            if let WsHubEvent::Message { message: m } = ev {
+                                if m.sender_id == 0 || !seen.insert(m.id) {
+                                    continue;
+                                }
+                                if let Some(fid) = &m.file_id {
+                                    p2p.fetch(fid, m.sender_id);
+                                }
+                                let reply = if let Some(fid) = &m.file_id {
+                                    let name = m.attachment_name.clone().unwrap_or_else(|| "file".into());
+                                    format!("📎 got your file \"{name}\" (id {fid})")
+                                } else if m.body.trim().eq_ignore_ascii_case("ping") {
+                                    "pong".to_string()
+                                } else if !m.body.trim().is_empty() {
+                                    format!("🤖 echo: {}", m.body.trim())
+                                } else {
+                                    String::new()
+                                };
+                                if !reply.is_empty() {
+                                    eprintln!("[bot] replying to message {}: {reply}", m.id);
+                                    let resp = client
+                                        .post(format!("{server}/api/conversations/{}/messages", m.conversation_id))
+                                        .bearer_auth(&token)
+                                        .json(&serde_json::json!({ "body": reply }))
+                                        .send()
+                                        .await;
+                                    if let Err(e) = resp {
+                                        eprintln!("[bot] reply failed: {e}");
+                                    }
+                                }
+                            }
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => {
+                            eprintln!("[bot] ws error: {e}; reconnecting in 5s");
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                        }
+                        None => {
+                            eprintln!("[bot] ws closed; reconnecting in 5s");
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
 fn main() -> iced::Result {
+    if std::env::args().any(|a| a == "--bot") {
+        let _ = run_bot();
+        return Ok(());
+    }
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).try_init();
     std::panic::set_hook(Box::new(|info| {
         eprintln!("PANIC: {info}");
@@ -950,6 +1187,11 @@ fn msg_short(msg: &Msg) -> String {
         Msg::ToggleBlock(_) => "ToggleBlock".into(),
         Msg::ToggleMute(_) => "ToggleMute".into(),
         Msg::ModerationResult(_) => "ModerationResult".into(),
+        Msg::TwoFaSetup => "TwoFaSetup".into(),
+        Msg::TwoFaSetupResult(_) => "TwoFaSetupResult".into(),
+        Msg::TwoFaEnable => "TwoFaEnable".into(),
+        Msg::TwoFaToggleResult(_) => "TwoFaToggleResult".into(),
+        Msg::TwoFaCodeInput(_) => "TwoFaCodeInput".into(),
     }
 }
 
@@ -1016,8 +1258,10 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                 state.screen = Screen::Verify;
                 Task::none()
             } else {
-                state.screen = Screen::TwoFa;
-                Task::none()
+                // 2FA is mandatory: this account has no TOTP secret yet, so the
+                // user must set it up before using the app.
+                state.screen = Screen::TwoFaSetup;
+                Task::done(Msg::TwoFaSetup)
             }
         }
         Msg::LoginResult(Err(e)) => { state.auth_busy = false; state.error = e; Task::none() }
@@ -1026,6 +1270,11 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             state.token = Some(token.clone());
             state.user = Some(user.clone());
             state.display_name_input = user.display_name.clone();
+            if !user.totp_enabled {
+                // 2FA is mandatory: prompt the user to set it up.
+                state.screen = Screen::TwoFaSetup;
+                return Task::done(Msg::TwoFaSetup);
+            }
             state.screen = Screen::Chat;
             state.ws_connected = true;
             let conv_token = token;
@@ -1078,8 +1327,20 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             }
             state.token = Some(token);
             state.user = Some(user.clone());
-            state.screen = if user.email_verified { Screen::Chat } else { Screen::Verify };
-            Task::none()
+            if !user.email_verified {
+                state.screen = Screen::Verify;
+                Task::none()
+            } else if !user.totp_enabled {
+                // 2FA is mandatory: set it up before using the app.
+                state.screen = Screen::TwoFaSetup;
+                Task::done(Msg::TwoFaSetup)
+            } else {
+                state.screen = Screen::Chat;
+                Task::perform(
+                    load_conversations(state.server.clone(), state.token.clone().unwrap_or_default()),
+                    Msg::ConversationsLoaded,
+                )
+            }
         }
         Msg::RegisterResult(Err(e)) => { state.auth_busy = false; handle_api_error(state, e) }
         Msg::TwoFaCodeChanged(c) => { state.twofa_code = c; Task::none() }
@@ -1155,8 +1416,9 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                 let server = state.server.clone();
                 Task::perform(load_conversations(server, token), Msg::ConversationsLoaded)
             } else {
-                state.screen = Screen::TwoFa;
-                Task::none()
+                // 2FA is mandatory: prompt the user to set it up now.
+                state.screen = Screen::TwoFaSetup;
+                Task::done(Msg::TwoFaSetup)
             }
         }
         Msg::VerifyResult(Err(e)) => handle_api_error(state, e),
@@ -1217,7 +1479,21 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                 Task::none()
             }
         }
-        Msg::DraftChanged(d) => { state.draft = d; Task::none() }
+        Msg::DraftChanged(d) => {
+            state.draft = d;
+            // Broadcast "typing" at most once per 2s per burst. The WS worker
+            // relays the frame to the server, which fans it out to the other
+            // members of the open conversation.
+            if state.last_typing_sent.elapsed() >= Duration::from_secs(2)
+                && let Some(conv) = state.selected_conversation
+                && let Some(ws_tx) = &state.ws_tx
+            {
+                state.last_typing_sent = std::time::Instant::now();
+                let frame = serde_json::json!({ "type": "typing", "conversation_id": conv }).to_string();
+                let _ = ws_tx.send(frame);
+            }
+            Task::none()
+        }
         Msg::SendMessage => {
             let body = state.draft.trim().to_string();
             let conv = match state.selected_conversation { Some(c) => c, None => return Task::none() };
@@ -1477,6 +1753,76 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             ensure_avatars(state)
         }
         Msg::ModerationResult(Err(e)) => handle_api_error(state, e),
+        Msg::TwoFaSetup => {
+            state.twofa_busy = true;
+            let token = state.token.clone().unwrap_or_default();
+            let server = state.server.clone();
+            Task::perform(
+                async move {
+                    let client = make_client();
+                    let resp = client.post(format!("{server}/api/me/2fa/setup"))
+                        .bearer_auth(&token)
+                        .send().await;
+                    match resp {
+                        Ok(r) => {
+                            auth_aware_error(&r)?;
+                            let v: serde_json::Value = r.json().await.unwrap_or_default();
+                            serde_json::from_value::<TwoFaSetupInfo>(v).map_err(|e| format!("parse error: {e}"))
+                        }
+                        Err(e) => Err(format!("{e}")),
+                    }
+                },
+                Msg::TwoFaSetupResult,
+            )
+        }
+        Msg::TwoFaSetupResult(Ok(info)) => {
+            state.twofa_busy = false;
+            state.twofa_setup = Some(info);
+            Task::none()
+        }
+        Msg::TwoFaSetupResult(Err(e)) => { state.twofa_busy = false; handle_api_error(state, e) }
+        Msg::TwoFaCodeInput(c) => { state.twofa_toggle_code = c; Task::none() }
+        Msg::TwoFaEnable => {
+            state.twofa_busy = true;
+            let token = state.token.clone().unwrap_or_default();
+            let server = state.server.clone();
+            let code = state.twofa_toggle_code.clone();
+            Task::perform(
+                async move {
+                    let client = make_client();
+                    let resp = client.post(format!("{server}/api/me/2fa/enable"))
+                        .bearer_auth(&token)
+                        .json(&serde_json::json!({ "code": code }))
+                        .send().await;
+                    match resp {
+                        Ok(r) => {
+                            auth_aware_error(&r)?;
+                            let v: serde_json::Value = r.json().await.unwrap_or_default();
+                            serde_json::from_value::<User>(v.get("user").cloned().unwrap_or_default())
+                                .map_err(|e| format!("parse error: {e}"))
+                        }
+                        Err(e) => Err(format!("{e}")),
+                    }
+                },
+                Msg::TwoFaToggleResult,
+            )
+        }
+        Msg::TwoFaToggleResult(Ok(u)) => {
+            state.twofa_busy = false;
+            state.twofa_setup = None;
+            state.twofa_toggle_code.clear();
+            state.user = Some(u);
+            state.info = "Two-factor authentication enabled".to_string();
+            // If we were mid-setup (2FA just enabled), enter the app.
+            if state.screen == Screen::TwoFaSetup {
+                state.screen = Screen::Chat;
+                let token = state.token.clone().unwrap_or_default();
+                let server = state.server.clone();
+                return Task::perform(load_conversations(server, token), Msg::ConversationsLoaded);
+            }
+            Task::none()
+        }
+        Msg::TwoFaToggleResult(Err(e)) => { state.twofa_busy = false; handle_api_error(state, e) }
         Msg::DisplayNameChanged(s) => { state.display_name_input = s; Task::none() }
         Msg::SaveSettings => {
             let token = state.token.clone().unwrap_or_default();
@@ -1594,16 +1940,15 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                     };
                     state.p2p_status.insert(file_id, status);
                 }
-                P2pEvent::Complete { file_id, mime, name: _, bytes } => {
-                    std::fs::create_dir_all(files_cache_dir()).ok();
-                    let path = cache_path_for(&file_id);
-                    let _ = std::fs::write(&path, &bytes);
-                    let image_handle = if mime.starts_with("image/") {
-                        iced::widget::image::Handle::from_bytes(bytes)
-                    } else {
-                        iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 0])
-                    };
-                    let image_handle = if mime.starts_with("image/") { Some(image_handle) } else { None };
+                P2pEvent::Complete { file_id, mime, name: _, path } => {
+                    // The receiver already streamed the bytes to `path`.
+                    let image_handle = std::fs::read(&path).ok().and_then(|bytes| {
+                        if mime.starts_with("image/") {
+                            Some(iced::widget::image::Handle::from_bytes(bytes))
+                        } else {
+                            None
+                        }
+                    });
                     state.downloaded.insert(file_id.clone(), DownloadedFile {
                         image_handle,
                         path: Some(path),
@@ -2956,6 +3301,7 @@ fn view(state: &AppState) -> Element<'_, Msg> {
     match state.screen {        Screen::Login | Screen::Register => view_auth(state),
         Screen::Verify => view_verify(state),
         Screen::TwoFa => view_2fa(state),
+        Screen::TwoFaSetup => view_2fa_setup(state),
         Screen::Chat => view_chat(state),
     }
 }
@@ -3073,6 +3419,54 @@ fn view_2fa(state: &AppState) -> Element<'_, Msg> {
         button("Verify").on_press(Msg::TwoFaSubmit).width(Length::Fixed(state.z(320.0))).into()
     };
     let mut form = column![title, desc, code_input, submit_btn].spacing(state.z(14)).align_x(iced::Alignment::Center);
+    if !state.error.is_empty() {
+        form = form.push(text(&state.error).color(iced::Color::from_rgb(0.9, 0.3, 0.2)));
+    }
+    container(form).center_x(Length::Fill).center_y(Length::Fill).into()
+}
+
+/// Mandatory 2FA setup: show the QR + secret and let the user confirm a code
+/// before they can use the app (2FA cannot be disabled).
+fn view_2fa_setup(state: &AppState) -> Element<'_, Msg> {
+    let title = text("Set up two-factor authentication").size(state.zs(28));
+    let desc = text("Scan this QR code with your authenticator app, then enter the 6-digit code").size(state.zs(14))
+        .color(iced::Color::from_rgb(0.6, 0.6, 0.6));
+
+    let mut form = column![title, desc].spacing(state.z(14)).align_x(iced::Alignment::Center);
+
+    match &state.twofa_setup {
+        None => {
+            // Setup request still in flight (or not started yet).
+            let btn: Element<'_, Msg> = if state.twofa_busy {
+                button(throbber(state.zs(16))).padding(state.z(6)).into()
+            } else {
+                button("Generate setup code").on_press(Msg::TwoFaSetup).padding(state.z(6)).into()
+            };
+            form = form.push(btn);
+        }
+        Some(info) => {
+            let qr_handle = data_url_bytes(&info.qr)
+                .map(iced::widget::image::Handle::from_bytes)
+                .unwrap_or_else(|| iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 0]));
+            let qr_img = iced::widget::Image::new(qr_handle).width(state.z(200)).height(state.z(200));
+            let secret = text(format!("Secret: {}", info.secret)).size(state.zs(12))
+                .color(iced::Color::from_rgb(0.7, 0.7, 0.7));
+            let code_input = text_input("6-digit code", &state.twofa_toggle_code)
+                .on_input(Msg::TwoFaCodeInput)
+                .on_submit(Msg::TwoFaEnable)
+                .width(Length::Fixed(state.z(320.0)));
+            let enable_btn: Element<'_, Msg> = if state.twofa_busy {
+                button(throbber(state.zs(16))).width(Length::Fixed(state.z(320.0))).into()
+            } else {
+                button("Enable 2FA").on_press(Msg::TwoFaEnable).width(Length::Fixed(state.z(320.0))).style(button::primary).into()
+            };
+            form = form.push(qr_img);
+            form = form.push(secret);
+            form = form.push(code_input);
+            form = form.push(enable_btn);
+        }
+    }
+
     if !state.error.is_empty() {
         form = form.push(text(&state.error).color(iced::Color::from_rgb(0.9, 0.3, 0.2)));
     }
@@ -3588,6 +3982,61 @@ fn view_settings(state: &AppState) -> Element<'_, Msg> {
         .spacing(state.z(16))
         .align_y(iced::Alignment::Center);
 
+    // ---- Two-factor section ----
+    let totp_enabled = state.user.as_ref().map(|u| u.totp_enabled).unwrap_or(false);
+    let twofa_label = text("Two-factor authentication").size(state.zs(14))
+        .color(iced::Color::from_rgb(0.6, 0.6, 0.6));
+
+    let twofa_section: Element<'_, Msg> = if totp_enabled {
+        // 2FA is mandatory and cannot be disabled — show a status line only.
+        row![
+            text("●").size(state.zs(10)).color(iced::Color::from_rgb(0.3, 0.8, 0.3)),
+            text("Enabled (required)").size(state.zs(13)).color(iced::Color::from_rgb(0.7, 0.7, 0.7)),
+        ].spacing(state.z(8)).align_y(iced::Alignment::Center).into()
+    } else {
+        // Defensive: if a user somehow reaches settings without 2FA, offer setup.
+        let setup_btn: Element<'_, Msg> = if state.twofa_busy {
+            button(throbber(state.zs(13))).padding(state.z(6)).into()
+        } else if state.twofa_setup.is_none() {
+            button(text("Set up 2FA").size(state.zs(13)))
+                .on_press(Msg::TwoFaSetup)
+                .padding([state.z(6.0), state.z(14.0)])
+                .into()
+        } else {
+            button(text("  ").size(state.zs(13))).padding(state.z(6)).into()
+        };
+
+        let setup_body: Option<Element<'_, Msg>> = state.twofa_setup.as_ref().map(|info| {
+            let secret = text(format!("Secret: {}", info.secret)).size(state.zs(12))
+                .color(iced::Color::from_rgb(0.7, 0.7, 0.7));
+            let qr_handle = data_url_bytes(&info.qr)
+                .map(iced::widget::image::Handle::from_bytes)
+                .unwrap_or_else(|| iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 0]));
+            let qr_img = iced::widget::Image::new(qr_handle).width(state.z(160)).height(state.z(160));
+            let code_input = text_input("Enter code from app", &state.twofa_toggle_code)
+                .on_input(Msg::TwoFaCodeInput)
+                .width(Length::Fixed(state.z(200.0)));
+            let confirm_btn: Element<'_, Msg> = if state.twofa_busy {
+                button(throbber(state.zs(13))).padding(state.z(6)).into()
+            } else {
+                button(text("Enable 2FA").size(state.zs(13)))
+                    .on_press(Msg::TwoFaEnable)
+                    .style(button::primary)
+                    .padding([state.z(6.0), state.z(14.0)])
+                    .into()
+            };
+            column![qr_img, secret, row![code_input, confirm_btn].spacing(state.z(8)).align_y(iced::Alignment::Center)]
+                .spacing(state.z(8))
+                .into()
+        });
+
+        let mut col = column![row![setup_btn].spacing(state.z(8))];
+        if let Some(body) = setup_body {
+            col = col.push(body);
+        }
+        col.into()
+    };
+
     let content = column![
         back_btn,
         title,
@@ -3604,8 +4053,12 @@ fn view_settings(state: &AppState) -> Element<'_, Msg> {
         accent_label,
         accent_row,
         rule::horizontal(1),
-        logout_btn,
+        twofa_label,
     ].spacing(state.z(12)).padding(state.z(24)).max_width(state.z(480));
+    let content = content
+        .push(twofa_section)
+        .push(rule::horizontal(1))
+        .push(logout_btn);
 
     container(content)
         .center_x(Length::Fill)

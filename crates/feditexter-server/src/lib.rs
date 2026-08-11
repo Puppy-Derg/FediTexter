@@ -9,7 +9,7 @@ pub mod mail;
 use axum::routing::{delete, get, post};
 use axum::Router;
 use api::auth_handlers::{
-    login, login_2fa, logout, me, register, resend_verification, set_avatar, two_fa_disable,
+    login, login_2fa, logout, me, register, resend_verification, set_avatar,
     two_fa_enable, two_fa_setup, update_me, verify,
 };
 use api::chat_handlers::{
@@ -34,7 +34,6 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/me/avatar", post(set_avatar))
         .route("/api/me/2fa/setup", post(two_fa_setup))
         .route("/api/me/2fa/enable", post(two_fa_enable))
-        .route("/api/me/2fa/disable", post(two_fa_disable))
         .route("/api/verify", post(verify))
         .route("/api/verify/resend", post(resend_verification))
         .route("/api/link-preview", post(link_preview))

@@ -40,6 +40,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mailer,
         http: reqwest::Client::builder()
             .user_agent("FediTexterServer/1.0")
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("failed to build http client"),
         presence: Default::default(),
