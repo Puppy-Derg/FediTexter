@@ -165,10 +165,11 @@ struct LinkPreview {
     title: Option<String>,
     #[serde(default)]
     description: Option<String>,
+    /// Raw image URLs (data URIs after fetching).
     #[serde(default)]
-    image: Option<String>,
+    images: Vec<String>,
     #[serde(skip)]
-    image_handle: Option<iced::widget::image::Handle>,
+    image_handles: Vec<iced::widget::image::Handle>,
 }
 
 /// A picked-but-not-yet-sent file attachment.
@@ -234,6 +235,7 @@ enum Msg {
     LoginEmailChanged(String),
     LoginPasswordChanged(String),
     LoginServerChanged(String),
+    RememberMeChanged(bool),
     LoginSubmit,
     LoginResult(Result<(String, User), String>),
     SessionRestored(Option<(String, String, User)>),
@@ -251,8 +253,8 @@ enum Msg {
     VerifySubmit,
     VerifyResult(Result<User, String>),
     SelectConversation(u64),
-    ConversationsLoaded(Vec<Conversation>),
-    MessagesLoaded { conversation_id: u64, messages: Vec<ApiMsg> },
+    ConversationsLoaded(Result<Vec<Conversation>, String>),
+    MessagesLoaded { conversation_id: u64, messages: Result<Vec<ApiMsg>, String> },
     DraftChanged(String),
     SendMessage,
     MessageSent(Result<ApiMsg, String>),
@@ -323,6 +325,10 @@ enum Msg {
     ClearAttachment,
     OpenFile(u64),
     RetryFile(u64),
+    SessionExpired(String),
+    ToggleBlock(u64),
+    ToggleMute(u64),
+    ModerationResult(Result<Profile, String>),
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +349,7 @@ struct AppState {
     server: String,
     login_email: String,
     login_password: String,
+    remember_me: bool,
     register_email: String,
     register_username: String,
     register_password: String,
@@ -374,6 +381,7 @@ struct AppState {
     conv_menu_pos: Option<(f32, f32)>,
     cursor_pos: iced::Point,
     link_previews: HashMap<String, LinkPreview>,
+    preview_loading: HashSet<String>,
     ws_connected: bool,
     window_size: iced::Size,
     accent: iced::Color,
@@ -383,6 +391,10 @@ struct AppState {
     new_conv_results: Vec<SearchUser>,
     new_conv_selected: Vec<u64>,
     new_conv_busy: bool,
+    busy: bool,
+    loading_messages: bool,
+    auth_busy: bool,
+    avatar_busy: bool,
     zoom: f32,
     avatar_handles: HashMap<u64, iced::widget::image::Handle>,
     avatar_attempted: HashSet<u64>,
@@ -403,6 +415,7 @@ impl Default for AppState {
             server: "https://dergdungeon.com.au".to_string(),
             login_email: String::new(),
             login_password: String::new(),
+            remember_me: true,
             register_email: String::new(),
             register_username: String::new(),
             register_password: String::new(),
@@ -434,6 +447,7 @@ impl Default for AppState {
             conv_menu_pos: None,
             cursor_pos: iced::Point::ORIGIN,
             link_previews: HashMap::new(),
+            preview_loading: HashSet::new(),
             ws_connected: false,
             window_size: iced::Size::new(1024.0, 768.0),
             accent: accent_from_file(),
@@ -443,6 +457,10 @@ impl Default for AppState {
             new_conv_results: Vec::new(),
             new_conv_selected: Vec::new(),
             new_conv_busy: false,
+            busy: false,
+            loading_messages: false,
+            auth_busy: false,
+            avatar_busy: false,
             zoom: 1.0,
             avatar_handles: HashMap::new(),
             avatar_attempted: HashSet::new(),
@@ -548,6 +566,35 @@ fn make_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
+/// Sentinel error string returned by API helpers when the server reports the
+/// session as invalid/revoked (HTTP 401), so the UI can force a re-login.
+const AUTH_FAILED: &str = "__auth_failed__";
+
+/// If `e` is the AUTH_FAILED sentinel, return a SessionExpired task; otherwise
+/// store it as a plain error and continue.
+fn handle_api_error(state: &mut AppState, e: String) -> Task<Msg> {
+    if e == AUTH_FAILED {
+        Task::done(Msg::SessionExpired(
+            "Your session was invalidated (token used from another device). Please log in again.".to_string(),
+        ))
+    } else {
+        state.error = e;
+        Task::none()
+    }
+}
+
+/// Classify a response: Ok(()) on success, AUTH_FAILED on 401, otherwise a
+/// descriptive error. HTTP 403 (moderation, 2FA-setup) is left untouched.
+fn auth_aware_error(resp: &reqwest::Response) -> Result<(), String> {
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(AUTH_FAILED.to_string());
+    }
+    if resp.status().is_success() {
+        return Ok(());
+    }
+    Err(format!("request failed: {}", resp.status()))
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -624,6 +671,17 @@ async fn restore_session() -> Option<(String, String, User)> {
     let v: serde_json::Value = resp.json().await.ok()?;
     let user: User = serde_json::from_value(v.get("user").cloned().unwrap_or_default()).ok()?;
     Some((server, token, user))
+}
+
+/// Persist the session so the next launch auto-logs-in (used only when the user
+/// ticks "Remember me").
+fn save_session(server: &str, token: &str) {
+    if server.is_empty() || token.is_empty() {
+        return;
+    }
+    let path = dirs_next::home_dir().unwrap_or_default().join(".feditexter_session");
+    let data = serde_json::json!({ "server": server, "token": token }).to_string();
+    let _ = std::fs::write(&path, data);
 }
 
 // ---------------------------------------------------------------------------
@@ -747,7 +805,19 @@ async fn ws_worker(
                 }
                 let _ = output.send(Msg::WsDisconnected).await;
             }
-            Err(_) => {
+            Err(e) => {
+                // A 401/403 on the handshake means the session is dead (revoked,
+                // expired, or token used from another device). Stop retrying and
+                // prompt the user to log in again.
+                if let tokio_tungstenite::tungstenite::Error::Http(resp) = &e {
+                    let status = resp.status().as_u16();
+                    if status == 401 || status == 403 {
+                        let _ = output.send(Msg::SessionExpired(
+                            "Your session was invalidated or expired. Please log in again.".to_string(),
+                        )).await;
+                        return;
+                    }
+                }
                 let _ = output.send(Msg::WsDisconnected).await;
             }
         }
@@ -775,6 +845,7 @@ fn msg_short(msg: &Msg) -> String {
         Msg::LoginEmailChanged(_) => "LoginEmailChanged".into(),
         Msg::LoginPasswordChanged(_) => "LoginPasswordChanged".into(),
         Msg::LoginServerChanged(_) => "LoginServerChanged".into(),
+        Msg::RememberMeChanged(_) => "RememberMeChanged".into(),
         Msg::LoginSubmit => "LoginSubmit".into(),
         Msg::LoginResult(r) => format!("LoginResult({})", if r.is_ok() { "Ok" } else { "Err" }),
         Msg::SessionRestored(_) => "SessionRestored".into(),
@@ -792,8 +863,8 @@ fn msg_short(msg: &Msg) -> String {
         Msg::VerifySubmit => "VerifySubmit".into(),
         Msg::VerifyResult(r) => format!("VerifyResult({})", if r.is_ok() { "Ok" } else { "Err" }),
         Msg::SelectConversation(id) => format!("SelectConversation({id})"),
-        Msg::ConversationsLoaded(v) => format!("ConversationsLoaded({})", v.len()),
-        Msg::MessagesLoaded { conversation_id, messages } => format!("MessagesLoaded(conv={conversation_id}, n={})", messages.len()),
+        Msg::ConversationsLoaded(v) => format!("ConversationsLoaded({})", v.as_ref().map(|x| x.len()).unwrap_or(0)),
+        Msg::MessagesLoaded { conversation_id, messages } => format!("MessagesLoaded(conv={conversation_id}, n={})", messages.as_ref().map(|x| x.len()).unwrap_or(0)),
         Msg::DraftChanged(_) => "DraftChanged".into(),
         Msg::SendMessage => "SendMessage".into(),
         Msg::MessageSent(r) => format!("MessageSent({})", if r.is_ok() { "Ok" } else { "Err" }),
@@ -864,6 +935,10 @@ fn msg_short(msg: &Msg) -> String {
         Msg::ClearAttachment => "ClearAttachment".into(),
         Msg::OpenFile(_) => "OpenFile".into(),
         Msg::RetryFile(_) => "RetryFile".into(),
+        Msg::SessionExpired(_) => "SessionExpired".into(),
+        Msg::ToggleBlock(_) => "ToggleBlock".into(),
+        Msg::ToggleMute(_) => "ToggleMute".into(),
+        Msg::ModerationResult(_) => "ModerationResult".into(),
     }
 }
 
@@ -875,15 +950,18 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
         Msg::LoginEmailChanged(e) => { state.login_email = e; Task::none() }
         Msg::LoginPasswordChanged(p) => { state.login_password = p; Task::none() }
         Msg::LoginServerChanged(s) => { state.server = s; Task::none() }
+        Msg::RememberMeChanged(b) => { state.remember_me = b; Task::none() }
         Msg::LoginSubmit => {
             state.error.clear();
+            state.auth_busy = true;
             let email = state.login_email.clone();
             let password = state.login_password.clone();
+            let remember_me = state.remember_me;
             let server = normalize_server(&state.server);
             Task::perform(async move {
                 let client = make_client();
                 let resp = client.post(format!("{server}/api/login"))
-                    .json(&serde_json::json!({ "email": email, "password": password }))
+                    .json(&serde_json::json!({ "email": email, "password": password, "remember_me": remember_me }))
                     .send().await;
                 match resp {
                     Ok(r) if r.status().is_success() => {
@@ -911,6 +989,10 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             })
         }
         Msg::LoginResult(Ok((token, user))) => {
+            state.auth_busy = false;
+            if state.remember_me {
+                save_session(&state.server, &token);
+            }
             state.token = Some(token.clone());
             state.user = Some(user.clone());
             state.display_name_input = user.display_name.clone();
@@ -927,7 +1009,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                 Task::none()
             }
         }
-        Msg::LoginResult(Err(e)) => { state.error = e; Task::none() }
+        Msg::LoginResult(Err(e)) => { state.auth_busy = false; state.error = e; Task::none() }
         Msg::SessionRestored(Some((server, token, user))) => {
             state.server = server;
             state.token = Some(token.clone());
@@ -956,6 +1038,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
         Msg::RegisterPasswordChanged(p) => { state.register_password = p; Task::none() }
         Msg::RegisterSubmit => {
             state.error.clear();
+            state.auth_busy = true;
             let email = state.register_email.clone();
             let username = state.register_username.clone();
             let password = state.register_password.clone();
@@ -978,22 +1061,28 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             }, Msg::RegisterResult)
         }
         Msg::RegisterResult(Ok((token, user))) => {
+            state.auth_busy = false;
+            if state.remember_me {
+                save_session(&state.server, &token);
+            }
             state.token = Some(token);
             state.user = Some(user.clone());
             state.screen = if user.email_verified { Screen::Chat } else { Screen::Verify };
             Task::none()
         }
-        Msg::RegisterResult(Err(e)) => { state.error = e; Task::none() }
+        Msg::RegisterResult(Err(e)) => { state.auth_busy = false; state.error = e; Task::none() }
         Msg::TwoFaCodeChanged(c) => { state.twofa_code = c; Task::none() }
         Msg::TwoFaSubmit => {
             state.error.clear();
+            state.auth_busy = true;
             let code = state.twofa_code.clone();
             let pending = state.pending_token.clone().unwrap_or_default();
+            let remember_me = state.remember_me;
             let server = state.server.clone();
             Task::perform(async move {
                 let client = make_client();
                 let resp = client.post(format!("{server}/api/login/2fa"))
-                    .json(&serde_json::json!({ "pending_token": pending, "code": code }))
+                    .json(&serde_json::json!({ "pending_token": pending, "code": code, "remember_me": remember_me }))
                     .send().await;
                 match resp {
                     Ok(r) if r.status().is_success() => {
@@ -1011,16 +1100,21 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             }, Msg::TwoFaResult)
         }
         Msg::TwoFaResult(Ok((token, user))) => {
+            state.auth_busy = false;
+            if state.remember_me {
+                save_session(&state.server, &token);
+            }
             state.token = Some(token.clone());
             state.user = Some(user);
             state.screen = Screen::Chat;
             let server = state.server.clone();
             Task::perform(load_conversations(server, token), Msg::ConversationsLoaded)
         }
-        Msg::TwoFaResult(Err(e)) => { state.error = e; Task::none() }
+        Msg::TwoFaResult(Err(e)) => { state.auth_busy = false; state.error = e; Task::none() }
         Msg::VerifyCodeChanged(c) => { state.verify_code = c; Task::none() }
         Msg::VerifySubmit => {
             state.error.clear();
+            state.auth_busy = true;
             let code = state.verify_code.clone();
             let token = state.token.clone().unwrap_or_default();
             let server = state.server.clone();
@@ -1042,13 +1136,14 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             }, Msg::VerifyResult)
         }
         Msg::VerifyResult(Ok(user)) => {
+            state.auth_busy = false;
             state.user = Some(user);
             state.screen = Screen::Chat;
             let token = state.token.clone().unwrap_or_default();
             let server = state.server.clone();
             Task::perform(load_conversations(server, token), Msg::ConversationsLoaded)
         }
-        Msg::VerifyResult(Err(e)) => { state.error = e; Task::none() }
+        Msg::VerifyResult(Err(e)) => { state.auth_busy = false; state.error = e; Task::none() }
         Msg::SelectConversation(id) => {
             state.selected_conversation = Some(id);
             state.unread.remove(&id);
@@ -1059,25 +1154,44 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             state.context_menu_pos = None;
             state.conv_menu_conv = None;
             state.conv_menu_pos = None;
+            state.loading_messages = true;
             let token = state.token.clone().unwrap_or_default();
             let server = state.server.clone();
             Task::perform(async move { load_messages(&server, &token, id).await },
                 move |msgs| Msg::MessagesLoaded { conversation_id: id, messages: msgs })
         }
-        Msg::ConversationsLoaded(convs) => { state.conversations = convs; ensure_avatars(state) }
+        Msg::ConversationsLoaded(Ok(convs)) => { state.conversations = convs; ensure_avatars(state) }
+        Msg::ConversationsLoaded(Err(e)) => {
+            if e == AUTH_FAILED {
+                return Task::done(Msg::SessionExpired("Your session was invalidated (token used from another device). Please log in again.".to_string()));
+            }
+            state.error = e;
+            Task::none()
+        }
         Msg::MessagesLoaded { conversation_id, messages } => {
+            state.loading_messages = false;
             if state.selected_conversation == Some(conversation_id) {
                 let mut tasks = Vec::new();
-                for m in &messages {
-                    for url in extract_urls(&m.body) {
-                        if !state.link_previews.contains_key(&url) {
-                            tasks.push(Task::perform(async move { Msg::FetchLinkPreview(url) }, |m| m));
+                match messages {
+                    Ok(msgs) => {
+                        for m in &msgs {
+                            for url in extract_urls(&m.body) {
+                                if !state.link_previews.contains_key(&url) {
+                                    tasks.push(Task::perform(async move { Msg::FetchLinkPreview(url) }, |m| m));
+                                }
+                            }
                         }
+                        state.messages = msgs;
+                        build_thumb_handles(state);
+                        auto_fetch_files(state);
+                    }
+                    Err(e) => {
+                        if e == AUTH_FAILED {
+                            return Task::done(Msg::SessionExpired("Your session was invalidated (token used from another device). Please log in again.".to_string()));
+                        }
+                        state.error = e;
                     }
                 }
-                state.messages = messages;
-                build_thumb_handles(state);
-                auto_fetch_files(state);
                 if tasks.is_empty() {
                     Task::none()
                 } else {
@@ -1095,6 +1209,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             let has_attach = attachment.is_some();
             if body.is_empty() && !has_attach { return Task::none(); }
             state.draft.clear();
+            state.busy = true;
             if let Some(att) = &attachment {
                 if let Some(p2p) = &state.p2p {
                     p2p.serve(ServingFile {
@@ -1137,12 +1252,16 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                         serde_json::from_value::<ApiMsg>(v.get("message").cloned().unwrap_or_default())
                             .map_err(|_| String::from("parse error"))
                     }
-                    Ok(r) => Err(format!("send failed: {}", r.status())),
+                    Ok(r) => {
+                        auth_aware_error(&r)?;
+                        Err(format!("send failed: {}", r.status()))
+                    }
                     Err(e) => Err(format!("{e}")),
                 }
             }, Msg::MessageSent)
         }
         Msg::MessageSent(Ok(m)) => {
+            state.busy = false;
             if state.selected_conversation == Some(m.conversation_id) {
                 if !state.messages.iter().any(|x| x.id == m.id) {
                     state.messages.push(m);
@@ -1151,7 +1270,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             }
             Task::none()
         }
-        Msg::MessageSent(Err(e)) => { state.error = e; Task::none() }
+        Msg::MessageSent(Err(e)) => { state.busy = false; handle_api_error(state, e) }
         Msg::StartEdit(msg_id) => {
             state.context_menu_msg = None;
             state.context_menu_pos = None;
@@ -1182,7 +1301,10 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                         serde_json::from_value::<ApiMsg>(v.get("message").cloned().unwrap_or_default())
                             .map_err(|_| String::from("parse error"))
                     }
-                    Ok(r) => Err(format!("edit failed: {}", r.status())),
+                    Ok(r) => {
+                        auth_aware_error(&r)?;
+                        Err(format!("edit failed: {}", r.status()))
+                    }
                     Err(e) => Err(format!("{e}")),
                 }
             }, Msg::EditResult)
@@ -1191,7 +1313,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             if let Some(existing) = state.messages.iter_mut().find(|x| x.id == m.id) { *existing = m; }
             Task::none()
         }
-        Msg::EditResult(Err(e)) => { state.error = e; Task::none() }
+        Msg::EditResult(Err(e)) => handle_api_error(state, e),
         Msg::DeleteMessage(msg_id) => {
             state.context_menu_msg = None;
             state.context_menu_pos = None;
@@ -1204,7 +1326,10 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                     .bearer_auth(&token).send().await;
                 match resp {
                     Ok(r) if r.status().is_success() => Ok(msg_id),
-                    Ok(r) => Err(format!("delete failed: {}", r.status())),
+                    Ok(r) => {
+                        auth_aware_error(&r)?;
+                        Err(format!("delete failed: {}", r.status()))
+                    }
                     Err(e) => Err(format!("{e}")),
                 }
             }, |r| match r { Ok(id) => Msg::DeleteResult(id), Err(e) => Msg::Error(e) })
@@ -1285,12 +1410,39 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                         serde_json::from_value::<Profile>(v.get("user").cloned().unwrap_or_default())
                             .map_err(|_| String::from("parse error"))
                     }
-                    _ => Err(String::from("failed")),
+                    Ok(r) => {
+                        auth_aware_error(&r)?;
+                        Err(String::from("failed"))
+                    }
+                    Err(e) => Err(format!("{e}")),
                 }
             }, |r: Result<Profile, String>| match r { Ok(p) => Msg::ProfileLoaded(p), Err(e) => Msg::Error(e) })
         }
         Msg::ProfileLoaded(p) => { state.profile = Some(p); state.profile_open = true; ensure_avatars(state) }
         Msg::CloseProfile => { state.profile_open = false; Task::none() }
+        Msg::ToggleBlock(user_id) => {
+            let token = state.token.clone().unwrap_or_default();
+            let server = state.server.clone();
+            let currently_blocked = state.profile.as_ref().map(|p| p.blocked).unwrap_or(false);
+            Task::perform(
+                moderation_action(server, token, user_id, if currently_blocked { "unblock" } else { "block" }),
+                Msg::ModerationResult,
+            )
+        }
+        Msg::ToggleMute(user_id) => {
+            let token = state.token.clone().unwrap_or_default();
+            let server = state.server.clone();
+            let currently_muted = state.profile.as_ref().map(|p| p.muted).unwrap_or(false);
+            Task::perform(
+                moderation_action(server, token, user_id, if currently_muted { "unmute" } else { "mute" }),
+                Msg::ModerationResult,
+            )
+        }
+        Msg::ModerationResult(Ok(p)) => {
+            state.profile = Some(p);
+            ensure_avatars(state)
+        }
+        Msg::ModerationResult(Err(e)) => handle_api_error(state, e),
         Msg::DisplayNameChanged(s) => { state.display_name_input = s; Task::none() }
         Msg::SaveSettings => {
             let token = state.token.clone().unwrap_or_default();
@@ -1308,7 +1460,10 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                         serde_json::from_value::<User>(v.get("user").cloned().unwrap_or_default())
                             .map_err(|_| String::from("parse error"))
                     }
-                    Ok(r) => Err(format!("update failed: {}", r.status())),
+                    Ok(r) => {
+                        auth_aware_error(&r)?;
+                        Err(format!("update failed: {}", r.status()))
+                    }
                     Err(e) => Err(format!("{e}")),
                 }
             }, Msg::SettingsResult)
@@ -1318,7 +1473,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             state.settings_open = false;
             ensure_avatars(state)
         }
-        Msg::SettingsResult(Err(e)) => { state.error = e; Task::none() }
+        Msg::SettingsResult(Err(e)) => handle_api_error(state, e),
         Msg::PickAvatar => {
             Task::perform(
                 async {
@@ -1334,19 +1489,21 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             )
         }
         Msg::AvatarChosen(Ok(bytes)) => {
+            state.avatar_busy = true;
             let token = state.token.clone().unwrap_or_default();
             let server = state.server.clone();
             Task::perform(upload_avatar(server, token, bytes), Msg::AvatarSaved)
         }
         Msg::AvatarChosen(Err(e)) => { state.error = format!("avatar: {e}"); Task::none() }
         Msg::AvatarSaved(Ok(u)) => {
+            state.avatar_busy = false;
             state.avatar_handles.remove(&u.id);
             state.avatar_attempted.remove(&u.id);
             state.user = Some(u);
             state.info = "Profile picture updated".to_string();
             ensure_avatars(state)
         }
-        Msg::AvatarSaved(Err(e)) => { state.error = format!("avatar upload failed: {e}"); Task::none() }
+        Msg::AvatarSaved(Err(e)) => { state.avatar_busy = false; handle_api_error(state, format!("avatar upload failed: {e}")) }
         Msg::RemoveAvatar => {
             let token = state.token.clone().unwrap_or_default();
             let server = state.server.clone();
@@ -1365,7 +1522,10 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                             serde_json::from_value::<User>(v.get("user").cloned().unwrap_or_default())
                                 .map_err(|_| String::from("parse error"))
                         }
-                        Ok(r) => Err(format!("update failed: {}", r.status())),
+                        Ok(r) => {
+                            auth_aware_error(&r)?;
+                            Err(format!("update failed: {}", r.status()))
+                        }
                         Err(e) => Err(format!("{e}")),
                     }
                 },
@@ -1516,7 +1676,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             Task::none()
         }
         Msg::ToggleSettings => { state.settings_open = !state.settings_open; Task::none() }
-        Msg::Error(e) => { state.error = e; Task::none() }
+        Msg::Error(e) => handle_api_error(state, e),
         Msg::Info(i) => { state.info = i; Task::none() }
         Msg::RefreshConversations => {
             let token = state.token.clone().unwrap_or_default();
@@ -1549,7 +1709,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                 Ok(c) => {
                     let _ = Msg::Info(String::new());
                     let _ = c.id;
-                    Msg::ConversationsLoaded(vec![]) // placeholder - will reload
+                    Msg::ConversationsLoaded(Ok(vec![])) // placeholder - will reload
                 }
                 Err(e) => Msg::Error(e),
             })
@@ -1605,7 +1765,10 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                     .send().await;
                 match resp {
                     Ok(r) if r.status().is_success() => Ok(()),
-                    Ok(r) => Err(format!("delete failed: {}", r.status())),
+                    Ok(r) => {
+                        auth_aware_error(&r)?;
+                        Err(format!("delete failed: {}", r.status()))
+                    }
                     Err(e) => Err(format!("{e}")),
                 }
             }, Msg::DeleteConversationResult)
@@ -1623,7 +1786,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             let server = state.server.clone();
             Task::perform(load_conversations(server, token), Msg::ConversationsLoaded)
         }
-        Msg::DeleteConversationResult(Err(e)) => { state.error = e; state.conv_menu_conv = None; Task::none() }
+        Msg::DeleteConversationResult(Err(e)) => { state.conv_menu_conv = None; handle_api_error(state, e) }
         Msg::Resized(size) => {
             state.window_size = size;
             Task::none()
@@ -1700,9 +1863,8 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                     state.new_conv_results = users;
                     return ensure_avatars(state);
                 }
-                Err(e) => state.error = e,
+                Err(e) => return handle_api_error(state, e),
             }
-            Task::none()
         }
         Msg::NewConvToggleUser(id) => {
             if state.new_conv_selected.contains(&id) {
@@ -1746,10 +1908,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                     let server = state.server.clone();
                     Task::perform(load_conversations(server, token), Msg::ConversationsLoaded)
                 }
-                Err(e) => {
-                    state.error = e;
-                    Task::none()
-                }
+                Err(e) => return handle_api_error(state, e),
             }
         }
         Msg::OpenLink(url) => {
@@ -1778,6 +1937,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             if state.link_previews.contains_key(&url) {
                 return Task::none();
             }
+            state.preview_loading.insert(url.clone());
             Task::perform(
                 fetch_link_preview(url.clone()),
                 move |preview| Msg::LinkPreviewLoaded { url: url.clone(), preview },
@@ -1785,14 +1945,15 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
         }
         Msg::LinkPreviewLoaded { url, preview } => {
             if let Some(mut p) = preview {
-                if let Some(ref image_uri) = p.image {
-                    let b64 = image_uri.rsplit(',').next().unwrap_or(image_uri.as_str());
+                for data_uri in &p.images {
+                    let b64 = data_uri.rsplit(',').next().unwrap_or(data_uri.as_str());
                     if let Ok(bytes) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64) {
-                        p.image_handle = Some(iced::widget::image::Handle::from_bytes(bytes));
+                        p.image_handles.push(iced::widget::image::Handle::from_bytes(bytes));
                     }
                 }
-                state.link_previews.insert(url, p);
+                state.link_previews.insert(url.clone(), p);
             }
+            state.preview_loading.remove(&url);
             Task::none()
         }
         Msg::Logout => {
@@ -1808,7 +1969,34 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             state.p2p_status.clear();
             state.ws_tx = None;
             state.p2p = None;
+            state.busy = false;
+            state.loading_messages = false;
+            state.auth_busy = false;
+            state.avatar_busy = false;
+            state.preview_loading.clear();
             let _ = std::fs::remove_file(dirs_next::home_dir().unwrap_or_default().join(".feditexter_session"));
+            Task::none()
+        }
+        Msg::SessionExpired(reason) => {
+            state.token = None;
+            state.user = None;
+            state.screen = Screen::Login;
+            state.conversations.clear();
+            state.messages.clear();
+            state.selected_conversation = None;
+            state.pending_attachment = None;
+            state.own_files.clear();
+            state.own_full_handles.clear();
+            state.p2p_status.clear();
+            state.ws_tx = None;
+            state.p2p = None;
+            state.busy = false;
+            state.loading_messages = false;
+            state.auth_busy = false;
+            state.avatar_busy = false;
+            state.preview_loading.clear();
+            let _ = std::fs::remove_file(dirs_next::home_dir().unwrap_or_default().join(".feditexter_session"));
+            state.error = reason;
             Task::none()
         }
         Msg::Noop => Task::none(),
@@ -1818,17 +2006,18 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
     }
 }
 
-async fn load_conversations(server: String, token: String) -> Vec<Conversation> {
+async fn load_conversations(server: String, token: String) -> Result<Vec<Conversation>, String> {
     let client = make_client();
     let resp = client.get(format!("{server}/api/conversations"))
         .bearer_auth(&token).send().await;
     match resp {
-        Ok(r) if r.status().is_success() => {
+        Ok(r) => {
+            auth_aware_error(&r)?;
             let v: serde_json::Value = r.json().await.unwrap_or_default();
-            serde_json::from_value(v.get("conversations").cloned().unwrap_or_default())
-                .unwrap_or_default()
+            Ok(serde_json::from_value(v.get("conversations").cloned().unwrap_or_default())
+                .unwrap_or_default())
         }
-        _ => Vec::new(),
+        Err(e) => Err(format!("{e}")),
     }
 }
 
@@ -1837,12 +2026,12 @@ async fn search_users_api(server: String, token: String, q: String) -> Result<Ve
     let url = format!("{server}/api/users/search?q={}", url::form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>());
     let resp = client.get(&url).bearer_auth(&token).send().await;
     match resp {
-        Ok(r) if r.status().is_success() => {
+        Ok(r) => {
+            auth_aware_error(&r)?;
             let v: serde_json::Value = r.json().await.unwrap_or_default();
             serde_json::from_value(v.get("users").cloned().unwrap_or_default())
                 .map_err(|e| format!("parse error: {e}"))
         }
-        Ok(r) => Err(format!("search failed: {}", r.status())),
         Err(e) => Err(format!("{e}")),
     }
 }
@@ -1866,6 +2055,7 @@ async fn create_conversation_api(
             serde_json::from_value(v).map_err(|e| format!("parse error: {e}"))
         }
         Ok(r) => {
+            auth_aware_error(&r)?;
             let body = r.text().await.unwrap_or_default();
             Err(format!("create failed: {body}"))
         }
@@ -1873,17 +2063,18 @@ async fn create_conversation_api(
     }
 }
 
-async fn load_messages(server: &str, token: &str, conv_id: u64) -> Vec<ApiMsg> {
+async fn load_messages(server: &str, token: &str, conv_id: u64) -> Result<Vec<ApiMsg>, String> {
     let client = make_client();
     let resp = client.get(format!("{server}/api/conversations/{conv_id}/messages"))
         .bearer_auth(token).send().await;
     match resp {
-        Ok(r) if r.status().is_success() => {
+        Ok(r) => {
+            auth_aware_error(&r)?;
             let v: serde_json::Value = r.json().await.unwrap_or_default();
-            serde_json::from_value(v.get("messages").cloned().unwrap_or_default())
-                .unwrap_or_default()
+            Ok(serde_json::from_value(v.get("messages").cloned().unwrap_or_default())
+                .unwrap_or_default())
         }
-        _ => Vec::new(),
+        Err(e) => Err(format!("{e}")),
     }
 }
 
@@ -2008,6 +2199,17 @@ fn avatar_element<'a>(state: &'a AppState, user_id: u64, fallback_name: &str, si
         avatar_circle_sized(user_initials(fallback_name), name_hue(fallback_name), state.zoom, size)
     }
 }
+
+/// An indeterminate loading spinner. Uses iced_aw's self-animating spinner so
+/// no extra timer subscription is needed.
+fn throbber(size: f32) -> Element<'static, Msg> {
+    iced_aw::Spinner::new()
+        .width(size)
+        .height(size)
+        .circle_radius((size / 8.0).max(1.0))
+        .into()
+}
+
 
 fn data_url_bytes(url: &str) -> Option<Vec<u8>> {
     let b64 = url.split_once(";base64,")?.1;
@@ -2272,6 +2474,24 @@ fn avatar_data_url(bytes: Vec<u8>) -> Result<String, String> {
     Ok(format!("data:image/png;base64,{b64}"))
 }
 
+async fn moderation_action(server: String, token: String, user_id: u64, action: &str) -> Result<Profile, String> {
+    let client = make_client();
+    let resp = client
+        .post(format!("{server}/api/users/{user_id}/{action}"))
+        .bearer_auth(&token)
+        .send()
+        .await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            let v: serde_json::Value = r.json().await.unwrap_or_default();
+            serde_json::from_value::<Profile>(v.get("user").cloned().unwrap_or_default())
+                .map_err(|e| format!("parse error: {e}"))
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
 async fn upload_avatar(server: String, token: String, bytes: Vec<u8>) -> Result<User, String> {
     let data_url = avatar_data_url(bytes)?;
     let client = make_client();
@@ -2287,7 +2507,10 @@ async fn upload_avatar(server: String, token: String, bytes: Vec<u8>) -> Result<
             serde_json::from_value::<User>(v.get("user").cloned().unwrap_or_default())
                 .map_err(|_| String::from("parse error"))
         }
-        Ok(r) => Err(format!("update failed: {}", r.status())),
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            Err(format!("update failed: {}", r.status()))
+        }
         Err(e) => Err(format!("{e}")),
     }
 }
@@ -2446,7 +2669,8 @@ fn preview_url_encode(s: &str) -> String {
 }
 
 /// Fetch media + metadata for a Bluesky/fxbsky post via the public API.
-async fn preview_bsky_post(client: &reqwest::Client, url: &str) -> Option<(Option<String>, Option<String>, Option<String>)> {
+/// Returns (title, description, Vec<image urls>).
+async fn preview_bsky_post(client: &reqwest::Client, url: &str) -> Option<(Option<String>, Option<String>, Vec<String>)> {
     let (handle, rkey) = preview_parse_bsky_url(url)?;
     let uri = format!("at://{handle}/app.bsky.feed.post/{rkey}");
     let api = format!(
@@ -2478,20 +2702,23 @@ async fn preview_bsky_post(client: &reqwest::Client, url: &str) -> Option<(Optio
     };
 
     let embed = thread.get("embed")?;
-    let img = if let Some(images) = embed.get("images") {
-        images.get(0)?.get("fullsize")?.as_str().map(str::to_string)
+    let imgs: Vec<String> = if let Some(images) = embed.get("images").and_then(|x| x.as_array()) {
+        images
+            .iter()
+            .filter_map(|i| i.get("fullsize").and_then(|f| f.as_str()).map(str::to_string))
+            .collect()
     } else if let Some(external) = embed.get("external") {
-        external.get("thumb")?.as_str().map(str::to_string)
+        external.get("thumb").and_then(|t| t.as_str()).map(str::to_string).into_iter().collect()
     } else if let Some(video) = embed.get("video") {
-        video.get("thumbnail")?.as_str().map(str::to_string)
+        video.get("thumbnail").and_then(|t| t.as_str()).map(str::to_string).into_iter().collect()
     } else if let Some(media) = embed.get("media") {
-        media.get("thumbnail")?.as_str().map(str::to_string)
+        media.get("thumbnail").and_then(|t| t.as_str()).map(str::to_string).into_iter().collect()
     } else {
-        None
+        Vec::new()
     };
-    let img = img.filter(|i| !preview_looks_private(i));
+    let imgs: Vec<String> = imgs.into_iter().filter(|i| !preview_looks_private(i)).collect();
 
-    Some((Some(title), None, img))
+    Some((Some(title), None, imgs))
 }
 
 /// Download an image, resize to max dimension, return a JPEG data URI.
@@ -2523,7 +2750,7 @@ async fn fetch_link_preview(url: String) -> Option<LinkPreview> {
     let client = preview_http_client();
     let mut title = None;
     let mut description = None;
-    let mut image_url = None;
+    let mut image_urls: Vec<String> = Vec::new();
 
     // Non-Bluesky links: fetch + parse HTML meta tags.
     if preview_parse_bsky_url(&url).is_none() {
@@ -2534,28 +2761,33 @@ async fn fetch_link_preview(url: String) -> Option<LinkPreview> {
                     let (t, d, i) = preview_parse_meta(&url, &html);
                     title = t;
                     description = d;
-                    image_url = i;
+                    if let Some(i) = i {
+                        image_urls.push(i);
+                    }
                 }
             }
         }
     }
 
     // Bluesky/fxbsky: the page is JS-rendered; use the public API.
-    if title.is_none() && image_url.is_none() {
-        if let Some((t, d, i)) = preview_bsky_post(&client, &url).await {
+    if title.is_none() && image_urls.is_empty() {
+        if let Some((t, d, mut imgs)) = preview_bsky_post(&client, &url).await {
             title = title.or(t);
             description = description.or(d);
-            image_url = image_url.or(i);
+            if !imgs.is_empty() {
+                image_urls.append(&mut imgs);
+            }
         }
     }
 
-    let image = if let Some(ref img) = image_url {
-        preview_fetch_image(&client, img).await
-    } else {
-        None
-    };
+    let mut images = Vec::new();
+    for img in image_urls {
+        if let Some(data) = preview_fetch_image(&client, &img).await {
+            images.push(data);
+        }
+    }
 
-    Some(LinkPreview { url, title, description, image, image_handle: None })
+    Some(LinkPreview { url, title, description, images, image_handles: Vec::new() })
 }
 
 // ---------------------------------------------------------------------------
@@ -2594,10 +2826,23 @@ fn view_auth(state: &AppState) -> Element<'_, Msg> {
         .secure(true)
         .width(Length::Fixed(state.z(320.0)));
 
-    let login_btn = if is_register {
-        button("Create account").on_press(Msg::RegisterSubmit).width(Length::Fixed(state.z(320.0)))
+    let login_btn: Element<'_, Msg> = if state.auth_busy {
+        button(throbber(state.zs(16))).width(Length::Fixed(state.z(320.0))).into()
+    } else if is_register {
+        button("Create account").on_press(Msg::RegisterSubmit).width(Length::Fixed(state.z(320.0))).into()
     } else {
-        button("Sign in").on_press(Msg::LoginSubmit).width(Length::Fixed(state.z(320.0)))
+        button("Sign in").on_press(Msg::LoginSubmit).width(Length::Fixed(state.z(320.0))).into()
+    };
+
+    let remember_row: Option<Element<'_, Msg>> = if is_register {
+        None
+    } else {
+        Some(
+            iced::widget::checkbox(state.remember_me)
+                .label("Remember me on this device")
+                .on_toggle(Msg::RememberMeChanged)
+                .into(),
+        )
     };
 
     let toggle = if is_register {
@@ -2608,9 +2853,14 @@ fn view_auth(state: &AppState) -> Element<'_, Msg> {
             .on_press(Msg::ShowRegister(true))
     };
 
-    let mut form = column![logo, subtitle, server, email, password, login_btn, toggle]
+    let mut form = column![logo, subtitle, server, email, password]
         .spacing(state.z(14))
         .align_x(iced::Alignment::Center);
+    if let Some(remember) = remember_row {
+        form = form.push(remember);
+    }
+    form = form.push(login_btn);
+    form = form.push(toggle);
 
     if !state.error.is_empty() {
         form = form.push(
@@ -2642,7 +2892,11 @@ fn view_verify(state: &AppState) -> Element<'_, Msg> {
         .on_input(Msg::VerifyCodeChanged)
         .on_submit(Msg::VerifySubmit)
         .width(Length::Fixed(state.z(320.0)));
-    let verify_btn = button("Verify").on_press(Msg::VerifySubmit).width(Length::Fixed(state.z(320.0)));
+    let verify_btn: Element<'_, Msg> = if state.auth_busy {
+        button(throbber(state.zs(16))).width(Length::Fixed(state.z(320.0))).into()
+    } else {
+        button("Verify").on_press(Msg::VerifySubmit).width(Length::Fixed(state.z(320.0))).into()
+    };
     let mut form = column![title, desc, code_input, verify_btn].spacing(state.z(14)).align_x(iced::Alignment::Center);
     if !state.error.is_empty() {
         form = form.push(text(&state.error).color(iced::Color::from_rgb(0.9, 0.3, 0.2)));
@@ -2658,7 +2912,11 @@ fn view_2fa(state: &AppState) -> Element<'_, Msg> {
         .on_input(Msg::TwoFaCodeChanged)
         .on_submit(Msg::TwoFaSubmit)
         .width(Length::Fixed(state.z(320.0)));
-    let submit_btn = button("Verify").on_press(Msg::TwoFaSubmit).width(Length::Fixed(state.z(320.0)));
+    let submit_btn: Element<'_, Msg> = if state.auth_busy {
+        button(throbber(state.zs(16))).width(Length::Fixed(state.z(320.0))).into()
+    } else {
+        button("Verify").on_press(Msg::TwoFaSubmit).width(Length::Fixed(state.z(320.0))).into()
+    };
     let mut form = column![title, desc, code_input, submit_btn].spacing(state.z(14)).align_x(iced::Alignment::Center);
     if !state.error.is_empty() {
         form = form.push(text(&state.error).color(iced::Color::from_rgb(0.9, 0.3, 0.2)));
@@ -2746,6 +3004,26 @@ fn view_chat(state: &AppState) -> Element<'_, Msg> {
             }
             if profile.muted {
                 info = info.push(text("Muted").size(state.zs(12)).color(iced::Color::from_rgb(0.9, 0.7, 0.2)));
+            }
+
+            if !profile.is_self && !profile.blocked_by {
+                let block_btn = button(
+                    text(if profile.blocked { "Unblock" } else { "Block" }).size(state.zs(13))
+                )
+                .on_press(Msg::ToggleBlock(profile.id))
+                .style(if profile.blocked { button::primary } else { danger_text_button })
+                .padding([state.z(6.0), state.z(16.0)]);
+
+                let mute_btn = button(
+                    text(if profile.muted { "Unmute" } else { "Mute" }).size(state.zs(13))
+                )
+                .on_press(Msg::ToggleMute(profile.id))
+                .padding([state.z(6.0), state.z(16.0)]);
+
+                let mod_row = row![block_btn, mute_btn]
+                    .spacing(state.z(8))
+                    .align_y(iced::Alignment::Center);
+                info = info.push(mod_row);
             }
 
             info = info.push(close_btn);
@@ -3014,7 +3292,7 @@ fn view_new_conv(state: &AppState) -> Element<'_, Msg> {
         NewConvKind::Channel => "Create channel",
     };
     let create_btn: Element<'_, Msg> = if state.new_conv_busy {
-        button("Creating…").width(Length::Fill).into()
+        button(row![throbber(state.zs(14)), text("Creating…").size(state.zs(13))].spacing(state.z(8))).width(Length::Fill).into()
     } else if valid {
         button(create_label).on_press(Msg::NewConvCreate).width(Length::Fill).style(button::primary).into()
     } else {
@@ -3135,9 +3413,16 @@ fn view_settings(state: &AppState) -> Element<'_, Msg> {
         None => avatar_circle_sized(user_initials("?"), 0.0, state.zoom, 64.0),
     };
 
-    let choose_btn = button(text("Choose image…").size(state.zs(13)))
-        .on_press(Msg::PickAvatar)
-        .padding([state.z(6.0), state.z(14.0)]);
+    let choose_btn: Element<'_, Msg> = if state.avatar_busy {
+        button(throbber(state.zs(13)))
+            .padding([state.z(6.0), state.z(14.0)])
+            .into()
+    } else {
+        button(text("Choose image…").size(state.zs(13)))
+            .on_press(Msg::PickAvatar)
+            .padding([state.z(6.0), state.z(14.0)])
+            .into()
+    };
 
     let remove_btn = button(text("Remove").size(state.zs(13)))
         .on_press(Msg::RemoveAvatar)
@@ -3463,14 +3748,39 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
         }
 
         for url in extract_urls(&m.body) {
+            if state.preview_loading.contains(&url) {
+                let loading_card = container(
+                    row![throbber(state.z(16)), text("Loading preview…").size(state.zs(11)).color(iced::Color::from_rgb(0.5, 0.5, 0.5))]
+                        .spacing(state.z(8))
+                        .align_y(iced::Alignment::Center)
+                )
+                .padding(state.z(8))
+                .max_width(state.z(380))
+                .style(|theme: &iced::Theme| {
+                    let p = theme.extended_palette();
+                    iced::widget::container::Style {
+                        background: Some(p.background.weak.color.into()),
+                        border: iced::Border {
+                            width: 1.0,
+                            color: p.background.weak.color,
+                            radius: 8.0.into(),
+                        },
+                        ..iced::widget::container::Style::default()
+                    }
+                });
+                bubble_content = bubble_content.push(loading_card);
+                continue;
+            }
             if let Some(preview) = state.link_previews.get(&url) {
                 let mut card_content = column![].spacing(state.z(4));
-                if let Some(ref handle) = preview.image_handle {
-                    card_content = card_content.push(
+                if !preview.image_handles.is_empty() {
+                    let imgs: Vec<Element<'_, Msg>> = preview.image_handles.iter().map(|handle| {
                         iced::widget::Image::new(handle.clone())
                             .width(Length::Fill)
                             .height(Length::Shrink)
-                    );
+                            .into()
+                    }).collect();
+                    card_content = card_content.push(column(imgs).spacing(state.z(4)));
                 }
                 if let Some(ref title) = preview.title {
                     if !title.is_empty() {
@@ -3634,9 +3944,20 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
         msg_row.into()
     }).collect();
 
+    let loading_indicator: Element<'_, Msg> = if state.loading_messages {
+        container(row![throbber(state.z(18)), text("Loading…").size(state.zs(12)).color(iced::Color::from_rgb(0.5, 0.5, 0.5))]
+            .spacing(state.z(8)).align_y(iced::Alignment::Center))
+        .center_x(Length::Fill)
+        .padding(state.z(12))
+        .into()
+    } else {
+        space::horizontal().into()
+    };
+
     let messages_scroll = scrollable(
         column![
             space::vertical().height(Length::Fixed(state.z(8.0))),
+            loading_indicator,
             column(msg_elements).spacing(state.z(4)),
             space::vertical().height(Length::Fixed(state.z(8.0))),
         ].width(Length::Fill)
@@ -3682,10 +4003,15 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
         let attach_btn = button(text("📎").size(state.zs(16)))
             .on_press(Msg::PickFile)
             .padding([state.z(8.0), state.z(10.0)]);
-        let send_btn = button(text("↑").size(state.zs(16)))
-            .on_press(Msg::SendMessage)
-            .style(button::primary)
-            .padding([state.z(8.0), state.z(12.0)]);
+        let send_btn: Element<'_, Msg> = if state.busy {
+            button(throbber(state.zs(16))).padding([state.z(8.0), state.z(12.0)]).into()
+        } else {
+            button(text("↑").size(state.zs(16)))
+                .on_press(Msg::SendMessage)
+                .style(button::primary)
+                .padding([state.z(8.0), state.z(12.0)])
+                .into()
+        };
         let pending_chip: Option<Element<'_, Msg>> = state.pending_attachment.as_ref().map(|att| {
             let thumb = if !att.thumbnail.is_empty() {
                 state.thumb_handles.get(&att.file_id).cloned()

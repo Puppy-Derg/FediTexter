@@ -184,7 +184,9 @@ pub(crate) fn client_ip(
 
 /// Reject requests whose device UUID or client IP no longer matches the one the
 /// session was created with, so a stolen token can't be replayed elsewhere.
-/// Legacy sessions (columns NULL) are bound on first use to upgrade them.
+/// A device mismatch is treated as theft: the session is revoked outright so
+/// neither the thief nor the original client can keep using it. Legacy sessions
+/// (columns NULL) are bound on first use to upgrade them.
 async fn enforce_session_binding(
     state: &AppState,
     parts: &Parts,
@@ -193,7 +195,16 @@ async fn enforce_session_binding(
     let presented = request_device_id(parts);
     match (&session.device_id, &presented) {
         (Some(expected), Some(actual)) if expected == actual => {}
-        (Some(_), _) => return Err(ApiError::Unauthorized("session is bound to another device")),
+        (Some(_), _) => {
+            // The token is being used from a device it was never issued to (or
+            // with no device header at all) — revoke the session so the token
+            // can't be replayed anywhere else.
+            let _ = sqlx::query("DELETE FROM sessions WHERE id = ?")
+                .bind(session.id)
+                .execute(&state.pool)
+                .await;
+            return Err(ApiError::Unauthorized("session invalidated: token was used from another device"));
+        }
         (None, Some(actual)) => {
             sqlx::query("UPDATE sessions SET device_id = ? WHERE id = ?")
                 .bind(actual)

@@ -27,3 +27,4 @@ sha1 = "0.10"
 dirs-next = "2"
 infer = "0.16"
 open = "5"
+iced_aw = { version = "0.14.1", default-features = false, features = ["spinner"] }
