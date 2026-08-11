@@ -1,5 +1,6 @@
-use feditexter_server::{build_app, db::AppState, federation::Federation};
+use feditexter_server::{bot, build_app, db::AppState, federation::Federation};
 use std::env;
+use std::sync::Arc;
 use sqlx::MySqlPool;
 use tracing::info;
 
@@ -31,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let federation = Federation::init(&pool, &public_domain).await?;
     info!("federation identity: {} key {}", public_domain, federation.public_key_hex());
 
-    let app = build_app(AppState {
+    let state = AppState {
         pool,
         hub: Default::default(),
         federation,
@@ -42,7 +43,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build()
             .expect("failed to build http client"),
         presence: Default::default(),
-    });
+    };
+
+    // Clone the state for axum; keep an Arc for the background bot task.
+    let shared = Arc::new(state);
+    tokio::spawn(bot::bot_loop(Arc::clone(&shared)));
+    let app = build_app(shared.as_ref().clone());
 
     let addr = format!("{bind_addr}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;

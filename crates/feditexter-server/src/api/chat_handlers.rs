@@ -128,8 +128,8 @@ async fn conversation_json(state: &AppState, conversation_id: u64) -> Result<Val
         .await
         .map_err(|_| ApiError::Internal("db error"))?;
 
-    let members: Vec<(u64, String, String, u64, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT m.user_id, u.username, u.display_name, u.server_id, s.domain, u.avatar_url
+    let members: Vec<(u64, String, String, u64, Option<String>, Option<String>, bool)> = sqlx::query_as(
+        "SELECT m.user_id, u.username, u.display_name, u.server_id, s.domain, u.avatar_url, u.is_bot
          FROM conversation_members m
          JOIN users u ON u.id = m.user_id
          LEFT JOIN servers s ON s.id = u.server_id
@@ -146,9 +146,9 @@ async fn conversation_json(state: &AppState, conversation_id: u64) -> Result<Val
         "kind": kind,
         "members": members
             .iter()
-            .map(|(id, username, display_name, _server_id, domain, avatar_url)| {
+            .map(|(id, username, display_name, _server_id, domain, avatar_url, is_bot)| {
                 let domain = domain.clone().unwrap_or_else(|| state.federation.domain.clone());
-                json!({ "id": id, "username": username, "display_name": display_name, "domain": domain, "avatar_url": avatar_url })
+                json!({ "id": id, "username": username, "display_name": display_name, "domain": domain, "avatar_url": avatar_url, "is_bot": is_bot })
             })
             .collect::<Vec<_>>(),
     }))
@@ -577,9 +577,9 @@ pub async fn search_users(
     let q = params.q.unwrap_or_default().trim().to_string();
     let domain = state.federation.domain.clone();
 
-    let users: Vec<(u64, String, String, Option<String>)> = if q.is_empty() {
+    let users: Vec<(u64, String, String, Option<String>, Option<String>, bool)> = if q.is_empty() {
         sqlx::query_as(
-            "SELECT u.id, u.username, u.display_name, s.domain
+            "SELECT u.id, u.username, u.display_name, s.domain, u.avatar_url, u.is_bot
              FROM users u
              LEFT JOIN servers s ON s.id = u.server_id
              WHERE u.id != ?
@@ -593,7 +593,7 @@ pub async fn search_users(
     } else {
         let like = format!("%{q}%");
         sqlx::query_as(
-            "SELECT u.id, u.username, u.display_name, s.domain
+            "SELECT u.id, u.username, u.display_name, s.domain, u.avatar_url, u.is_bot
              FROM users u
              LEFT JOIN servers s ON s.id = u.server_id
              WHERE u.id != ?
@@ -612,12 +612,14 @@ pub async fn search_users(
     Ok(Json(json!({
         "users": users
             .iter()
-            .map(|(id, username, display_name, d)| {
+            .map(|(id, username, display_name, d, avatar_url, is_bot)| {
                 json!({
                     "id": id,
                     "username": username,
                     "display_name": display_name,
                     "domain": d.clone().unwrap_or_else(|| domain.clone()),
+                    "avatar_url": avatar_url,
+                    "is_bot": is_bot,
                 })
             })
             .collect::<Vec<_>>(),

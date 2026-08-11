@@ -80,6 +80,7 @@ pub async fn register(
         email_verified,
         avatar_url: None,
         totp_enabled: false,
+        is_bot: false,
     };
 
     let device_id = headers.get("x-device-id").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
@@ -115,8 +116,8 @@ pub async fn login(
     headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let row: Option<(u64, String, String, String, String, bool, Option<String>, bool)> = sqlx::query_as(
-        "SELECT id, email, username, display_name, password_hash, email_verified, avatar_url, totp_enabled
+    let row: Option<(u64, String, String, String, String, bool, Option<String>, bool, bool)> = sqlx::query_as(
+        "SELECT id, email, username, display_name, password_hash, email_verified, avatar_url, totp_enabled, is_bot
          FROM users WHERE email = ?",
     )
     .bind(&body.email)
@@ -124,7 +125,7 @@ pub async fn login(
     .await
     .map_err(|_| ApiError::Internal("db error"))?;
 
-    let (id, email, username, display_name, password_hash, email_verified, avatar_url, totp_enabled) = match row {
+    let (id, email, username, display_name, password_hash, email_verified, avatar_url, totp_enabled, is_bot) = match row {
         Some(r) => r,
         None => {
             verify_password(&body.password, DUMMY_PASSWORD_HASH);
@@ -136,7 +137,7 @@ pub async fn login(
         return Err(ApiError::Unauthorized("invalid credentials"));
     }
 
-    let user = User { id, email, username, display_name, email_verified, avatar_url, totp_enabled };
+    let user = User { id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot };
     let device_id = headers.get("x-device-id").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let login_ip = crate::auth::client_ip(&headers, None);
 
@@ -207,7 +208,7 @@ pub async fn login_2fa(
         .map_err(|_| ApiError::Internal("db error"))?;
 
     let user: User = sqlx::query_as(
-        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled FROM users WHERE id = ?",
+        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot FROM users WHERE id = ?",
     )
     .bind(user_id)
     .fetch_one(&state.pool)
@@ -274,7 +275,7 @@ pub async fn two_fa_enable(
     }
 
     let user: User = sqlx::query_as(
-        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled FROM users WHERE id = ?",
+        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot FROM users WHERE id = ?",
     )
     .bind(auth.user.id)
     .fetch_one(&state.pool)
@@ -308,7 +309,7 @@ pub async fn two_fa_disable(
     }
 
     let user: User = sqlx::query_as(
-        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled FROM users WHERE id = ?",
+        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot FROM users WHERE id = ?",
     )
     .bind(auth.user.id)
     .fetch_one(&state.pool)
@@ -381,7 +382,7 @@ pub async fn update_me(
         .map_err(|_| ApiError::Internal("db error"))?;
 
     let user: User = sqlx::query_as(
-        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled FROM users WHERE id = ?",
+        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot FROM users WHERE id = ?",
     )
     .bind(auth.user.id)
     .fetch_one(&state.pool)
@@ -420,7 +421,7 @@ pub async fn verify(
     }
 
     let user: User = sqlx::query_as(
-        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled FROM users WHERE id = ?",
+        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot FROM users WHERE id = ?",
     )
     .bind(auth.user.id)
     .fetch_one(&state.pool)
@@ -462,7 +463,7 @@ pub async fn resend_verification(
     }
 
     let user: User = sqlx::query_as(
-        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled FROM users WHERE id = ?",
+        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot FROM users WHERE id = ?",
     )
     .bind(auth.user.id)
     .fetch_one(&state.pool)
@@ -508,7 +509,7 @@ pub async fn set_avatar(
         .map_err(|_| ApiError::Internal("db error"))?;
 
     let user: User = sqlx::query_as(
-        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled FROM users WHERE id = ?",
+        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot FROM users WHERE id = ?",
     )
     .bind(auth.user.id)
     .fetch_one(&state.pool)

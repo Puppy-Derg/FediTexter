@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use iced::widget::{button, column, container, mouse_area, row, rule, scrollable, space, text, text_input};
@@ -26,6 +26,8 @@ struct User {
     avatar_url: Option<String>,
     #[serde(default)]
     totp_enabled: bool,
+    #[serde(default)]
+    is_bot: bool,
 }
 fn default_true() -> bool { true }
 
@@ -40,6 +42,8 @@ struct Member {
     domain: String,
     #[serde(default)]
     avatar_url: Option<String>,
+    #[serde(default)]
+    is_bot: bool,
 }
 
 #[derive(serde::Deserialize, Clone, Debug)]
@@ -57,6 +61,10 @@ struct SearchUser {
     display_name: String,
     #[serde(default)]
     domain: String,
+    #[serde(default)]
+    avatar_url: Option<String>,
+    #[serde(default)]
+    is_bot: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +139,8 @@ struct Profile {
     avatar_url: Option<String>,
     #[serde(default)]
     is_self: bool,
+    #[serde(default)]
+    is_bot: bool,
     #[serde(default)]
     blocked: bool,
     #[serde(default)]
@@ -229,6 +239,11 @@ enum Msg {
     SaveSettings,
     SettingsResult(Result<User, String>),
     ToggleSettings,
+    PickAvatar,
+    AvatarChosen(Result<Vec<u8>, String>),
+    AvatarSaved(Result<User, String>),
+    RemoveAvatar,
+    AvatarFetched { user_id: u64, result: Result<Vec<u8>, String> },
     Error(String),
     Info(String),
     RefreshConversations,
@@ -325,6 +340,8 @@ struct AppState {
     new_conv_selected: Vec<u64>,
     new_conv_busy: bool,
     zoom: f32,
+    avatar_handles: HashMap<u64, iced::widget::image::Handle>,
+    avatar_attempted: HashSet<u64>,
 }
 
 impl Default for AppState {
@@ -375,6 +392,8 @@ impl Default for AppState {
             new_conv_selected: Vec::new(),
             new_conv_busy: false,
             zoom: 1.0,
+            avatar_handles: HashMap::new(),
+            avatar_attempted: HashSet::new(),
         }
     }
 }
@@ -636,6 +655,11 @@ fn msg_short(msg: &Msg) -> String {
         Msg::SaveSettings => "SaveSettings".into(),
         Msg::SettingsResult(r) => format!("SettingsResult({})", if r.is_ok() { "Ok" } else { "Err" }),
         Msg::ToggleSettings => "ToggleSettings".into(),
+        Msg::PickAvatar => "PickAvatar".into(),
+        Msg::AvatarChosen(_) => "AvatarChosen".into(),
+        Msg::AvatarSaved(_) => "AvatarSaved".into(),
+        Msg::RemoveAvatar => "RemoveAvatar".into(),
+        Msg::AvatarFetched { .. } => "AvatarFetched".into(),
         Msg::Error(_) => "Error".into(),
         Msg::Info(_) => "Info".into(),
         Msg::RefreshConversations => "RefreshConversations".into(),
@@ -871,7 +895,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             Task::perform(async move { load_messages(&server, &token, id).await },
                 move |msgs| Msg::MessagesLoaded { conversation_id: id, messages: msgs })
         }
-        Msg::ConversationsLoaded(convs) => { state.conversations = convs; Task::none() }
+        Msg::ConversationsLoaded(convs) => { state.conversations = convs; ensure_avatars(state) }
         Msg::MessagesLoaded { conversation_id, messages } => {
             if state.selected_conversation == Some(conversation_id) {
                 let mut tasks = Vec::new();
@@ -997,29 +1021,42 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                         if !state.messages.iter().any(|x| x.id == msg_id) {
                             state.messages.push(message);
                         }
+                        Task::none()
                     } else {
                         *state.unread.entry(conv_id).or_insert(0) += 1;
+                        if state.conversations.iter().any(|c| c.id == conv_id) {
+                            Task::none()
+                        } else {
+                            // New conversation we don't know about yet (e.g. the
+                            // bot reached out) — refresh the list so it shows up.
+                            let server = state.server.clone();
+                            let token = state.token.clone().unwrap_or_default();
+                            Task::perform(load_conversations(server, token), Msg::ConversationsLoaded)
+                        }
                     }
                 }
                 WsHubEvent::MessageEdited { message } => {
                     if let Some(existing) = state.messages.iter_mut().find(|x| x.id == message.id) {
                         *existing = message;
                     }
+                    Task::none()
                 }
                 WsHubEvent::MessageDeleted { conversation_id, message_id } => {
                     if state.selected_conversation == Some(conversation_id) {
                         state.messages.retain(|m| m.id != message_id);
                     }
+                    Task::none()
                 }
                 WsHubEvent::Typing { conversation_id, from_username, .. } => {
                     state.typing.insert(conversation_id, (from_username, std::time::Instant::now()));
+                    Task::none()
                 }
                 WsHubEvent::Presence { user_id, online } => {
                     state.presence.insert(user_id, online);
+                    Task::none()
                 }
-                _ => {}
+                _ => Task::none(),
             }
-            Task::none()
         }
         Msg::TypingExpired => {
             let now = std::time::Instant::now();
@@ -1043,7 +1080,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                 }
             }, |r: Result<Profile, String>| match r { Ok(p) => Msg::ProfileLoaded(p), Err(e) => Msg::Error(e) })
         }
-        Msg::ProfileLoaded(p) => { state.profile = Some(p); state.profile_open = true; Task::none() }
+        Msg::ProfileLoaded(p) => { state.profile = Some(p); state.profile_open = true; ensure_avatars(state) }
         Msg::CloseProfile => { state.profile_open = false; Task::none() }
         Msg::DisplayNameChanged(s) => { state.display_name_input = s; Task::none() }
         Msg::SaveSettings => {
@@ -1067,8 +1104,73 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                 }
             }, Msg::SettingsResult)
         }
-        Msg::SettingsResult(Ok(u)) => { state.user = Some(u); state.settings_open = false; Task::none() }
+        Msg::SettingsResult(Ok(u)) => {
+            state.user = Some(u);
+            state.settings_open = false;
+            ensure_avatars(state)
+        }
         Msg::SettingsResult(Err(e)) => { state.error = e; Task::none() }
+        Msg::PickAvatar => {
+            Task::perform(
+                async {
+                    let path = rfd::FileDialog::new()
+                        .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif", "bmp", "ico"])
+                        .pick_file();
+                    match path {
+                        Some(p) => std::fs::read(&p).map_err(|e| format!("could not read file: {e}")),
+                        None => Err("no file selected".to_string()),
+                    }
+                },
+                Msg::AvatarChosen,
+            )
+        }
+        Msg::AvatarChosen(Ok(bytes)) => {
+            let token = state.token.clone().unwrap_or_default();
+            let server = state.server.clone();
+            Task::perform(upload_avatar(server, token, bytes), Msg::AvatarSaved)
+        }
+        Msg::AvatarChosen(Err(e)) => { state.error = format!("avatar: {e}"); Task::none() }
+        Msg::AvatarSaved(Ok(u)) => {
+            state.avatar_handles.remove(&u.id);
+            state.avatar_attempted.remove(&u.id);
+            state.user = Some(u);
+            state.info = "Profile picture updated".to_string();
+            ensure_avatars(state)
+        }
+        Msg::AvatarSaved(Err(e)) => { state.error = format!("avatar upload failed: {e}"); Task::none() }
+        Msg::RemoveAvatar => {
+            let token = state.token.clone().unwrap_or_default();
+            let server = state.server.clone();
+            Task::perform(
+                async move {
+                    let client = make_client();
+                    let resp = client
+                        .post(format!("{server}/api/me/avatar"))
+                        .bearer_auth(&token)
+                        .json(&serde_json::json!({ "avatar": "" }))
+                        .send()
+                        .await;
+                    match resp {
+                        Ok(r) if r.status().is_success() => {
+                            let v: serde_json::Value = r.json().await.unwrap_or_default();
+                            serde_json::from_value::<User>(v.get("user").cloned().unwrap_or_default())
+                                .map_err(|_| String::from("parse error"))
+                        }
+                        Ok(r) => Err(format!("update failed: {}", r.status())),
+                        Err(e) => Err(format!("{e}")),
+                    }
+                },
+                Msg::AvatarSaved,
+            )
+        }
+        Msg::AvatarFetched { user_id, result } => {
+            if let Ok(bytes) = result {
+                if let Some(handle) = make_avatar_handle(bytes) {
+                    state.avatar_handles.insert(user_id, handle);
+                }
+            }
+            Task::none()
+        }
         Msg::ToggleSettings => { state.settings_open = !state.settings_open; Task::none() }
         Msg::Error(e) => { state.error = e; Task::none() }
         Msg::Info(i) => { state.info = i; Task::none() }
@@ -1227,6 +1329,8 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                     username: p.username.clone(),
                     display_name: p.display_name.clone(),
                     domain: p.domain.clone(),
+                    avatar_url: p.avatar_url.clone(),
+                    is_bot: false,
                 });
                 state.new_conv_selected.push(user_id);
             }
@@ -1248,7 +1352,10 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
         }
         Msg::NewConvSearchResults(result) => {
             match result {
-                Ok(users) => state.new_conv_results = users,
+                Ok(users) => {
+                    state.new_conv_results = users;
+                    return ensure_avatars(state);
+                }
                 Err(e) => state.error = e,
             }
             Task::none()
@@ -1515,23 +1622,180 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> iced::Color {
 }
 
 fn avatar_circle(initials: String, hue: f32, zoom: f32) -> Element<'static, Msg> {
+    avatar_circle_sized(initials, hue, zoom, 36.0)
+}
+
+fn avatar_circle_sized(initials: String, hue: f32, zoom: f32, size: f32) -> Element<'static, Msg> {
     let color = hsl_to_rgb(hue, 0.6, 0.4);
+    let size = size * zoom;
     container(
         text(initials).size((14.0 * zoom).max(6.0)).color(iced::Color::WHITE)
     )
-    .width(36.0 * zoom)
-    .height(36.0 * zoom)
-    .center_x(Length::Fixed(36.0 * zoom))
-    .center_y(Length::Fixed(36.0 * zoom))
+    .width(size)
+    .height(size)
+    .center_x(Length::Fixed(size))
+    .center_y(Length::Fixed(size))
     .style(move |_: &iced::Theme| iced::widget::container::Style {
         background: Some(color.into()),
         border: iced::Border {
-            radius: (18.0 * zoom).into(),
+            radius: (size / 2.0).into(),
             ..iced::Border::default()
         },
         ..iced::widget::container::Style::default()
     })
     .into()
+}
+
+/// Render a user's profile picture if we have one cached, else initials.
+fn avatar_element<'a>(state: &'a AppState, user_id: u64, fallback_name: &str, size: f32) -> Element<'a, Msg> {
+    if let Some(handle) = state.avatar_handles.get(&user_id) {
+        let s = size * state.zoom;
+        iced::widget::Image::new(handle.clone())
+            .width(Length::Fixed(s))
+            .height(Length::Fixed(s))
+            .into()
+    } else {
+        avatar_circle_sized(user_initials(fallback_name), name_hue(fallback_name), state.zoom, size)
+    }
+}
+
+fn data_url_bytes(url: &str) -> Option<Vec<u8>> {
+    let b64 = url.split_once(";base64,")?.1;
+    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok()
+}
+
+/// Decode avatar bytes, upscale/crop to a square, apply a circular alpha mask
+/// with a soft edge, and return a PNG handle suitable for `image()`.
+fn make_avatar_handle(bytes: Vec<u8>) -> Option<iced::widget::image::Handle> {
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    let target: u32 = 128;
+    let scale = target as f32 / w.max(h) as f32;
+    let (nw, nh) = ((w as f32 * scale).round().max(1.0) as u32, (h as f32 * scale).round().max(1.0) as u32);
+    let resized = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Lanczos3);
+    let sq = nw.min(nh);
+    let (x0, y0) = ((nw - sq) / 2, (nh - sq) / 2);
+    let cropped = image::imageops::crop_imm(&resized, x0, y0, sq, sq).to_image();
+    let cx = sq as f32 / 2.0;
+    let cy = sq as f32 / 2.0;
+    let radius = sq as f32 / 2.0;
+    let feather = 1.5f32;
+    let mut out = cropped;
+    for y in 0..sq {
+        for x in 0..sq {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let cover = ((radius - dist) / feather).clamp(0.0, 1.0);
+            let px = out.get_pixel_mut(x, y);
+            px[3] = ((px[3] as f32) * cover).round() as u8;
+        }
+    }
+    let mut buf = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut buf);
+    image::DynamicImage::ImageRgba8(out).write_to(&mut cursor, image::ImageFormat::Png).ok()?;
+    Some(iced::widget::image::Handle::from_bytes(buf))
+}
+
+async fn fetch_avatar_bytes(url: String) -> Result<Vec<u8>, String> {
+    let resp = make_client().get(&url).send().await.map_err(|e| format!("{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("status {}", resp.status()));
+    }
+    resp.bytes().await.map(|b| b.to_vec()).map_err(|e| format!("{e}"))
+}
+
+/// Scan every known user (self, conversation members, open profile) and load
+/// any avatar we haven't attempted yet. `data:` URLs are decoded inline; http(s)
+/// URLs are fetched in the background.
+fn ensure_avatars(state: &mut AppState) -> Task<Msg> {
+    let mut targets: Vec<(u64, String)> = Vec::new();
+    if let Some(u) = state.user.as_ref() {
+        if let Some(url) = u.avatar_url.as_ref().filter(|s| !s.is_empty()) {
+            targets.push((u.id, url.clone()));
+        }
+    }
+    for c in &state.conversations {
+        for m in &c.members {
+            if let Some(url) = m.avatar_url.as_ref().filter(|s| !s.is_empty()) {
+                targets.push((m.id, url.clone()));
+            }
+        }
+    }
+    if let Some(p) = &state.profile {
+        if let Some(url) = p.avatar_url.as_ref().filter(|s| !s.is_empty()) {
+            targets.push((p.id, url.clone()));
+        }
+    }
+    for u in &state.new_conv_results {
+        if let Some(url) = u.avatar_url.as_ref().filter(|s| !s.is_empty()) {
+            targets.push((u.id, url.clone()));
+        }
+    }
+
+    let mut pending: Vec<(u64, String)> = Vec::new();
+    for (id, url) in targets {
+        if !state.avatar_attempted.insert(id) {
+            continue;
+        }
+        if url.starts_with("data:") {
+            if let Some(bytes) = data_url_bytes(&url) {
+                if let Some(handle) = make_avatar_handle(bytes) {
+                    state.avatar_handles.insert(id, handle);
+                }
+            }
+        } else if url.starts_with("http://") || url.starts_with("https://") {
+            pending.push((id, url));
+        }
+    }
+    if pending.is_empty() {
+        return Task::none();
+    }
+    let tasks: Vec<Task<Msg>> = pending
+        .into_iter()
+        .map(|(id, url)| Task::perform(fetch_avatar_bytes(url), move |result| Msg::AvatarFetched { user_id: id, result }))
+        .collect();
+    Task::batch(tasks)
+}
+
+/// Downscale to ≤256px, re-encode as a PNG data URL for POST /api/me/avatar.
+fn avatar_data_url(bytes: Vec<u8>) -> Result<String, String> {
+    let img = image::load_from_memory(&bytes).map_err(|_| String::from("could not decode image"))?;
+    const MAX: u32 = 256;
+    let img = if img.width() > MAX || img.height() > MAX {
+        let scale = MAX as f32 / img.width().max(img.height()) as f32;
+        img.resize(
+            ((img.width() as f32) * scale) as u32,
+            ((img.height() as f32) * scale) as u32,
+            image::imageops::FilterType::Lanczos3,
+        )
+    } else {
+        img
+    };
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png).map_err(|_| String::from("could not encode image"))?;
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, out.into_inner());
+    Ok(format!("data:image/png;base64,{b64}"))
+}
+
+async fn upload_avatar(server: String, token: String, bytes: Vec<u8>) -> Result<User, String> {
+    let data_url = avatar_data_url(bytes)?;
+    let client = make_client();
+    let resp = client
+        .post(format!("{server}/api/me/avatar"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "avatar": data_url }))
+        .send()
+        .await;
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            let v: serde_json::Value = r.json().await.unwrap_or_default();
+            serde_json::from_value::<User>(v.get("user").cloned().unwrap_or_default())
+                .map_err(|_| String::from("parse error"))
+        }
+        Ok(r) => Err(format!("update failed: {}", r.status())),
+        Err(e) => Err(format!("{e}")),
+    }
 }
 
 fn user_initials(name: &str) -> String {
@@ -1943,7 +2207,7 @@ fn view_chat(state: &AppState) -> Element<'_, Msg> {
     if state.profile_open {
         if let Some(ref profile) = state.profile {
             let close_btn = button(text("Close").size(state.zs(13))).on_press(Msg::CloseProfile).padding([state.z(6.0), state.z(16.0)]);
-            let avatar = avatar_circle(user_initials(&profile.display_name), name_hue(&profile.display_name), state.zoom);
+            let avatar = avatar_element(state, profile.id, &profile.display_name, 64.0);
 
             let username_el: Element<'_, Msg> = if profile.is_self {
                 text(format!("@{}", profile.username)).size(state.zs(14)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)).into()
@@ -1961,6 +2225,18 @@ fn view_chat(state: &AppState) -> Element<'_, Msg> {
                 username_el,
                 text(&profile.domain).size(state.zs(12)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
             ].spacing(state.z(8)).align_x(iced::Alignment::Center);
+
+            if profile.is_bot {
+                info = info.push(
+                    container(text("BOT").size(state.zs(9)).color(iced::Color::WHITE))
+                        .padding([state.z(2.0), state.z(8.0)])
+                        .style(|_: &iced::Theme| iced::widget::container::Style {
+                            background: Some(iced::Color::from_rgb(0.4, 0.6, 0.8).into()),
+                            border: iced::Border { radius: 8.0.into(), ..iced::Border::default() },
+                            ..iced::widget::container::Style::default()
+                        })
+                );
+            }
 
             if !profile.is_self {
                 info = info.push(
@@ -2215,7 +2491,7 @@ fn view_new_conv(state: &AppState) -> Element<'_, Msg> {
                 format!("@{}@{}", u.username, u.domain)
             };
             let label = row![
-                avatar_circle(user_initials(name), name_hue(name), state.zoom),
+                avatar_element(state, u.id, name, 36.0),
                 column![
                     text(name).size(state.zs(14)),
                     text(handle).size(state.zs(11)).color(iced::Color::from_rgb(0.75, 0.75, 0.75)),
@@ -2357,11 +2633,36 @@ fn view_settings(state: &AppState) -> Element<'_, Msg> {
 
     let accent_row = row(swatches).spacing(state.z(8));
 
+    let pfp_label = text("Profile picture").size(state.zs(14))
+        .color(iced::Color::from_rgb(0.6, 0.6, 0.6));
+
+    let current_avatar = match &state.user {
+        Some(u) => avatar_element(state, u.id, &u.display_name, 64.0),
+        None => avatar_circle_sized(user_initials("?"), 0.0, state.zoom, 64.0),
+    };
+
+    let choose_btn = button(text("Choose image…").size(state.zs(13)))
+        .on_press(Msg::PickAvatar)
+        .padding([state.z(6.0), state.z(14.0)]);
+
+    let remove_btn = button(text("Remove").size(state.zs(13)))
+        .on_press(Msg::RemoveAvatar)
+        .style(danger_text_button)
+        .padding(state.z(6));
+
+    let pfp_row = row![current_avatar, column![choose_btn, remove_btn].spacing(state.z(6))]
+        .spacing(state.z(16))
+        .align_y(iced::Alignment::Center);
+
     let content = column![
         back_btn,
         title,
         text(format!("Username: {username}")).size(state.zs(14)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
         text(format!("Email: {email}")).size(state.zs(14)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
+        rule::horizontal(1),
+        pfp_label,
+        pfp_row,
+        rule::horizontal(1),
         display_name_label,
         display_name_input,
         save_btn,
@@ -2409,7 +2710,14 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {
 
             let initials = user_initials(&name);
             let hue = name_hue(&name);
-            let avatar = avatar_circle(initials.clone(), hue, state.zoom);
+            let avatar = if c.kind == "direct" {
+                match other {
+                    Some(m) => avatar_element(state, m.id, &name, 36.0),
+                    None => avatar_circle(initials.clone(), hue, state.zoom),
+                }
+            } else {
+                avatar_circle(initials.clone(), hue, state.zoom)
+            };
 
             let unread = state.unread.get(&c.id).copied().unwrap_or(0);
             let online = other
@@ -2432,6 +2740,16 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {
                         .padding([state.z(1.0), state.z(5.0)])
                         .style(move |_: &iced::Theme| iced::widget::container::Style {
                             background: Some(state.accent.into()),
+                            border: iced::Border { radius: 8.0.into(), ..iced::Border::default() },
+                            ..iced::widget::container::Style::default()
+                        })
+                );
+            } else if other.map(|m| m.is_bot).unwrap_or(false) {
+                name_row = name_row.push(
+                    container(text("BOT").size(state.zs(9)).color(iced::Color::WHITE))
+                        .padding([state.z(1.0), state.z(5.0)])
+                        .style(move |_: &iced::Theme| iced::widget::container::Style {
+                            background: Some(iced::Color::from_rgb(0.4, 0.6, 0.8).into()),
                             border: iced::Border { radius: 8.0.into(), ..iced::Border::default() },
                             ..iced::widget::container::Style::default()
                         })
@@ -2545,20 +2863,39 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
         .map(|(name, _)| format!("{name} is typing…"))
         .unwrap_or_default();
 
-    let header_avatar_btn = other_member
-        .map(|m| {
-            button(avatar_circle(header_initials.clone(), header_hue, state.zoom))
-                .on_press(Msg::ShowProfile(m.id))
-                .style(button::text)
-                .padding(state.z(0))
-        })
-        .unwrap_or_else(|| button(avatar_circle(header_initials.clone(), header_hue, state.zoom)).style(button::text).padding(state.z(0)));
+    let header_avatar_btn = match other_member {
+        Some(m) => button(avatar_element(state, m.id, &header_name, 36.0))
+            .on_press(Msg::ShowProfile(m.id))
+            .style(button::text)
+            .padding(state.z(0)),
+        None => button(avatar_circle(header_initials.clone(), header_hue, state.zoom)).style(button::text).padding(state.z(0)),
+    };
+
+    let header_badge = other_member
+        .filter(|m| m.is_bot && !is_group)
+        .map(|_| {
+            container(text("BOT").size(state.zs(9)).color(iced::Color::WHITE))
+                .padding([state.z(1.0), state.z(5.0)])
+                .style(|_: &iced::Theme| iced::widget::container::Style {
+                    background: Some(iced::Color::from_rgb(0.4, 0.6, 0.8).into()),
+                    border: iced::Border { radius: 8.0.into(), ..iced::Border::default() },
+                    ..iced::widget::container::Style::default()
+                })
+        });
+
+    let header_name_el: Element<'_, Msg> = match header_badge {
+        Some(badge) => row![text(header_name.clone()).size(state.zs(15)), badge]
+            .spacing(state.z(6))
+            .align_y(iced::Alignment::Center)
+            .into(),
+        None => text(header_name.clone()).size(state.zs(15)).into(),
+    };
 
     let header_content = if typing_text.is_empty() {
         row![
             header_avatar_btn,
             column![
-                text(header_name).size(state.zs(15)),
+                header_name_el,
                 text(status).size(state.zs(11)).color(status_color),
             ].spacing(state.z(2)),
         ].spacing(state.z(10)).align_y(iced::Alignment::Center)
@@ -2566,7 +2903,7 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
         row![
             header_avatar_btn,
             column![
-                text(header_name).size(state.zs(15)),
+                header_name_el,
                 text(typing_text).size(state.zs(11)).color(iced::Color::from_rgb(0.49, 0.36, 0.88)),
             ].spacing(state.z(2)),
         ].spacing(state.z(10)).align_y(iced::Alignment::Center)
@@ -2695,7 +3032,7 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
             .style(style_fn);
 
         let pfp_label = sender_label.clone();
-        let pfp = avatar_circle(user_initials(&pfp_label), name_hue(&pfp_label), state.zoom);
+        let pfp = avatar_element(state, m.sender_id, &pfp_label, 36.0);
         let pfp_btn = button(pfp)
             .on_press(Msg::ShowProfile(m.sender_id))
             .style(button::text)
