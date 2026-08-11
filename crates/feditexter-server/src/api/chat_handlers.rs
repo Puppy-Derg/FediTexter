@@ -122,11 +122,16 @@ async fn create_group_conversation(state: &AppState, member_ids: &[u64], kind: &
 }
 
 async fn conversation_json(state: &AppState, conversation_id: u64) -> Result<Value, ApiError> {
-    let kind: String = sqlx::query_scalar("SELECT kind FROM conversations WHERE id = ?")
-        .bind(conversation_id)
-        .fetch_one(&state.pool)
-        .await
-        .map_err(|_| ApiError::Internal("db error"))?;
+    let row: Option<(String, Option<u64>, Option<String>)> = sqlx::query_as(
+        "SELECT kind, guild_id, name FROM conversations WHERE id = ?",
+    )
+    .bind(conversation_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
+    let Some((kind, guild_id, channel_name)) = row else {
+        return Err(ApiError::NotFound("conversation not found"));
+    };
 
     let members: Vec<(u64, String, String, u64, Option<String>, Option<String>, bool)> = sqlx::query_as(
         "SELECT m.user_id, u.username, u.display_name, u.server_id, s.domain, u.avatar_url, u.is_bot
@@ -144,6 +149,8 @@ async fn conversation_json(state: &AppState, conversation_id: u64) -> Result<Val
     Ok(json!({
         "id": conversation_id,
         "kind": kind,
+        "guild_id": guild_id,
+        "channel_name": channel_name,
         "members": members
             .iter()
             .map(|(id, username, display_name, _server_id, domain, avatar_url, is_bot)| {

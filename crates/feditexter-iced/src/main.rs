@@ -60,7 +60,31 @@ struct Member {
 struct Conversation {
     id: u64,
     kind: String,
+    #[serde(default)]
+    guild_id: Option<u64>,
+    #[serde(default)]
+    channel_name: Option<String>,
     members: Vec<Member>,
+}
+
+/// A Discord-like server (guild). Guilds are fetched separately from plain
+/// conversations; each owns several channel conversations.
+#[derive(serde::Deserialize, Clone, Debug)]
+struct Guild {
+    id: u64,
+    name: String,
+    #[serde(default)]
+    owner_id: u64,
+    #[serde(default)]
+    member_count: u64,
+    #[serde(default)]
+    channels: Vec<GuildChannel>,
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+struct GuildChannel {
+    id: u64,
+    name: String,
 }
 
 #[derive(serde::Deserialize, Clone, Debug)]
@@ -81,7 +105,12 @@ struct SearchUser {
 enum NewConvKind {
     Direct,
     Group,
-    Channel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeftTab {
+    Dms,
+    Servers,
 }
 
 impl NewConvKind {
@@ -89,7 +118,6 @@ impl NewConvKind {
         match self {
             NewConvKind::Direct => "Direct message",
             NewConvKind::Group => "Group chat",
-            NewConvKind::Channel => "Channel",
         }
     }
 
@@ -97,7 +125,6 @@ impl NewConvKind {
         match self {
             NewConvKind::Direct => "direct",
             NewConvKind::Group => "group",
-            NewConvKind::Channel => "large_group",
         }
     }
 
@@ -105,7 +132,6 @@ impl NewConvKind {
         match self {
             NewConvKind::Direct => "Talk to one person",
             NewConvKind::Group => "A small group conversation",
-            NewConvKind::Channel => "A large open space for many people",
         }
     }
 }
@@ -342,6 +368,20 @@ enum Msg {
     TwoFaEnable,
     TwoFaToggleResult(Result<User, String>),
     TwoFaCodeInput(String),
+    GuildsLoaded(Result<Vec<Guild>, String>),
+    SelectGuild(Option<u64>),
+    OpenGuildModal,
+    CloseGuildModal,
+    GuildNameInput(String),
+    GuildJoinCodeInput(String),
+    CreateGuildSubmit,
+    GuildCreated(Result<u64, String>),
+    JoinGuildSubmit,
+    GuildJoined(Result<(), String>),
+    CreateChannelSubmit(u64),
+    ChannelCreated(Result<(), String>),
+    ChannelNameInput(String),
+    SetLeftTab(LeftTab),
 }
 
 // ---------------------------------------------------------------------------
@@ -375,6 +415,14 @@ struct AppState {
     error: String,
     info: String,
     conversations: Vec<Conversation>,
+    guilds: Vec<Guild>,
+    selected_guild: Option<u64>,
+    left_tab: LeftTab,
+    guild_modal_open: bool,
+    guild_name_input: String,
+    guild_join_code_input: String,
+    channel_name_input: String,
+    guild_busy: bool,
     messages: Vec<ApiMsg>,
     selected_conversation: Option<u64>,
     draft: String,
@@ -449,6 +497,14 @@ impl Default for AppState {
             error: String::new(),
             info: String::new(),
             conversations: Vec::new(),
+            guilds: Vec::new(),
+            selected_guild: None,
+            left_tab: LeftTab::Dms,
+            guild_modal_open: false,
+            guild_name_input: String::new(),
+            guild_join_code_input: String::new(),
+            channel_name_input: String::new(),
+            guild_busy: false,
             messages: Vec::new(),
             selected_conversation: None,
             draft: String::new(),
@@ -1192,6 +1248,20 @@ fn msg_short(msg: &Msg) -> String {
         Msg::TwoFaEnable => "TwoFaEnable".into(),
         Msg::TwoFaToggleResult(_) => "TwoFaToggleResult".into(),
         Msg::TwoFaCodeInput(_) => "TwoFaCodeInput".into(),
+        Msg::GuildsLoaded(_) => "GuildsLoaded".into(),
+        Msg::SelectGuild(_) => "SelectGuild".into(),
+        Msg::OpenGuildModal => "OpenGuildModal".into(),
+        Msg::CloseGuildModal => "CloseGuildModal".into(),
+        Msg::GuildNameInput(_) => "GuildNameInput".into(),
+        Msg::GuildJoinCodeInput(_) => "GuildJoinCodeInput".into(),
+        Msg::CreateGuildSubmit => "CreateGuildSubmit".into(),
+        Msg::GuildCreated(_) => "GuildCreated".into(),
+        Msg::JoinGuildSubmit => "JoinGuildSubmit".into(),
+        Msg::GuildJoined(_) => "GuildJoined".into(),
+        Msg::CreateChannelSubmit(_) => "CreateChannelSubmit".into(),
+        Msg::ChannelCreated(_) => "ChannelCreated".into(),
+        Msg::ChannelNameInput(_) => "ChannelNameInput".into(),
+        Msg::SetLeftTab(_) => "SetLeftTab".into(),
     }
 }
 
@@ -1438,7 +1508,17 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             Task::perform(async move { load_messages(&server, &token, id).await },
                 move |msgs| Msg::MessagesLoaded { conversation_id: id, messages: msgs })
         }
-        Msg::ConversationsLoaded(Ok(convs)) => { state.conversations = convs; ensure_avatars(state) }
+        Msg::ConversationsLoaded(Ok(convs)) => {
+            state.conversations = convs;
+            let avatars = ensure_avatars(state);
+            // Also refresh the guild list so the server rail stays in sync.
+            let token = state.token.clone().unwrap_or_default();
+            let server = state.server.clone();
+            Task::batch(vec![
+                avatars,
+                Task::perform(load_guilds(server, token), Msg::GuildsLoaded),
+            ])
+        }
         Msg::ConversationsLoaded(Err(e)) => {
             if e == AUTH_FAILED {
                 return Task::done(Msg::SessionExpired("Your session was invalidated (token used from another device). Please log in again.".to_string()));
@@ -1823,6 +1903,102 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             Task::none()
         }
         Msg::TwoFaToggleResult(Err(e)) => { state.twofa_busy = false; handle_api_error(state, e) }
+        Msg::GuildsLoaded(Ok(guilds)) => { state.guilds = guilds; Task::none() }
+        Msg::GuildsLoaded(Err(e)) => handle_api_error(state, e),
+        Msg::SelectGuild(g) => {
+            state.selected_guild = g;
+            state.left_tab = LeftTab::Servers;
+            state.selected_conversation = None;
+            state.messages.clear();
+            state.conv_menu_conv = None;
+            Task::none()
+        }
+        Msg::SetLeftTab(tab) => {
+            state.left_tab = tab;
+            match tab {
+                LeftTab::Dms => {
+                    state.selected_guild = None;
+                    state.selected_conversation = None;
+                    state.messages.clear();
+                }
+                LeftTab::Servers => {
+                    state.selected_conversation = None;
+                    state.messages.clear();
+                }
+            }
+            Task::none()
+        }
+        Msg::OpenGuildModal => { state.guild_modal_open = true; Task::none() }
+        Msg::CloseGuildModal => { state.guild_modal_open = false; Task::none() }
+        Msg::GuildNameInput(s) => { state.guild_name_input = s; Task::none() }
+        Msg::GuildJoinCodeInput(s) => { state.guild_join_code_input = s; Task::none() }
+        Msg::CreateGuildSubmit => {
+            state.guild_busy = true;
+            let name = state.guild_name_input.trim().to_string();
+            if name.is_empty() { state.guild_busy = false; return Task::none(); }
+            let token = state.token.clone().unwrap_or_default();
+            let server = state.server.clone();
+            Task::perform(create_guild_api(server, token, name), Msg::GuildCreated)
+        }
+        Msg::GuildCreated(Ok(_gid)) => {
+            state.guild_busy = false;
+            state.guild_modal_open = false;
+            state.guild_name_input.clear();
+            state.selected_guild = None;
+            let token = state.token.clone().unwrap_or_default();
+            let server = state.server.clone();
+            let load = load_guilds(server.clone(), token.clone());
+            let convs = load_conversations(server, token);
+            Task::batch(vec![
+                Task::perform(load, Msg::GuildsLoaded),
+                Task::perform(convs, Msg::ConversationsLoaded),
+            ])
+        }
+        Msg::GuildCreated(Err(e)) => { state.guild_busy = false; handle_api_error(state, e) }
+        Msg::JoinGuildSubmit => {
+            state.guild_busy = true;
+            let code = state.guild_join_code_input.trim().to_string();
+            if code.is_empty() { state.guild_busy = false; return Task::none(); }
+            let token = state.token.clone().unwrap_or_default();
+            let server = state.server.clone();
+            Task::perform(join_guild_api(server, token, code), Msg::GuildJoined)
+        }
+        Msg::GuildJoined(Ok(())) => {
+            state.guild_busy = false;
+            state.guild_modal_open = false;
+            state.guild_join_code_input.clear();
+            let token = state.token.clone().unwrap_or_default();
+            let server = state.server.clone();
+            let load = load_guilds(server.clone(), token.clone());
+            let convs = load_conversations(server, token);
+            Task::batch(vec![
+                Task::perform(load, Msg::GuildsLoaded),
+                Task::perform(convs, Msg::ConversationsLoaded),
+            ])
+        }
+        Msg::GuildJoined(Err(e)) => { state.guild_busy = false; handle_api_error(state, e) }
+        Msg::ChannelNameInput(s) => { state.channel_name_input = s; Task::none() }
+        Msg::CreateChannelSubmit(guild_id) => {
+            state.guild_busy = true;
+            let name = state.channel_name_input.trim().to_string();
+            if name.is_empty() { state.guild_busy = false; return Task::none(); }
+            let token = state.token.clone().unwrap_or_default();
+            let server = state.server.clone();
+            Task::perform(create_channel_api(server, token, guild_id, name), Msg::ChannelCreated)
+        }
+        Msg::ChannelCreated(Ok(())) => {
+            state.guild_busy = false;
+            state.channel_name_input.clear();
+            let token = state.token.clone().unwrap_or_default();
+            let server = state.server.clone();
+            let load = load_guilds(server.clone(), token.clone());
+            let convs = load_conversations(server, token);
+            Task::batch(vec![
+                Task::perform(load, Msg::GuildsLoaded),
+                Task::perform(convs, Msg::ConversationsLoaded),
+            ])
+        }
+        Msg::ChannelCreated(Err(e)) => { state.guild_busy = false; handle_api_error(state, e) }
         Msg::DisplayNameChanged(s) => { state.display_name_input = s; Task::none() }
         Msg::SaveSettings => {
             let token = state.token.clone().unwrap_or_default();
@@ -2266,7 +2442,6 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             let valid = match state.new_conv_kind {
                 NewConvKind::Direct => state.new_conv_selected.len() == 1,
                 NewConvKind::Group => state.new_conv_selected.len() >= 2,
-                NewConvKind::Channel => !state.new_conv_selected.is_empty(),
             };
             if !valid {
                 return Task::none();
@@ -2365,6 +2540,9 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             state.avatar_busy = false;
             state.picking_file = false;
             state.preview_loading.clear();
+            state.left_tab = LeftTab::Dms;
+            state.guilds.clear();
+            state.selected_guild = None;
             let _ = std::fs::remove_file(dirs_next::home_dir().unwrap_or_default().join(".feditexter_session"));
             Task::none()
         }
@@ -2387,6 +2565,9 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             state.avatar_busy = false;
             state.picking_file = false;
             state.preview_loading.clear();
+            state.left_tab = LeftTab::Dms;
+            state.guilds.clear();
+            state.selected_guild = None;
             let _ = std::fs::remove_file(dirs_next::home_dir().unwrap_or_default().join(".feditexter_session"));
             state.error = reason;
             Task::none()
@@ -2408,6 +2589,67 @@ async fn load_conversations(server: String, token: String) -> Result<Vec<Convers
             let v: serde_json::Value = r.json().await.unwrap_or_default();
             Ok(serde_json::from_value(v.get("conversations").cloned().unwrap_or_default())
                 .unwrap_or_default())
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn load_guilds(server: String, token: String) -> Result<Vec<Guild>, String> {
+    let client = make_client();
+    let resp = client.get(format!("{server}/api/servers"))
+        .bearer_auth(&token).send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            let v: serde_json::Value = r.json().await.unwrap_or_default();
+            serde_json::from_value(v.get("guilds").cloned().unwrap_or_default())
+                .map_err(|e| format!("parse error: {e}"))
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn create_guild_api(server: String, token: String, name: String) -> Result<u64, String> {
+    let client = make_client();
+    let resp = client.post(format!("{server}/api/servers"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": name }))
+        .send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            let v: serde_json::Value = r.json().await.unwrap_or_default();
+            v.get("guild_id").and_then(|x| x.as_u64()).ok_or_else(|| "missing guild_id".to_string())
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn join_guild_api(server: String, token: String, code: String) -> Result<(), String> {
+    let client = make_client();
+    let resp = client.post(format!("{server}/api/servers/join"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "code": code }))
+        .send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            if r.status().is_success() { Ok(()) } else { Err(format!("join failed: {}", r.status())) }
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn create_channel_api(server: String, token: String, guild_id: u64, name: String) -> Result<(), String> {
+    let client = make_client();
+    let resp = client.post(format!("{server}/api/servers/{guild_id}/channels"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": name }))
+        .send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            if r.status().is_success() { Ok(()) } else { Err(format!("create failed: {}", r.status())) }
         }
         Err(e) => Err(format!("{e}")),
     }
@@ -3250,17 +3492,29 @@ async fn fetch_link_preview(url: String) -> Option<LinkPreview> {
     let mut description = None;
     let mut image_urls: Vec<String> = Vec::new();
 
-    // Non-Bluesky links: fetch + parse HTML meta tags.
+    // Bluesky/fxbsky: the page is JS-rendered; use the public API.
     if preview_parse_bsky_url(&url).is_none() {
-        if let Ok(resp) = client.get(&url).send().await {
-            if let Ok(bytes) = resp.bytes().await {
-                if bytes.len() <= PREVIEW_MAX_PAGE_BYTES {
-                    let html = String::from_utf8_lossy(&bytes);
-                    let (t, d, i) = preview_parse_meta(&url, &html);
-                    title = t;
-                    description = d;
-                    if let Some(i) = i {
-                        image_urls.push(i);
+        // Specialised oEmbed handlers first (more reliable than scraping).
+        if let Some((t, a, img)) = preview_youtube_oembed(&client, &url).await {
+            title = Some(t);
+            description = Some(a);
+            image_urls.push(img);
+        } else if let Some((t, a, img)) = preview_mastodon_oembed(&client, &url).await {
+            title = Some(t);
+            description = Some(a);
+            image_urls.push(img);
+        } else {
+            // Generic: fetch + parse HTML meta tags.
+            if let Ok(resp) = client.get(&url).send().await {
+                if let Ok(bytes) = resp.bytes().await {
+                    if bytes.len() <= PREVIEW_MAX_PAGE_BYTES {
+                        let html = String::from_utf8_lossy(&bytes);
+                        let (t, d, i) = preview_parse_meta(&url, &html);
+                        title = t;
+                        description = d;
+                        if let Some(i) = i {
+                            image_urls.push(i);
+                        }
                     }
                 }
             }
@@ -3288,6 +3542,53 @@ async fn fetch_link_preview(url: String) -> Option<LinkPreview> {
     }
 
     Some(LinkPreview { url, title, description, images })
+}
+
+/// YouTube oEmbed: reliable title/author/thumbnail without scraping.
+async fn preview_youtube_oembed(client: &reqwest::Client, url: &str) -> Option<(String, String, String)> {
+    if !(url.contains("youtube.com") || url.contains("youtu.be") || url.contains("youtube-nocookie.com")) {
+        return None;
+    }
+    let api = format!(
+        "https://www.youtube.com/oembed?url={}&format=json",
+        url::form_urlencoded::byte_serialize(url.as_bytes()).collect::<String>()
+    );
+    let resp = client.get(&api).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = resp.json().await.ok()?;
+    let title = v.get("title")?.as_str()?.to_string();
+    let author = v.get("author_name").and_then(|a| a.as_str()).unwrap_or("YouTube").to_string();
+    let thumb = v.get("thumbnail_url")?.as_str()?.to_string();
+    if preview_looks_private(&thumb) {
+        return None;
+    }
+    Some((title, format!("by {author}"), thumb))
+}
+
+/// Mastodon oEmbed: detect the instance from the URL and ask its oEmbed API.
+async fn preview_mastodon_oembed(client: &reqwest::Client, url: &str) -> Option<(String, String, String)> {
+    let host = url::Url::parse(url).ok()?.host_str()?.to_string();
+    if host == "bsky.app" || host.ends_with(".bsky.app") {
+        return None;
+    }
+    let api = format!(
+        "https://{host}/api/oembed?url={}&format=json",
+        url::form_urlencoded::byte_serialize(url.as_bytes()).collect::<String>()
+    );
+    let resp = client.get(&api).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = resp.json().await.ok()?;
+    let title = v.get("title")?.as_str()?.to_string();
+    let author = v.get("author_name").and_then(|a| a.as_str()).unwrap_or(&host).to_string();
+    let thumb = v.get("thumbnail_url").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    if !thumb.is_empty() && preview_looks_private(&thumb) {
+        return None;
+    }
+    Some((title, format!("@{author} · {host}"), thumb))
 }
 
 // ---------------------------------------------------------------------------
@@ -3736,6 +4037,10 @@ fn view_chat(state: &AppState) -> Element<'_, Msg> {
         layers.push(view_new_conv(state));
     }
 
+    if state.guild_modal_open {
+        layers.push(view_guild_modal(state));
+    }
+
     iced::widget::Stack::from_vec(layers)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -3763,7 +4068,16 @@ fn view_new_conv(state: &AppState) -> Element<'_, Msg> {
     let kind_row = row![
         new_conv_kind_button(state, NewConvKind::Direct),
         new_conv_kind_button(state, NewConvKind::Group),
-        new_conv_kind_button(state, NewConvKind::Channel),
+        button(
+            column![
+                text("Server").size(state.zs(13)),
+                text("Create or join a server").size(state.zs(10)).color(iced::Color::from_rgb(0.75, 0.75, 0.75)),
+            ].spacing(state.z(2)).align_x(iced::Alignment::Center).width(Length::Fill)
+        )
+        .on_press(Msg::OpenGuildModal)
+        .width(Length::Fill)
+        .height(Length::Fixed(state.z(64.0)))
+        .padding([state.z(8.0), state.z(8.0)]),
     ].spacing(state.z(8));
 
     let search = text_input("Search users…", &state.new_conv_search)
@@ -3833,12 +4147,10 @@ fn view_new_conv(state: &AppState) -> Element<'_, Msg> {
     let valid = match state.new_conv_kind {
         NewConvKind::Direct => state.new_conv_selected.len() == 1,
         NewConvKind::Group => state.new_conv_selected.len() >= 2,
-        NewConvKind::Channel => !state.new_conv_selected.is_empty(),
     };
     let create_label = match state.new_conv_kind {
         NewConvKind::Direct => "Start chat",
         NewConvKind::Group => "Create group",
-        NewConvKind::Channel => "Create channel",
     };
     let create_btn: Element<'_, Msg> = if state.new_conv_busy {
         button(row![throbber(state.zs(14)), text("Creating…").size(state.zs(13))].spacing(state.z(8))).width(Length::Fill).into()
@@ -3884,6 +4196,116 @@ fn view_new_conv(state: &AppState) -> Element<'_, Msg> {
             })
     )
     .on_press(Msg::CloseNewConv)
+    .into();
+
+    let centered = container(mouse_area(popup).on_press(Msg::Noop))
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into();
+
+    iced::widget::Stack::from_vec(vec![dim, centered])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+fn view_guild_modal(state: &AppState) -> Element<'_, Msg> {
+    let close_btn = button(text("✕").size(state.zs(14))).on_press(Msg::CloseGuildModal).padding(state.z(4));
+    let title = text("Servers & channels").size(state.zs(18));
+
+    let name_input = text_input("Server name (e.g. My Server)", &state.guild_name_input)
+        .on_input(Msg::GuildNameInput)
+        .on_submit(Msg::CreateGuildSubmit)
+        .width(Length::Fill);
+    let create_btn: Element<'_, Msg> = if state.guild_busy {
+        button(throbber(state.zs(14))).padding(state.z(6)).into()
+    } else {
+        button(text("Create server").size(state.zs(13)))
+            .on_press(Msg::CreateGuildSubmit)
+            .style(button::primary)
+            .padding([state.z(6.0), state.z(14.0)])
+            .into()
+    };
+
+    let join_code_input = text_input("Invite code (e.g. 5f3a9c2b1d7e8a4f)", &state.guild_join_code_input)
+        .on_input(Msg::GuildJoinCodeInput)
+        .on_submit(Msg::JoinGuildSubmit)
+        .width(Length::Fill);
+    let join_btn: Element<'_, Msg> = if state.guild_busy {
+        button(throbber(state.zs(14))).padding(state.z(6)).into()
+    } else {
+        button(text("Join server").size(state.zs(13)))
+            .on_press(Msg::JoinGuildSubmit)
+            .padding([state.z(6.0), state.z(14.0)])
+            .into()
+    };
+
+    let mut content = column![
+        row![title, space::horizontal(), close_btn].align_y(iced::Alignment::Center),
+        text("Create a new server").size(state.zs(13)).color(iced::Color::from_rgb(0.75, 0.75, 0.75)),
+        name_input,
+        create_btn,
+        rule::horizontal(1),
+        text("Join an existing server").size(state.zs(13)).color(iced::Color::from_rgb(0.75, 0.75, 0.75)),
+        join_code_input,
+        join_btn,
+    ].spacing(state.z(10)).align_x(iced::Alignment::Start);
+
+    // When a guild is selected, offer channel creation too.
+    if let Some(guild_id) = state.selected_guild
+        && let Some(g) = state.guilds.iter().find(|g| g.id == guild_id)
+    {
+        let channel_input = text_input("Channel name (e.g. general)", &state.channel_name_input)
+            .on_input(Msg::ChannelNameInput)
+            .on_submit(Msg::CreateChannelSubmit(guild_id))
+            .width(Length::Fill);
+        let channel_btn: Element<'_, Msg> = if state.guild_busy {
+            button(throbber(state.zs(14))).padding(state.z(6)).into()
+        } else {
+            button(text("Add channel").size(state.zs(13)))
+                .on_press(Msg::CreateChannelSubmit(guild_id))
+                .padding([state.z(6.0), state.z(14.0)])
+                .into()
+        };
+        content = content.push(rule::horizontal(1));
+        content = content.push(text(format!("Add a channel to {}", g.name)).size(state.zs(13)).color(iced::Color::from_rgb(0.75, 0.75, 0.75)));
+        content = content.push(channel_input);
+        content = content.push(channel_btn);
+    }
+
+    if !state.error.is_empty() {
+        content = content.push(text(&state.error).size(state.zs(12)).color(iced::Color::from_rgb(0.9, 0.3, 0.2)));
+    }
+
+    let popup = container(content)
+        .padding(state.z(20))
+        .width(Length::Fixed(state.z(360.0)))
+        .style(|theme: &iced::Theme| {
+            let p = theme.extended_palette();
+            iced::widget::container::Style {
+                background: Some(p.background.weakest.color.into()),
+                border: iced::Border {
+                    width: 1.0,
+                    color: p.background.weak.color,
+                    radius: 12.0.into(),
+                },
+                shadow: iced::Shadow { color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.4), offset: iced::Vector::new(0.0, 4.0), blur_radius: 12.0 },
+                ..iced::widget::container::Style::default()
+            }
+        });
+
+    let dim = mouse_area(
+        container(space::horizontal())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_: &iced::Theme| iced::widget::container::Style {
+                background: Some(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.55).into()),
+                ..iced::widget::container::Style::default()
+            })
+    )
+    .on_press(Msg::CloseGuildModal)
     .into();
 
     let centered = container(mouse_area(popup).on_press(Msg::Noop))
@@ -4067,15 +4489,100 @@ fn view_settings(state: &AppState) -> Element<'_, Msg> {
 }
 
 fn view_sidebar(state: &AppState) -> Element<'_, Msg> {
-    let settings_btn = button(text("⚙").size(state.zs(18))).on_press(Msg::ToggleSettings);
-
     let header = row![
         text("Conversations").size(state.zs(18)),
-        space::horizontal(),
-        settings_btn,
     ].align_y(iced::Alignment::Center).spacing(state.z(8));
 
-    let conv_list: Element<'_, Msg> = if state.conversations.is_empty() {
+    // ----- Server rail (leftmost, Discord-style) -----
+    let guild_rail_items: Vec<Element<'_, Msg>> = state.guilds.iter().map(|g| {
+        let selected = state.selected_guild == Some(g.id);
+        let initials = user_initials(&g.name);
+        let hue = name_hue(&g.name);
+        let btn = button(
+            container(text(initials).size(state.zs(13)).color(iced::Color::WHITE))
+                .width(state.z(44.0))
+                .height(state.z(44.0))
+                .center_x(Length::Fixed(state.z(44.0)))
+                .center_y(Length::Fixed(state.z(44.0)))
+                .style(move |_: &iced::Theme| iced::widget::container::Style {
+                    background: Some(hsl_to_rgb(hue, 0.6, 0.4).into()),
+                    border: iced::Border {
+                        radius: if selected { 14.0 } else { 22.0 }.into(),
+                        ..iced::Border::default()
+                    },
+                    ..iced::widget::container::Style::default()
+                })
+        )
+        .on_press(Msg::SelectGuild(Some(g.id)))
+        .style(if selected { button::primary } else { button::text })
+        .padding(state.z(2));
+        mouse_area(btn)
+            .on_right_press(Msg::SelectGuild(Some(g.id)))
+            .into()
+    }).collect();
+
+    let guild_rail = column(
+        guild_rail_items
+            .into_iter()
+            .collect::<Vec<_>>()
+    )
+    .spacing(state.z(6))
+    .padding(state.z(8))
+    .width(Length::Fixed(state.z(56.0)))
+    .height(Length::Fill);
+
+    // ----- Main list: guild channels or flat conversations -----
+    let conv_list: Element<'_, Msg> = if let Some(guild_id) = state.selected_guild {
+        let guild = state.guilds.iter().find(|g| g.id == guild_id);
+        match guild {
+            Some(g) => {
+                let items: Vec<Element<'_, Msg>> = g.channels.iter().map(|ch| {
+                    let is_selected = state.selected_conversation == Some(ch.id);
+                    let unread = state.unread.get(&ch.id).copied().unwrap_or(0);
+                    let label: Element<'_, Msg> = if unread > 0 {
+                        row![
+                            container(text("#").size(state.zs(14)).color(iced::Color::from_rgb(0.6, 0.6, 0.6))),
+                            text(&ch.name).size(state.zs(14)),
+                            space::horizontal(),
+                            container(text(format!("{unread}")).size(state.zs(10)).color(iced::Color::WHITE))
+                                .padding([state.z(1.0), state.z(5.0)])
+                                .style(|_: &iced::Theme| iced::widget::container::Style {
+                                    background: Some(state.accent.into()),
+                                    border: iced::Border { radius: 9.0.into(), ..iced::Border::default() },
+                                    ..iced::widget::container::Style::default()
+                                }),
+                        ].spacing(state.z(6)).align_y(iced::Alignment::Center).into()
+                    } else {
+                        row![
+                            text("#").size(state.zs(14)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
+                            text(&ch.name).size(state.zs(14)),
+                            space::horizontal(),
+                        ].spacing(state.z(6)).align_y(iced::Alignment::Center).into()
+                    };
+                    let btn = button(label)
+                        .on_press(Msg::SelectConversation(ch.id))
+                        .width(Length::Fill)
+                        .padding([state.z(6.0), state.z(8.0)])
+                        .style(if is_selected { button::primary } else { button::secondary });
+                    btn.into()
+                }).collect();
+
+                let add_channel_btn: Element<'_, Msg> = if state.guild_busy {
+                    button(throbber(state.z(12))).padding(state.z(4)).into()
+                } else {
+                    button(text("＋ channel").size(state.zs(12)))
+                        .on_press(Msg::OpenGuildModal)
+                        .padding(state.z(4))
+                        .into()
+                };
+                column![
+                    column(items).spacing(state.z(2)),
+                    add_channel_btn,
+                ].spacing(state.z(6)).into()
+            }
+            None => text("Guild not found").size(state.zs(13)).into(),
+        }
+    } else if state.conversations.is_empty() {
         container(text("No conversations yet").size(state.zs(13)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)))
             .center_x(Length::Fill)
             .center_y(Length::Fill)
@@ -4183,11 +4690,79 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {
         .style(button::primary)
         .padding([state.z(8.0), state.z(10.0)]);
 
+    let main_panel: Element<'_, Msg> = match state.left_tab {
+        LeftTab::Dms => column![
+            header,
+            new_conv_btn,
+            scrollable(conv_list).height(Length::Fill),
+        ].spacing(state.z(8)).padding(state.z(12)).into(),
+        LeftTab::Servers => {
+            if state.selected_guild.is_some() {
+                column![
+                    text(if let Some(g) = state.guilds.iter().find(|g| Some(g.id) == state.selected_guild) { g.name.clone() } else { String::new() }).size(state.zs(16)),
+                    scrollable(conv_list).height(Length::Fill),
+                ].spacing(state.z(8)).padding(state.z(12)).into()
+            } else {
+                column![
+                    text("Servers").size(state.zs(16)),
+                    text("Pick a server from the left rail, or create one").size(state.zs(12)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
+                    space::vertical().height(state.z(4)),
+                    button(text("＋ Create / join a server").size(state.zs(13)))
+                        .on_press(Msg::OpenGuildModal)
+                        .width(Length::Fill)
+                        .style(button::primary)
+                        .padding([state.z(8.0), state.z(10.0)]),
+                ].spacing(state.z(8)).padding(state.z(12)).into()
+            }
+        }
+    };
+
+    // ----- Bottom tab bar: DMs / Servers / Settings -----
+    let dms_selected = state.left_tab == LeftTab::Dms;
+    let servers_selected = state.left_tab == LeftTab::Servers;
+    let dms_tab = button(text("DMs").size(state.zs(12)))
+        .on_press(Msg::SetLeftTab(LeftTab::Dms))
+        .width(Length::Fill)
+        .padding([state.z(6.0), state.z(6.0)])
+        .style(if dms_selected { button::primary } else { button::secondary });
+    let servers_tab = button(text("Servers").size(state.zs(12)))
+        .on_press(Msg::SetLeftTab(LeftTab::Servers))
+        .width(Length::Fill)
+        .padding([state.z(6.0), state.z(6.0)])
+        .style(if servers_selected { button::primary } else { button::secondary });
+    let settings_tab = button(text("Settings").size(state.zs(12)))
+        .on_press(Msg::ToggleSettings)
+        .width(Length::Fill)
+        .padding([state.z(6.0), state.z(6.0)]);
+    let bottom_bar = container(row![dms_tab, servers_tab, settings_tab].spacing(state.z(4)))
+        .padding(state.z(6))
+        .width(Length::Fill)
+        .style(|theme: &iced::Theme| {
+            let p = theme.extended_palette();
+            iced::widget::container::Style {
+                background: Some(p.background.weak.color.into()),
+                ..iced::widget::container::Style::default()
+            }
+        });
+
+    let rail_panel: Element<'_, Msg> = if state.left_tab == LeftTab::Servers {
+        row![
+            guild_rail,
+            container(main_panel)
+                .width(Length::Fixed(state.z(224.0)))
+                .height(Length::Fill),
+        ].spacing(state.z(0)).height(Length::Fill).into()
+    } else {
+        container(main_panel)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    };
+
     let sidebar_content = column![
-        header,
-        new_conv_btn,
-        scrollable(conv_list).height(Length::Fill),
-    ].spacing(state.z(8)).padding(state.z(12));
+        rail_panel,
+        bottom_bar,
+    ].height(Length::Fill);
 
     container(sidebar_content)
         .width(Length::Fixed(state.z(280.0)))

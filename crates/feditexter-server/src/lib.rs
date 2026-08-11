@@ -17,6 +17,10 @@ use api::chat_handlers::{
     list_messages, presence, search_users, send_message,
 };
 use api::federation_handlers::{inbox, user_lookup, well_known};
+use api::guilds::{
+    create_channel, create_guild, create_invite, guild_detail, join_guild, leave_guild,
+    list_guilds,
+};
 use api::moderation::{block_user, mute_user, unblock_user, unmute_user, user_profile};
 use api::preview::link_preview;
 use api::ws::ws_handler;
@@ -42,6 +46,12 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/users/{id}/unblock", post(unblock_user))
         .route("/api/users/{id}/mute", post(mute_user))
         .route("/api/users/{id}/unmute", post(unmute_user))
+        .route("/api/servers", get(list_guilds).post(create_guild))
+        .route("/api/servers/join", post(join_guild))
+        .route("/api/servers/{id}", get(guild_detail))
+        .route("/api/servers/{id}/channels", post(create_channel))
+        .route("/api/servers/{id}/invite", post(create_invite))
+        .route("/api/servers/{id}/leave", post(leave_guild))
         .route("/api/conversations", post(create_conversation))
         .route("/api/conversations", get(list_conversations))
         .route("/api/users/search", get(search_users))
