@@ -43,17 +43,21 @@ jobs:
             target: aarch64-apple-darwin
             name: feditexter-iced-macos-arm64
             binary: feditexter-iced
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            name: feditexter-iced-macos-x64
-            binary: feditexter-iced
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             name: feditexter-iced-windows-x64.exe
             binary: feditexter-iced.exe
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            name: feditexter-iced-windows-arm64.exe
+            binary: feditexter-iced.exe
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             name: feditexter-iced-linux-x64
+            binary: feditexter-iced
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            name: feditexter-iced-linux-arm64
             binary: feditexter-iced
     runs-on: ${{ matrix.os }}
     steps:
@@ -65,13 +69,33 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install Linux build deps
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev \
             libwayland-dev libx11-dev libxcb1-dev libxcb-render0-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libgtk-3-dev \
             libfontconfig1-dev libfreetype6-dev libssl-dev pkg-config
+
+      - name: Install Linux aarch64 cross deps
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu pkg-config \
+            libxkbcommon-dev:arm64 libxkbcommon-x11-dev:arm64 \
+            libwayland-dev:arm64 libx11-dev:arm64 libxcb1-dev:arm64 \
+            libxcb-render0-dev:arm64 libxcb-shape0-dev:arm64 \
+            libxcb-xfixes0-dev:arm64 libgtk-3-dev:arm64 \
+            libfontconfig1-dev:arm64 libfreetype6-dev:arm64 \
+            libssl-dev:arm64
+
+      - name: Set aarch64 cross env
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig" >> "$GITHUB_ENV"
 
       - name: Build client
         run: cargo build --release --target ${{ matrix.target }} -p feditexter-iced
@@ -100,20 +124,12 @@ jobs:
           name: feditexter-iced-macos-arm64
           path: dist/arm64
 
-      - name: Download macOS x64
-        uses: actions/download-artifact@v4
-        with:
-          name: feditexter-iced-macos-x64
-          path: dist/x64
-
-      - name: Create universal binary + app bundle
+      - name: Create app bundle
         shell: bash
         run: |
           mkdir -p "FediTexter.app/Contents/MacOS"
-          lipo -create \
-            "dist/arm64/feditexter-iced-macos-arm64" \
-            "dist/x64/feditexter-iced-macos-x64" \
-            -output "FediTexter.app/Contents/MacOS/FediTexter"
+          cp "dist/arm64/feditexter-iced-macos-arm64" "FediTexter.app/Contents/MacOS/FediTexter"
+          chmod +x "FediTexter.app/Contents/MacOS/FediTexter"
           plutil -create xml1 "FediTexter.app/Contents/Info.plist"
           plutil -insert CFBundleName -string "FediTexter" "FediTexter.app/Contents/Info.plist"
           plutil -insert CFBundleDisplayName -string "FediTexter" "FediTexter.app/Contents/Info.plist"
@@ -125,19 +141,18 @@ jobs:
           plutil -insert LSMinimumSystemVersion -string "12.0" "FediTexter.app/Contents/Info.plist"
           plutil -insert NSHighResolutionCapable -bool YES "FediTexter.app/Contents/Info.plist"
           plutil -insert NSPrincipalClass -string "NSApplication" "FediTexter.app/Contents/Info.plist"
-          chmod +x "FediTexter.app/Contents/MacOS/FediTexter"
           codesign --force --deep -s - "FediTexter.app"
 
       - name: Zip app bundle
         shell: bash
         run: |
-          ditto -c -k --keepParent "FediTexter.app" "feditexter-iced-macos-universal.zip"
+          ditto -c -k --keepParent "FediTexter.app" "feditexter-iced-macos-arm64.zip"
 
-      - name: Upload universal app
+      - name: Upload macOS app
         uses: actions/upload-artifact@v4
         with:
-          name: feditexter-iced-macos-universal
-          path: feditexter-iced-macos-universal.zip
+          name: feditexter-iced-macos-arm64.zip
+          path: feditexter-iced-macos-arm64.zip
 
   release:
     needs: [build-server, build-client, package-macos-app]
@@ -150,35 +165,14 @@ jobs:
         with:
           path: artifacts
 
-      - name: Remove stale macOS binary assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          # A brand-new tag has no release yet (the "Create release" step below
-          # creates it), so the lookup 404s — nothing to clean up in that case.
-          RELEASE_RESP=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${GITHUB_REF_NAME}")
-          RELEASE_ID=$(echo "$RELEASE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
-          if [ -z "$RELEASE_ID" ]; then
-            echo "No existing release for ${GITHUB_REF_NAME}; nothing to clean up"
-            exit 0
-          fi
-          ASSETS=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets" \
-            | python3 -c "import json,sys; print(' '.join(str(a['id']) for a in json.load(sys.stdin) if a['name'].startswith('feditexter-iced-macos-') and not a['name'].endswith('.zip')))")
-          for ID in $ASSETS; do
-            echo "Deleting stale asset $ID"
-            curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/repos/${{ github.repository }}/releases/assets/$ID" -o /dev/null -w "%{http_code}\n"
-          done
-
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             artifacts/feditexter-server/feditexter-server
             artifacts/feditexter-iced-windows-x64.exe/feditexter-iced-windows-x64.exe
+            artifacts/feditexter-iced-windows-arm64.exe/feditexter-iced-windows-arm64.exe
             artifacts/feditexter-iced-linux-x64/feditexter-iced-linux-x64
-            artifacts/feditexter-iced-macos-universal/feditexter-iced-macos-universal.zip
+            artifacts/feditexter-iced-linux-arm64/feditexter-iced-linux-arm64
+            artifacts/feditexter-iced-macos-arm64.zip/feditexter-iced-macos-arm64.zip
           generate_release_notes: true
