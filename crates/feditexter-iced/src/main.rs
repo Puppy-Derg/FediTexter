@@ -1,12 +1,21 @@
 #![allow(dead_code)]
 
+mod p2p;
+
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::{SinkExt, StreamExt};
 use iced::widget::{button, column, container, mouse_area, row, rule, scrollable, space, text, text_input};
 use iced::widget::scrollable::Viewport;
 use iced::widget::Id;
-use iced::{Element, Length, Task};
+use iced::{Element, Length, Subscription, Task};
+use p2p::{P2pEvent, P2pManager, ServingFile, SignalEvent};
+use tokio::sync::mpsc::UnboundedSender;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::Message;
 
 // ---------------------------------------------------------------------------
 // API types
@@ -162,6 +171,33 @@ struct LinkPreview {
     image_handle: Option<iced::widget::image::Handle>,
 }
 
+/// A picked-but-not-yet-sent file attachment.
+#[derive(Clone, Debug)]
+struct Attachment {
+    mime: String,
+    name: String,
+    file_id: String,
+    file_size: u64,
+    thumbnail: String,
+    bytes: Vec<u8>,
+}
+
+/// A file we sent this session, kept to render our own bubble at full res.
+#[derive(Clone)]
+struct OwnFile {
+    thumbnail: String,
+    bytes: Vec<u8>,
+}
+
+/// A file fully downloaded this session (or loaded from the on-disk cache).
+#[derive(Clone)]
+struct DownloadedFile {
+    /// Cached image handle for image mimes.
+    image_handle: Option<iced::widget::image::Handle>,
+    /// On-disk cache path for the raw bytes.
+    path: Option<std::path::PathBuf>,
+}
+
 // ---------------------------------------------------------------------------
 // WebSocket hub events
 // ---------------------------------------------------------------------------
@@ -174,7 +210,7 @@ enum WsHubEvent {
     MessageEdited { message: ApiMsg },
     #[serde(rename = "message_deleted")]
     MessageDeleted { conversation_id: u64, message_id: u64 },
-    Signal { signal: serde_json::Value },
+    Signal { signal: SignalEvent },
     Typing {
         conversation_id: u64,
         from_user_id: u64,
@@ -279,6 +315,14 @@ enum Msg {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    WsSenderReady(UnboundedSender<String>),
+    P2pReady(Arc<P2pManager>),
+    P2pEvent(P2pEvent),
+    PickFile,
+    FilePicked(Result<Attachment, String>),
+    ClearAttachment,
+    OpenFile(u64),
+    RetryFile(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -342,6 +386,14 @@ struct AppState {
     zoom: f32,
     avatar_handles: HashMap<u64, iced::widget::image::Handle>,
     avatar_attempted: HashSet<u64>,
+    ws_tx: Option<UnboundedSender<String>>,
+    p2p: Option<Arc<P2pManager>>,
+    pending_attachment: Option<Attachment>,
+    own_files: HashMap<String, OwnFile>,
+    downloaded: HashMap<String, DownloadedFile>,
+    p2p_status: HashMap<String, String>,
+    thumb_handles: HashMap<String, iced::widget::image::Handle>,
+    own_full_handles: HashMap<String, iced::widget::image::Handle>,
 }
 
 impl Default for AppState {
@@ -394,6 +446,14 @@ impl Default for AppState {
             zoom: 1.0,
             avatar_handles: HashMap::new(),
             avatar_attempted: HashSet::new(),
+            ws_tx: None,
+            p2p: None,
+            pending_attachment: None,
+            own_files: HashMap::new(),
+            downloaded: HashMap::new(),
+            p2p_status: HashMap::new(),
+            thumb_handles: HashMap::new(),
+            own_full_handles: HashMap::new(),
         }
     }
 }
@@ -528,7 +588,9 @@ fn format_local_time(ts: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn boot() -> (AppState, Task<Msg>) {
-    (AppState::default(), Task::perform(restore_session(), Msg::SessionRestored))
+    let mut state = AppState::default();
+    load_cached_files(&mut state);
+    (state, Task::perform(restore_session(), Msg::SessionRestored))
 }
 
 fn main() -> iced::Result {
@@ -597,11 +659,110 @@ fn subscription(state: &AppState) -> iced::Subscription<Msg> {
                 _ => None,
             }
         }));
+        if let Some(token) = state.token.clone() {
+            subs.push(ws_subscription(state.server.clone(), token, device_id()));
+        }
     }
     if !subs.is_empty() {
         iced::Subscription::batch(subs)
     } else {
         iced::Subscription::none()
+    }
+}
+
+fn ws_subscription(server: String, token: String, device_id: String) -> Subscription<Msg> {
+    Subscription::run_with(
+        (server, token, device_id),
+        |data: &(String, String, String)| {
+            let (server, token, device_id) = data.clone();
+            iced::stream::channel(100, async move |mut output| {
+                ws_worker(server, token, device_id, &mut output).await;
+            })
+        },
+    )
+}
+
+async fn ws_worker(
+    server: String,
+    token: String,
+    device_id: String,
+    output: &mut iced::futures::channel::mpsc::Sender<Msg>,
+) {
+    let url = ws_url(&server);
+    let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (p2p_tx, mut p2p_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
+    let handle = tokio::runtime::Handle::current();
+    let p2p = P2pManager::new(handle, ws_tx.clone(), p2p_tx);
+    let _ = output.send(Msg::WsSenderReady(ws_tx.clone())).await;
+    let _ = output.send(Msg::P2pReady(p2p.clone())).await;
+
+    loop {
+        let mut request = match url.clone().into_client_request() {
+            Ok(r) => r,
+            Err(_) => {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                continue;
+            }
+        };
+        if let Ok(header) = HeaderValue::from_str(&format!("Bearer {token}")) {
+            request.headers_mut().insert("authorization", header);
+        }
+        if let Ok(header) = HeaderValue::from_str(&device_id) {
+            request.headers_mut().insert("x-device-id", header);
+        }
+        match tokio_tungstenite::connect_async(request).await {
+            Ok((ws, _)) => {
+                eprintln!("[ws] connected to {url}");
+                let _ = output.send(Msg::WsConnected).await;
+                let (mut sink, mut stream) = ws.split();
+                loop {
+                    let out_msg: Option<Msg> = tokio::select! {
+                        outgoing = ws_rx.recv() => {
+                            match outgoing {
+                                Some(text) => {
+                                    if sink.send(Message::Text(text.into())).await.is_err() {
+                                        break;
+                                    }
+                                    None
+                                }
+                                None => return,
+                            }
+                        }
+                        ev = p2p_rx.recv() => ev.map(Msg::P2pEvent),
+                        incoming = stream.next() => {
+                            match incoming {
+                                Some(Ok(Message::Text(text))) => {
+                                    serde_json::from_str::<WsHubEvent>(&text).ok().map(Msg::WsEvent)
+                                }
+                                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                                _ => None,
+                            }
+                        }
+                    };
+                    if let Some(msg) = out_msg {
+                        if output.send(msg).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                let _ = output.send(Msg::WsDisconnected).await;
+            }
+            Err(_) => {
+                let _ = output.send(Msg::WsDisconnected).await;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
+
+fn ws_url(server: &str) -> String {
+    let base = server.trim_end_matches('/');
+    if let Some(rest) = base.strip_prefix("https://") {
+        format!("wss://{rest}/api/ws")
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        format!("ws://{rest}/api/ws")
+    } else {
+        format!("ws://{base}/api/ws")
     }
 }
 
@@ -695,6 +856,14 @@ fn msg_short(msg: &Msg) -> String {
         Msg::ZoomIn => "ZoomIn".into(),
         Msg::ZoomOut => "ZoomOut".into(),
         Msg::ZoomReset => "ZoomReset".into(),
+        Msg::WsSenderReady(_) => "WsSenderReady".into(),
+        Msg::P2pReady(_) => "P2pReady".into(),
+        Msg::P2pEvent(_) => "P2pEvent".into(),
+        Msg::PickFile => "PickFile".into(),
+        Msg::FilePicked(_) => "FilePicked".into(),
+        Msg::ClearAttachment => "ClearAttachment".into(),
+        Msg::OpenFile(_) => "OpenFile".into(),
+        Msg::RetryFile(_) => "RetryFile".into(),
     }
 }
 
@@ -907,6 +1076,8 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                     }
                 }
                 state.messages = messages;
+                build_thumb_handles(state);
+                auto_fetch_files(state);
                 if tasks.is_empty() {
                     Task::none()
                 } else {
@@ -920,15 +1091,45 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
         Msg::SendMessage => {
             let body = state.draft.trim().to_string();
             let conv = match state.selected_conversation { Some(c) => c, None => return Task::none() };
-            if body.is_empty() { return Task::none(); }
+            let attachment = state.pending_attachment.take();
+            let has_attach = attachment.is_some();
+            if body.is_empty() && !has_attach { return Task::none(); }
             state.draft.clear();
+            if let Some(att) = &attachment {
+                if let Some(p2p) = &state.p2p {
+                    p2p.serve(ServingFile {
+                        file_id: att.file_id.clone(),
+                        mime: att.mime.clone(),
+                        name: att.name.clone(),
+                        size: att.file_size,
+                        bytes: att.bytes.clone(),
+                    });
+                }
+                if att.mime.starts_with("image/") {
+                    state.own_full_handles.insert(att.file_id.clone(), iced::widget::image::Handle::from_bytes(att.bytes.clone()));
+                }
+                state.own_files.insert(
+                    att.file_id.clone(),
+                    OwnFile { thumbnail: att.thumbnail.clone(), bytes: att.bytes.clone() },
+                );
+            }
             let token = state.token.clone().unwrap_or_default();
             let server = state.server.clone();
             Task::perform(async move {
                 let client = make_client();
+                let mut payload = serde_json::json!({ "body": body });
+                if let Some(att) = attachment {
+                    payload["attachment_mime"] = serde_json::json!(att.mime);
+                    payload["attachment_name"] = serde_json::json!(att.name);
+                    payload["file_id"] = serde_json::json!(att.file_id);
+                    payload["file_size"] = serde_json::json!(att.file_size);
+                    if !att.thumbnail.is_empty() {
+                        payload["thumbnail_data"] = serde_json::json!(att.thumbnail);
+                    }
+                }
                 let resp = client.post(format!("{server}/api/conversations/{conv}/messages"))
                     .bearer_auth(&token)
-                    .json(&serde_json::json!({ "body": body }))
+                    .json(&payload)
                     .send().await;
                 match resp {
                     Ok(r) if r.status().is_success() => {
@@ -946,6 +1147,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                 if !state.messages.iter().any(|x| x.id == m.id) {
                     state.messages.push(m);
                 }
+                build_thumb_handles(state);
             }
             Task::none()
         }
@@ -1021,6 +1223,8 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                         if !state.messages.iter().any(|x| x.id == msg_id) {
                             state.messages.push(message);
                         }
+                        build_thumb_handles(state);
+                        auto_fetch_files(state);
                         Task::none()
                     } else {
                         *state.unread.entry(conv_id).or_insert(0) += 1;
@@ -1055,7 +1259,12 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                     state.presence.insert(user_id, online);
                     Task::none()
                 }
-                _ => Task::none(),
+                WsHubEvent::Signal { signal } => {
+                    if let Some(p2p) = &state.p2p {
+                        p2p.handle_signal(signal);
+                    }
+                    Task::none()
+                }
             }
         }
         Msg::TypingExpired => {
@@ -1168,6 +1377,141 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                 if let Some(handle) = make_avatar_handle(bytes) {
                     state.avatar_handles.insert(user_id, handle);
                 }
+            }
+            Task::none()
+        }
+        Msg::WsSenderReady(tx) => { state.ws_tx = Some(tx); Task::none() }
+        Msg::P2pReady(p2p) => {
+            state.p2p = Some(p2p);
+            auto_fetch_files(state);
+            Task::none()
+        }
+        Msg::P2pEvent(ev) => {
+            match ev {
+                P2pEvent::Status { file_id, status } => {
+                    state.p2p_status.insert(file_id, status);
+                }
+                P2pEvent::Progress { file_id, received, total } => {
+                    let status = if total > 0 {
+                        let pct = ((received as f64 / total as f64) * 100.0) as u64;
+                        format!("receiving · {pct}%")
+                    } else {
+                        "receiving…".to_string()
+                    };
+                    state.p2p_status.insert(file_id, status);
+                }
+                P2pEvent::Complete { file_id, mime, name: _, bytes } => {
+                    std::fs::create_dir_all(files_cache_dir()).ok();
+                    let path = cache_path_for(&file_id);
+                    let _ = std::fs::write(&path, &bytes);
+                    let image_handle = if mime.starts_with("image/") {
+                        iced::widget::image::Handle::from_bytes(bytes)
+                    } else {
+                        iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 0])
+                    };
+                    let image_handle = if mime.starts_with("image/") { Some(image_handle) } else { None };
+                    state.downloaded.insert(file_id.clone(), DownloadedFile {
+                        image_handle,
+                        path: Some(path),
+                    });
+                    state.p2p_status.remove(&file_id);
+                }
+                P2pEvent::Failed { file_id, reason } => {
+                    let status = if reason.contains("offline") || reason.contains("cancel") {
+                        "offline"
+                    } else {
+                        "error"
+                    };
+                    state.p2p_status.insert(file_id, status.to_string());
+                }
+            }
+            Task::none()
+        }
+        Msg::PickFile => {
+            Task::perform(
+                async {
+                    let file = rfd::AsyncFileDialog::new().pick_file().await;
+                    let Some(handle) = file else { return Err("no file selected".to_string()); };
+                    let bytes = handle.read().await;
+                    const MAX_FILE: usize = 1024 * 1024 * 1024;
+                    if bytes.len() > MAX_FILE {
+                        return Err("file too large (max 1 GB)".to_string());
+                    }
+                    let name = handle.file_name().to_string();
+                    let mime = mime_from_path(handle.path()).to_string();
+                    let file_id = uuid::Uuid::new_v4().to_string();
+                    let file_size = bytes.len() as u64;
+                    let thumbnail = if mime.starts_with("image/") {
+                        image::load_from_memory(&bytes)
+                            .ok()
+                            .map(|img| {
+                                let max_dim = 480u32;
+                                let img = if img.width() > max_dim || img.height() > max_dim {
+                                    let scale = max_dim as f32 / img.width().max(img.height()) as f32;
+                                    img.resize(
+                                        ((img.width() as f32) * scale) as u32,
+                                        ((img.height() as f32) * scale) as u32,
+                                        image::imageops::FilterType::Lanczos3,
+                                    )
+                                } else {
+                                    img
+                                };
+                                let mut out = std::io::Cursor::new(Vec::new());
+                                let _ = img.write_to(&mut out, image::ImageFormat::Jpeg);
+                                use base64::Engine;
+                                let data = base64::engine::general_purpose::STANDARD.encode(out.into_inner());
+                                format!("data:image/jpeg;base64,{data}")
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    Ok(Attachment { mime, name, file_id, file_size, thumbnail, bytes })
+                },
+                Msg::FilePicked,
+            )
+        }
+        Msg::FilePicked(Ok(att)) => {
+            if !att.thumbnail.is_empty() {
+                if let Some(bytes) = data_url_bytes(&att.thumbnail) {
+                    state.thumb_handles.insert(att.file_id.clone(), iced::widget::image::Handle::from_bytes(bytes));
+                }
+            }
+            state.pending_attachment = Some(att);
+            Task::none()
+        }
+        Msg::FilePicked(Err(e)) => { state.error = e; Task::none() }
+        Msg::ClearAttachment => { state.pending_attachment = None; Task::none() }
+        Msg::OpenFile(msg_id) => {
+            let m = state.messages.iter().find(|m| m.id == msg_id).cloned();
+            let Some(m) = m else { return Task::none() };
+            let Some(file_id) = &m.file_id else { return Task::none() };
+            let mime = m.attachment_mime.clone().unwrap_or_default();
+            let name = m.attachment_name.clone().unwrap_or_default();
+            let is_own = state.user.as_ref().map(|u| u.id) == Some(m.sender_id);
+            let bytes = if is_own {
+                state.own_files.get(file_id).map(|o| o.bytes.clone())
+            } else {
+                state.downloaded.get(file_id)
+                    .and_then(|d| d.path.clone())
+                    .and_then(|p| std::fs::read(p).ok())
+            };
+            match bytes {
+                Some(bytes) => { open_bytes(&mime, &name, &bytes); Task::none() }
+                None => {
+                    if let Some(p2p) = state.p2p.clone() {
+                        p2p.retry_fetch(file_id, m.sender_id);
+                    }
+                    Task::none()
+                }
+            }
+        }
+        Msg::RetryFile(msg_id) => {
+            let m = state.messages.iter().find(|m| m.id == msg_id).cloned();
+            let Some(m) = m else { return Task::none() };
+            let Some(file_id) = &m.file_id else { return Task::none() };
+            if let Some(p2p) = state.p2p.clone() {
+                p2p.retry_fetch(file_id, m.sender_id);
             }
             Task::none()
         }
@@ -1458,6 +1802,12 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             state.conversations.clear();
             state.messages.clear();
             state.selected_conversation = None;
+            state.pending_attachment = None;
+            state.own_files.clear();
+            state.own_full_handles.clear();
+            state.p2p_status.clear();
+            state.ws_tx = None;
+            state.p2p = None;
             let _ = std::fs::remove_file(dirs_next::home_dir().unwrap_or_default().join(".feditexter_session"));
             Task::none()
         }
@@ -1662,6 +2012,150 @@ fn avatar_element<'a>(state: &'a AppState, user_id: u64, fallback_name: &str, si
 fn data_url_bytes(url: &str) -> Option<Vec<u8>> {
     let b64 = url.split_once(";base64,")?.1;
     base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok()
+}
+
+fn files_cache_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    std::path::Path::new(&home).join(".feditexter_files")
+}
+
+fn cache_path_for(file_id: &str) -> std::path::PathBuf {
+    files_cache_dir().join(file_id)
+}
+
+fn human_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.1} GB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1} MB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.0} KB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn mime_from_path(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("svg") => "image/svg+xml",
+        Some("mp4") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("mov") => "video/quicktime",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("ogg") => "audio/ogg",
+        Some("pdf") => "application/pdf",
+        Some("txt") => "text/plain",
+        Some("zip") => "application/zip",
+        Some("json") => "application/json",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Write an attachment's bytes to a temp file and open it in the OS viewer.
+fn open_bytes(mime: &str, name: &str, bytes: &[u8]) {
+    let ext = match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "audio/mpeg" => "mp3",
+        "audio/wav" => "wav",
+        "application/pdf" => "pdf",
+        "text/plain" => "txt",
+        _ => "bin",
+    };
+    let mut base: String = name
+        .rsplit('.')
+        .next_back()
+        .filter(|_| !name.is_empty())
+        .map(|stem| stem.to_string())
+        .unwrap_or_else(|| "feditexter".to_string());
+    base = base
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(40)
+        .collect();
+    if base.is_empty() {
+        base = "feditexter".to_string();
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("{base}-{stamp}.{ext}"));
+    if std::fs::write(&path, bytes).is_err() {
+        return;
+    }
+    let _ = open::that(&path);
+}
+
+/// Request P2P transfers for any visible file attachments we don't hold yet.
+/// Idempotent per file (the manager dedupes).
+fn auto_fetch_files(state: &AppState) {
+    let Some(p2p) = &state.p2p else { return };
+    let self_id = state.user.as_ref().map(|u| u.id);
+    for m in &state.messages {
+        if let Some(file_id) = &m.file_id {
+            if self_id == Some(m.sender_id) {
+                continue;
+            }
+            if state.downloaded.contains_key(file_id) {
+                continue;
+            }
+            p2p.fetch(file_id, m.sender_id);
+        }
+    }
+}
+
+/// Decode message thumbnails once and cache the image handles (the iced raster
+/// cache is keyed by handle id, so rebuilding a handle each frame leaks GPU
+/// texture space).
+fn build_thumb_handles(state: &mut AppState) {
+    for m in &state.messages {
+        let Some(file_id) = &m.file_id else { continue };
+        if state.thumb_handles.contains_key(file_id) {
+            continue;
+        }
+        if let Some(thumb) = &m.thumbnail_data {
+            if let Some(bytes) = data_url_bytes(thumb)
+                && let Some(handle) = make_avatar_handle(bytes)
+            {
+                state.thumb_handles.insert(file_id.clone(), handle);
+            }
+        }
+    }
+}
+
+/// Pre-load files cached on disk from earlier sessions so previously-downloaded
+/// attachments render as complete instead of re-fetching.
+fn load_cached_files(state: &mut AppState) {
+    let dir = files_cache_dir();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && let Some(name) = path.file_name().and_then(|n| n.to_str())
+            {
+                state.downloaded.insert(
+                    name.to_string(),
+                    DownloadedFile { image_handle: None, path: Some(path) },
+                );
+            }
+        }
+    }
 }
 
 /// Decode avatar bytes, upscale/crop to a square, apply a circular alpha mask
@@ -3013,6 +3507,90 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
             }
         }
 
+        if let Some(file_id) = &m.file_id {
+            let mime = m.attachment_mime.clone().unwrap_or_default();
+            let name = m.attachment_name.clone().unwrap_or_default();
+            let size = m.file_size.unwrap_or(0) as u64;
+            let is_image = mime.starts_with("image/");
+
+            let mut card_content = column![].spacing(state.z(4));
+
+            // Full-res image if we hold the file (own send or downloaded).
+            let full_handle = if is_self {
+                state.own_full_handles.get(file_id).cloned()
+            } else {
+                state.downloaded.get(file_id).and_then(|d| d.image_handle.clone())
+            };
+
+            let thumb_handle = state.thumb_handles.get(file_id).cloned();
+
+            if is_image {
+                let img_el = if let Some(h) = full_handle {
+                    iced::widget::Image::new(h)
+                        .width(Length::Fixed(state.z(280)))
+                        .height(Length::Shrink)
+                } else if let Some(h) = thumb_handle {
+                    iced::widget::Image::new(h)
+                        .width(Length::Fixed(state.z(200)))
+                        .height(Length::Shrink)
+                } else {
+                    iced::widget::Image::new(iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 0]))
+                };
+                card_content = card_content.push(img_el);
+            }
+
+            let held = is_self || state.downloaded.contains_key(file_id);
+            if !held {
+                let status = state.p2p_status.get(file_id).cloned().unwrap_or_default();
+                let status_text = if status.is_empty() { "waiting…".to_string() } else { status.clone() };
+                let status_el: Element<'_, Msg> = if status == "offline" || status == "error" {
+                    button(text(format!("{status_text} · retry")).size(state.zs(11)).color(iced::Color::from_rgb(0.9, 0.7, 0.5)))
+                        .on_press(Msg::RetryFile(m.id))
+                        .style(button::text)
+                        .padding(state.z(0))
+                        .into()
+                } else {
+                    text(status_text).size(state.zs(11)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)).into()
+                };
+                card_content = card_content.push(status_el);
+            }
+
+            let file_line = row![
+                text("📎").size(state.zs(14)),
+                text(name).size(state.zs(12)),
+                text(human_size(size)).size(state.zs(10)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+                space::horizontal(),
+                if held {
+                    button(text("Open").size(state.zs(11)).color(iced::Color::from_rgb(0.6, 0.8, 1.0)))
+                        .on_press(Msg::OpenFile(m.id))
+                        .style(button::text)
+                        .padding(state.z(0))
+                } else {
+                    button(text("Open").size(state.zs(11)).color(iced::Color::from_rgb(0.4, 0.4, 0.4)))
+                        .style(button::text)
+                        .padding(state.z(0))
+                },
+            ].spacing(state.z(8)).align_y(iced::Alignment::Center);
+            card_content = card_content.push(file_line);
+
+            let card = container(card_content)
+                .padding(state.z(8))
+                .max_width(state.z(320))
+                .style(|theme: &iced::Theme| {
+                    let p = theme.extended_palette();
+                    iced::widget::container::Style {
+                        background: Some(p.background.weak.color.into()),
+                        border: iced::Border {
+                            width: 1.0,
+                            color: p.background.weak.color,
+                            radius: 8.0.into(),
+                        },
+                        ..iced::widget::container::Style::default()
+                    }
+                });
+            bubble_content = bubble_content.push(card);
+        }
+
         if m.edited_at.is_some() {
             let edit_color = if is_self { iced::Color::from_rgba(1.0, 1.0, 1.0, 0.5) } else { iced::Color::from_rgb(0.6, 0.6, 0.6) };
             bubble_content = bubble_content.push(text("edited").size(state.zs(10)).color(edit_color));
@@ -3101,17 +3679,48 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
                 .width(Length::Fill),
         ].spacing(state.z(8)).into()
     } else {
+        let attach_btn = button(text("📎").size(state.zs(16)))
+            .on_press(Msg::PickFile)
+            .padding([state.z(8.0), state.z(10.0)]);
         let send_btn = button(text("↑").size(state.zs(16)))
             .on_press(Msg::SendMessage)
             .style(button::primary)
             .padding([state.z(8.0), state.z(12.0)]);
-        row![
+        let pending_chip: Option<Element<'_, Msg>> = state.pending_attachment.as_ref().map(|att| {
+            let thumb = if !att.thumbnail.is_empty() {
+                state.thumb_handles.get(&att.file_id).cloned()
+            } else {
+                None
+            };
+            let img: Option<iced::widget::Image<iced::widget::image::Handle>> = thumb
+                .map(|h| iced::widget::Image::new(h.clone()).width(state.z(32)).height(state.z(32)));
+            let clear = button(text("✕").size(state.zs(12))).on_press(Msg::ClearAttachment).padding(state.z(2));
+            let img_el: Element<'_, Msg> = match img {
+                Some(i) => i.into(),
+                None => text("📎").size(state.zs(16)).into(),
+            };
+            let row: Element<'_, Msg> = row![
+                img_el,
+                text(att.name.clone()).size(state.zs(12)),
+                text(human_size(att.file_size)).size(state.zs(10)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+                space::horizontal(),
+                clear,
+            ].spacing(state.z(8)).align_y(iced::Alignment::Center).into();
+            container(row).padding(state.z(6)).style(composer_style).into()
+        });
+        let input_row = row![
+            attach_btn,
             text_input("Type a message…", &state.draft)
                 .on_input(Msg::DraftChanged)
                 .on_submit(Msg::SendMessage)
                 .width(Length::Fill),
             send_btn,
-        ].spacing(state.z(8)).align_y(iced::Alignment::Center).into()
+        ].spacing(state.z(8)).align_y(iced::Alignment::Center);
+        let mut col = column![input_row].spacing(state.z(6));
+        if let Some(chip) = pending_chip {
+            col = col.push(chip);
+        }
+        col.into()
     };
 
     let composer_container = container(composer)

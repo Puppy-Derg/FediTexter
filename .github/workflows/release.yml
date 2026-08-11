@@ -81,7 +81,16 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo dpkg --add-architecture arm64
+          # Ubuntu 24.04's deb822 source restricts Architectures to amd64; allow
+          # arm64 there so the :arm64 dev packages are resolvable.
+          sudo sed -i 's/^Architectures: amd64$/Architectures: amd64 arm64/' /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          # Third-party .list repos (azure-cli, microsoft-prod, ...) have no arm64
+          # mirror; pin them to amd64 or apt-get update 404s after adding the arch.
+          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list.d/*.list 2>/dev/null || true
           sudo apt-get update
+          # gcc-aarch64-linux-gnu is the amd64 cross-compiler (runs on the host
+          # to produce arm64 binaries); pkg-config is Multi-Arch: foreign. Only
+          # the lib* dev packages are :arm64.
           sudo apt-get install -y gcc-aarch64-linux-gnu pkg-config \
             libxkbcommon-dev:arm64 libxkbcommon-x11-dev:arm64 \
             libwayland-dev:arm64 libx11-dev:arm64 libxcb1-dev:arm64 \
