@@ -13,7 +13,7 @@ use api::auth_handlers::{
 };
 use api::chat_handlers::{
     create_conversation, delete_conversation, delete_message, edit_message, list_conversations,
-    list_messages, presence, send_message,
+    list_messages, presence, search_users, send_message,
 };
 use api::federation_handlers::{inbox, user_lookup, well_known};
 use api::moderation::{block_user, mute_user, unblock_user, unmute_user, user_profile};
@@ -44,6 +44,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/users/{id}/unmute", post(unmute_user))
         .route("/api/conversations", post(create_conversation))
         .route("/api/conversations", get(list_conversations))
+        .route("/api/users/search", get(search_users))
         .route("/api/conversations/{id}", delete(delete_conversation))
         .route("/api/conversations/{id}/messages", get(list_messages))
         .route("/api/conversations/{id}/messages", post(send_message))

@@ -18,6 +18,8 @@ pub struct CreateConversationRequest {
     pub member_ids: Vec<u64>,
     #[serde(default)]
     pub handles: Vec<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -95,13 +97,14 @@ pub(crate) async fn ensure_direct_conversation(
     Ok(conversation_id)
 }
 
-async fn create_group_conversation(state: &AppState, member_ids: &[u64]) -> Result<u64, ApiError> {
+async fn create_group_conversation(state: &AppState, member_ids: &[u64], kind: &str) -> Result<u64, ApiError> {
     let mut tx = state
         .pool
         .begin()
         .await
         .map_err(|_| ApiError::Internal("db error"))?;
-    let inserted = sqlx::query("INSERT INTO conversations (kind) VALUES ('group')")
+    let inserted = sqlx::query("INSERT INTO conversations (kind) VALUES (?)")
+        .bind(kind)
         .execute(&mut *tx)
         .await
         .map_err(|_| ApiError::Internal("db error"))?;
@@ -230,7 +233,11 @@ pub async fn create_conversation(
     } else {
         let mut members = vec![auth.user.id];
         members.extend(ids);
-        create_group_conversation(&state, &members).await?
+        let kind = match body.kind.as_deref() {
+            Some("large_group") => "large_group",
+            _ => "group",
+        };
+        create_group_conversation(&state, &members, kind).await?
     };
 
     Ok((StatusCode::CREATED, Json(conversation_json(&state, conversation_id).await?)))
@@ -555,4 +562,64 @@ pub async fn delete_message(
     federation::deliver_delete_outbound(&state, conversation_id, msg_id, &auth.user);
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+pub struct SearchUsersParams {
+    pub q: Option<String>,
+}
+
+pub async fn search_users(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Query(params): Query<SearchUsersParams>,
+) -> Result<Json<Value>, ApiError> {
+    let q = params.q.unwrap_or_default().trim().to_string();
+    let domain = state.federation.domain.clone();
+
+    let users: Vec<(u64, String, String, Option<String>)> = if q.is_empty() {
+        sqlx::query_as(
+            "SELECT u.id, u.username, u.display_name, s.domain
+             FROM users u
+             LEFT JOIN servers s ON s.id = u.server_id
+             WHERE u.id != ?
+             ORDER BY u.id DESC
+             LIMIT 50",
+        )
+        .bind(auth.user.id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?
+    } else {
+        let like = format!("%{q}%");
+        sqlx::query_as(
+            "SELECT u.id, u.username, u.display_name, s.domain
+             FROM users u
+             LEFT JOIN servers s ON s.id = u.server_id
+             WHERE u.id != ?
+               AND (u.username LIKE ? OR u.display_name LIKE ?)
+             ORDER BY u.username
+             LIMIT 50",
+        )
+        .bind(auth.user.id)
+        .bind(&like)
+        .bind(&like)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?
+    };
+
+    Ok(Json(json!({
+        "users": users
+            .iter()
+            .map(|(id, username, display_name, d)| {
+                json!({
+                    "id": id,
+                    "username": username,
+                    "display_name": display_name,
+                    "domain": d.clone().unwrap_or_else(|| domain.clone()),
+                })
+            })
+            .collect::<Vec<_>>(),
+    })))
 }
