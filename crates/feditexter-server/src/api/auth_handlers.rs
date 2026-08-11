@@ -3,10 +3,36 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Instant;
 
 use crate::api::error::ApiError;
 use crate::auth::{hash_password, verify_password, AuthUser, AuthUserLax, User};
+use crate::auth::client_ip;
 use crate::db::AppState;
+
+/// Sliding-window bucket: (count, window_start).
+static RATE_BUCKETS: Mutex<Option<HashMap<String, (u64, Instant)>>> = Mutex::new(None);
+
+/// Check whether `ip` has exceeded `max` requests in the last 60s for the
+/// given `key`. Returns Ok(()) when under the limit.
+fn rate_limit(ip: &str, key: &str, max: u64) -> Result<(), ApiError> {
+    let mut guard = RATE_BUCKETS.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    let bucket = format!("{key}:{ip}");
+    let now = Instant::now();
+    let (count, window_start) = map.entry(bucket).or_insert((0, now));
+    if now.duration_since(*window_start) > std::time::Duration::from_secs(60) {
+        *count = 0;
+        *window_start = now;
+    }
+    *count += 1;
+    if *count > max {
+        return Err(ApiError::Unauthorized("too many requests, try again shortly"));
+    }
+    Ok(())
+}
 
 #[derive(Deserialize)]
 pub struct RegisterRequest {
@@ -30,6 +56,8 @@ pub async fn register(
     headers: HeaderMap,
     Json(body): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let ip = client_ip(&headers, None).unwrap_or_else(|| "unknown".to_string());
+    rate_limit(&ip, "register", 5)?;
     if body.password.len() < 8 {
         return Err(ApiError::BadRequest("password must be at least 8 characters"));
     }
@@ -116,6 +144,8 @@ pub async fn login(
     headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    let ip = client_ip(&headers, None).unwrap_or_else(|| "unknown".to_string());
+    rate_limit(&ip, "login", 10)?;
     let row: Option<(u64, String, String, String, String, bool, Option<String>, bool, bool)> = sqlx::query_as(
         "SELECT id, email, username, display_name, password_hash, email_verified, avatar_url, totp_enabled, is_bot
          FROM users WHERE email = ?",
@@ -165,21 +195,41 @@ pub struct Login2faRequest {
 /// Complete a 2FA login: verify the TOTP code for the pending session.
 pub async fn login_2fa(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<Login2faRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let token_hash = crate::auth::sha256(body.pending_token.trim());
-    let row: Option<(u64, u64)> = sqlx::query_as(
-        "SELECT id, user_id FROM sessions WHERE token_hash = ? AND is_2fa_pending = 1",
+    let session: crate::auth::Session = sqlx::query_as(
+        "SELECT id, user_id, expires_at, is_2fa_pending, device_id, login_ip
+         FROM sessions WHERE token_hash = ? AND is_2fa_pending = 1",
     )
     .bind(&token_hash)
     .fetch_optional(&state.pool)
     .await
-    .map_err(|_| ApiError::Internal("db error"))?;
+    .map_err(|_| ApiError::Internal("db error"))?
+    .ok_or(ApiError::Unauthorized("invalid or expired pending token"))?;
 
-    let (session_id, user_id) = match row {
-        Some(r) => r,
-        None => return Err(ApiError::Unauthorized("invalid or expired pending token")),
-    };
+    let session_id = session.id;
+    let user_id = session.user_id;
+
+    // Enforce device binding on the pending session (same check as every
+    // authenticated request) so a stolen pending token + TOTP code can't be
+    // used from a different device.
+    let presented_device = crate::auth::request_device_id_from_headers(&headers);
+    match (&session.device_id, &presented_device) {
+        (Some(expected), Some(actual)) if expected == actual => {}
+        (Some(_), _) => {
+            if let Err(e) = sqlx::query("DELETE FROM sessions WHERE id = ?")
+                .bind(session_id)
+                .execute(&state.pool)
+                .await
+            {
+                tracing::error!("failed to revoke pending 2fa session {session_id}: {e}");
+            }
+            return Err(ApiError::Unauthorized("session invalidated: token was used from another device"));
+        }
+        (None, Some(_)) | (None, None) => {}
+    }
 
     let secret: String = sqlx::query_scalar("SELECT totp_secret FROM users WHERE id = ?")
         .bind(user_id)

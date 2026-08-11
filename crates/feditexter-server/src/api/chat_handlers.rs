@@ -273,7 +273,7 @@ pub async fn list_messages(
 
     let messages: Vec<Message> = sqlx::query_as(
         "SELECT id, conversation_id, sender_id, body, created_at, attachment_mime, attachment_name, attachment_data,
-                file_id, file_size, thumbnail_data, edited_at, original_body, deleted_at
+                file_id, file_size, thumbnail_data, edited_at, original_body, deleted_at, remote_message_id
          FROM messages WHERE conversation_id = ? AND deleted_at IS NULL ORDER BY id ASC",
     )
     .bind(conversation_id)
@@ -361,7 +361,7 @@ pub async fn send_message(
 
     let message: Message = sqlx::query_as(
         "SELECT id, conversation_id, sender_id, body, created_at, attachment_mime, attachment_name, attachment_data,
-                file_id, file_size, thumbnail_data, edited_at, original_body, deleted_at FROM messages WHERE id = ?",
+                file_id, file_size, thumbnail_data, edited_at, original_body, deleted_at, remote_message_id FROM messages WHERE id = ?",
     )
     .bind(inserted_id)
     .fetch_one(&state.pool)
@@ -485,7 +485,7 @@ pub async fn edit_message(
     if current_body == body.body {
         let message: Message = sqlx::query_as(
             "SELECT id, conversation_id, sender_id, body, created_at, attachment_mime, attachment_name, attachment_data,
-                    file_id, file_size, thumbnail_data, edited_at, original_body, deleted_at FROM messages WHERE id = ?",
+                    file_id, file_size, thumbnail_data, edited_at, original_body, deleted_at, remote_message_id FROM messages WHERE id = ?",
         )
         .bind(msg_id)
         .fetch_one(&state.pool)
@@ -510,7 +510,7 @@ pub async fn edit_message(
 
     let message: Message = sqlx::query_as(
         "SELECT id, conversation_id, sender_id, body, created_at, attachment_mime, attachment_name, attachment_data,
-                file_id, file_size, thumbnail_data, edited_at, original_body, deleted_at FROM messages WHERE id = ?",
+                file_id, file_size, thumbnail_data, edited_at, original_body, deleted_at, remote_message_id FROM messages WHERE id = ?",
     )
     .bind(msg_id)
     .fetch_one(&state.pool)

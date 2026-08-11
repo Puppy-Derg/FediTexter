@@ -75,7 +75,7 @@ async fn insert_bot_message(
 async fn message_by_id(state: &AppState, id: u64) -> Result<Message, ApiError> {
     sqlx::query_as(
         "SELECT id, conversation_id, sender_id, body, created_at, attachment_mime, attachment_name, attachment_data,
-                file_id, file_size, thumbnail_data, edited_at, original_body, deleted_at
+                file_id, file_size, thumbnail_data, edited_at, original_body, deleted_at, remote_message_id
          FROM messages WHERE id = ?",
     )
     .bind(id)

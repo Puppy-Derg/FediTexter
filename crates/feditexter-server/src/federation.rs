@@ -335,6 +335,7 @@ async fn deliver_to_server(
         "from_username": sender.username,
         "from_id": sender.id,
         "to_id": to_remote_id,
+        "message_id": message.id,
         "body": message.body,
         "sent_at": message.created_at,
         "attachment_mime": message.attachment_mime,

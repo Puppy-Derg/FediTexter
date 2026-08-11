@@ -165,11 +165,11 @@ struct LinkPreview {
     title: Option<String>,
     #[serde(default)]
     description: Option<String>,
-    /// Raw image URLs (data URIs after fetching).
+    /// Source image URLs. Handles are resolved via the shared `media_handles`
+    /// RAM cache (keyed by image URL) so the same image across messages reuses
+    /// a single GPU texture.
     #[serde(default)]
     images: Vec<String>,
-    #[serde(skip)]
-    image_handles: Vec<iced::widget::image::Handle>,
 }
 
 /// A picked-but-not-yet-sent file attachment.
@@ -382,6 +382,9 @@ struct AppState {
     cursor_pos: iced::Point,
     link_previews: HashMap<String, LinkPreview>,
     preview_loading: HashSet<String>,
+    /// RAM cache of decoded image handles, keyed by the source image URL, so
+    /// the same image across messages/previews shares one GPU texture.
+    media_handles: HashMap<String, iced::widget::image::Handle>,
     ws_connected: bool,
     window_size: iced::Size,
     accent: iced::Color,
@@ -395,6 +398,7 @@ struct AppState {
     loading_messages: bool,
     auth_busy: bool,
     avatar_busy: bool,
+    picking_file: bool,
     zoom: f32,
     avatar_handles: HashMap<u64, iced::widget::image::Handle>,
     avatar_attempted: HashSet<u64>,
@@ -448,6 +452,7 @@ impl Default for AppState {
             cursor_pos: iced::Point::ORIGIN,
             link_previews: HashMap::new(),
             preview_loading: HashSet::new(),
+            media_handles: HashMap::new(),
             ws_connected: false,
             window_size: iced::Size::new(1024.0, 768.0),
             accent: accent_from_file(),
@@ -461,6 +466,7 @@ impl Default for AppState {
             loading_messages: false,
             auth_busy: false,
             avatar_busy: false,
+            picking_file: false,
             zoom: 1.0,
             avatar_handles: HashMap::new(),
             avatar_attempted: HashSet::new(),
@@ -682,6 +688,11 @@ fn save_session(server: &str, token: &str) {
     let path = dirs_next::home_dir().unwrap_or_default().join(".feditexter_session");
     let data = serde_json::json!({ "server": server, "token": token }).to_string();
     let _ = std::fs::write(&path, data);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,7 +1081,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             state.screen = if user.email_verified { Screen::Chat } else { Screen::Verify };
             Task::none()
         }
-        Msg::RegisterResult(Err(e)) => { state.auth_busy = false; state.error = e; Task::none() }
+        Msg::RegisterResult(Err(e)) => { state.auth_busy = false; handle_api_error(state, e) }
         Msg::TwoFaCodeChanged(c) => { state.twofa_code = c; Task::none() }
         Msg::TwoFaSubmit => {
             state.error.clear();
@@ -1110,7 +1121,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             let server = state.server.clone();
             Task::perform(load_conversations(server, token), Msg::ConversationsLoaded)
         }
-        Msg::TwoFaResult(Err(e)) => { state.auth_busy = false; state.error = e; Task::none() }
+        Msg::TwoFaResult(Err(e)) => { state.auth_busy = false; handle_api_error(state, e) }
         Msg::VerifyCodeChanged(c) => { state.verify_code = c; Task::none() }
         Msg::VerifySubmit => {
             state.error.clear();
@@ -1137,13 +1148,18 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
         }
         Msg::VerifyResult(Ok(user)) => {
             state.auth_busy = false;
-            state.user = Some(user);
-            state.screen = Screen::Chat;
-            let token = state.token.clone().unwrap_or_default();
-            let server = state.server.clone();
-            Task::perform(load_conversations(server, token), Msg::ConversationsLoaded)
+            state.user = Some(user.clone());
+            if user.totp_enabled {
+                state.screen = Screen::Chat;
+                let token = state.token.clone().unwrap_or_default();
+                let server = state.server.clone();
+                Task::perform(load_conversations(server, token), Msg::ConversationsLoaded)
+            } else {
+                state.screen = Screen::TwoFa;
+                Task::none()
+            }
         }
-        Msg::VerifyResult(Err(e)) => { state.auth_busy = false; state.error = e; Task::none() }
+        Msg::VerifyResult(Err(e)) => handle_api_error(state, e),
         Msg::SelectConversation(id) => {
             state.selected_conversation = Some(id);
             state.unread.remove(&id);
@@ -1226,6 +1242,24 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                 state.own_files.insert(
                     att.file_id.clone(),
                     OwnFile { thumbnail: att.thumbnail.clone(), bytes: att.bytes.clone() },
+                );
+                // Persist the bytes to the on-disk cache so our own sent file
+                // survives a restart (the bubble can then render it full-res and
+                // OpenFile can read it back — otherwise the bytes are RAM-only
+                // and P2P-fetching from ourselves makes no sense).
+                let path = cache_path_for(&att.file_id);
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::write(&path, &att.bytes);
+                let image_handle = if att.mime.starts_with("image/") {
+                    Some(iced::widget::image::Handle::from_bytes(att.bytes.clone()))
+                } else {
+                    None
+                };
+                state.downloaded.insert(
+                    att.file_id.clone(),
+                    DownloadedFile { image_handle, path: Some(path) },
                 );
             }
             let token = state.token.clone().unwrap_or_default();
@@ -1632,6 +1666,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             )
         }
         Msg::FilePicked(Ok(att)) => {
+            state.picking_file = false;
             if !att.thumbnail.is_empty() {
                 if let Some(bytes) = data_url_bytes(&att.thumbnail) {
                     state.thumb_handles.insert(att.file_id.clone(), iced::widget::image::Handle::from_bytes(bytes));
@@ -1640,7 +1675,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             state.pending_attachment = Some(att);
             Task::none()
         }
-        Msg::FilePicked(Err(e)) => { state.error = e; Task::none() }
+        Msg::FilePicked(Err(e)) => { state.picking_file = false; state.error = e; Task::none() }
         Msg::ClearAttachment => { state.pending_attachment = None; Task::none() }
         Msg::OpenFile(msg_id) => {
             let m = state.messages.iter().find(|m| m.id == msg_id).cloned();
@@ -1651,6 +1686,11 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             let is_own = state.user.as_ref().map(|u| u.id) == Some(m.sender_id);
             let bytes = if is_own {
                 state.own_files.get(file_id).map(|o| o.bytes.clone())
+                    .or_else(|| {
+                        state.downloaded.get(file_id)
+                            .and_then(|d| d.path.clone())
+                            .and_then(|p| std::fs::read(p).ok())
+                    })
             } else {
                 state.downloaded.get(file_id)
                     .and_then(|d| d.path.clone())
@@ -1944,11 +1984,16 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             )
         }
         Msg::LinkPreviewLoaded { url, preview } => {
-            if let Some(mut p) = preview {
-                for data_uri in &p.images {
-                    let b64 = data_uri.rsplit(',').next().unwrap_or(data_uri.as_str());
-                    if let Ok(bytes) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64) {
-                        p.image_handles.push(iced::widget::image::Handle::from_bytes(bytes));
+            if let Some(p) = preview {
+                // Decode each image's processed JPEG once and keep the handle in
+                // the RAM cache keyed by image URL, so the same image shared by
+                // several messages reuses one GPU texture.
+                for img in &p.images {
+                    if state.media_handles.contains_key(img) {
+                        continue;
+                    }
+                    if let Ok(bytes) = std::fs::read(preview_cache_path(img)) {
+                        state.media_handles.insert(img.clone(), iced::widget::image::Handle::from_bytes(bytes));
                     }
                 }
                 state.link_previews.insert(url.clone(), p);
@@ -1973,6 +2018,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             state.loading_messages = false;
             state.auth_busy = false;
             state.avatar_busy = false;
+            state.picking_file = false;
             state.preview_loading.clear();
             let _ = std::fs::remove_file(dirs_next::home_dir().unwrap_or_default().join(".feditexter_session"));
             Task::none()
@@ -1994,6 +2040,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             state.loading_messages = false;
             state.auth_busy = false;
             state.avatar_busy = false;
+            state.picking_file = false;
             state.preview_loading.clear();
             let _ = std::fs::remove_file(dirs_next::home_dir().unwrap_or_default().join(".feditexter_session"));
             state.error = reason;
@@ -2225,6 +2272,111 @@ fn cache_path_for(file_id: &str) -> std::path::PathBuf {
     files_cache_dir().join(file_id)
 }
 
+/// Directory for cached network media (avatars, link-preview images).
+fn media_cache_dir() -> std::path::PathBuf {
+    files_cache_dir().join("media")
+}
+
+/// Deterministic on-disk path for a URL's cached bytes (sha1 of the URL).
+fn media_cache_path(url: &str) -> std::path::PathBuf {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(url.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    media_cache_dir().join(hex)
+}
+
+/// Read cached bytes for `url`, or fetch them (writing through to the cache on
+/// success). Used so avatars aren't re-downloaded on every launch / re-render.
+/// This caches the RAW bytes (avatars are further processed by the renderer).
+async fn cached_bytes(url: &str) -> Result<Vec<u8>, String> {
+    cached_bytes_with_retry(url, false).await
+}
+
+async fn cached_bytes_with_retry(url: &str, retry: bool) -> Result<Vec<u8>, String> {
+    let path = media_cache_path(url);
+    if !retry {
+        if let Ok(bytes) = std::fs::read(&path)
+            && !bytes.is_empty()
+        {
+            return Ok(bytes);
+        }
+    }
+    let client = preview_http_client();
+    let resp = client.get(url).send().await.map_err(|e| format!("{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("status {}", resp.status()));
+    }
+    let bytes = resp.bytes().await.map(|b| b.to_vec()).map_err(|e| format!("{e}"))?;
+    if bytes.is_empty() {
+        return Err("empty response".into());
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, &bytes);
+    Ok(bytes)
+}
+
+/// Deterministic on-disk path for a URL's PROCESSED preview image (a downscaled
+/// JPEG). Kept separate from [`media_cache_path`] so the same URL cached raw for
+/// avatars and processed for previews never collides.
+fn preview_cache_path(url: &str) -> std::path::PathBuf {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(url.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    media_cache_dir().join(format!("preview-{hex}.jpg"))
+}
+
+/// Fetch a preview image, downscale it, and cache the PROCESSED JPEG on disk so
+/// subsequent reads skip the (expensive) decode/resize/encode entirely. A
+/// corrupt cached file is dropped and re-downloaded once.
+async fn cached_preview_jpeg(url: &str) -> Option<Vec<u8>> {
+    let path = preview_cache_path(url);
+
+    // Cache hit: read the processed JPEG (self-heal on a corrupt file).
+    if let Ok(bytes) = std::fs::read(&path)
+        && !bytes.is_empty()
+    {
+        if image::load_from_memory(&bytes).is_ok() {
+            return Some(bytes);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Fetch raw bytes (network or raw disk cache), then process once.
+    let raw = match cached_bytes(url).await {
+        Ok(b) => b,
+        Err(_) => return None,
+    };
+    if raw.len() > PREVIEW_MAX_IMAGE_BYTES {
+        return None;
+    }
+    let decoded = image::load_from_memory(&raw).ok()?;
+    let (w, h) = (decoded.width(), decoded.height());
+    let scaled = if w > PREVIEW_IMAGE_MAX_DIM || h > PREVIEW_IMAGE_MAX_DIM {
+        let scale = PREVIEW_IMAGE_MAX_DIM as f32 / w.max(h) as f32;
+        decoded.resize(
+            ((w as f32) * scale) as u32,
+            ((h as f32) * scale) as u32,
+            image::imageops::FilterType::Lanczos3,
+        )
+    } else {
+        decoded
+    };
+    let mut out = std::io::Cursor::new(Vec::new());
+    scaled.write_to(&mut out, image::ImageFormat::Jpeg).ok()?;
+    let jpeg = out.into_inner();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, &jpeg);
+    Some(jpeg)
+}
+
 fn human_size(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = 1024.0 * 1024.0;
@@ -2293,11 +2445,8 @@ fn open_bytes(mime: &str, name: &str, bytes: &[u8]) {
     if base.is_empty() {
         base = "feditexter".to_string();
     }
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!("{base}-{stamp}.{ext}"));
+    let unique = uuid::Uuid::new_v4();
+    let path = std::env::temp_dir().join(format!("{base}-{unique}.{ext}"));
     if std::fs::write(&path, bytes).is_err() {
         return;
     }
@@ -2324,7 +2473,8 @@ fn auto_fetch_files(state: &AppState) {
 
 /// Decode message thumbnails once and cache the image handles (the iced raster
 /// cache is keyed by handle id, so rebuilding a handle each frame leaks GPU
-/// texture space).
+/// texture space). Unlike avatars, thumbnails are NOT cropped or circularly
+/// masked.
 fn build_thumb_handles(state: &mut AppState) {
     for m in &state.messages {
         let Some(file_id) = &m.file_id else { continue };
@@ -2333,16 +2483,33 @@ fn build_thumb_handles(state: &mut AppState) {
         }
         if let Some(thumb) = &m.thumbnail_data {
             if let Some(bytes) = data_url_bytes(thumb)
-                && let Some(handle) = make_avatar_handle(bytes)
+                && let Ok(img) = image::load_from_memory(&bytes)
             {
-                state.thumb_handles.insert(file_id.clone(), handle);
+                let (w, h) = (img.width(), img.height());
+                let max_dim = 256u32;
+                let thumb_img = if w > max_dim || h > max_dim {
+                    let scale = max_dim as f32 / w.max(h) as f32;
+                    img.resize(
+                        ((w as f32) * scale) as u32,
+                        ((h as f32) * scale) as u32,
+                        image::imageops::FilterType::Lanczos3,
+                    )
+                } else {
+                    img
+                };
+                let mut buf = Vec::new();
+                let mut cursor = std::io::Cursor::new(&mut buf);
+                if thumb_img.write_to(&mut cursor, image::ImageFormat::Png).is_ok() {
+                    state.thumb_handles.insert(file_id.clone(), iced::widget::image::Handle::from_bytes(buf));
+                }
             }
         }
     }
 }
 
 /// Pre-load files cached on disk from earlier sessions so previously-downloaded
-/// attachments render as complete instead of re-fetching.
+/// (or sent) attachments render as complete instead of re-fetching. For images,
+/// decode the full-res handle once so bubbles show the real picture.
 fn load_cached_files(state: &mut AppState) {
     let dir = files_cache_dir();
     if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -2351,9 +2518,17 @@ fn load_cached_files(state: &mut AppState) {
             if path.is_file()
                 && let Some(name) = path.file_name().and_then(|n| n.to_str())
             {
+                let image_handle = std::fs::read(&path).ok().and_then(|bytes| {
+                    // Guard against loading enormous cached files on boot.
+                    if bytes.len() > 50_000_000 {
+                        return None;
+                    }
+                    image::load_from_memory(&bytes).ok()?;
+                    Some(iced::widget::image::Handle::from_bytes(bytes))
+                });
                 state.downloaded.insert(
                     name.to_string(),
-                    DownloadedFile { image_handle: None, path: Some(path) },
+                    DownloadedFile { image_handle, path: Some(path) },
                 );
             }
         }
@@ -2394,11 +2569,7 @@ fn make_avatar_handle(bytes: Vec<u8>) -> Option<iced::widget::image::Handle> {
 }
 
 async fn fetch_avatar_bytes(url: String) -> Result<Vec<u8>, String> {
-    let resp = make_client().get(&url).send().await.map_err(|e| format!("{e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("status {}", resp.status()));
-    }
-    resp.bytes().await.map(|b| b.to_vec()).map_err(|e| format!("{e}"))
+    cached_bytes(&url).await
 }
 
 /// Scan every known user (self, conversation members, open profile) and load
@@ -2721,29 +2892,11 @@ async fn preview_bsky_post(client: &reqwest::Client, url: &str) -> Option<(Optio
     Some((Some(title), None, imgs))
 }
 
-/// Download an image, resize to max dimension, return a JPEG data URI.
-async fn preview_fetch_image(client: &reqwest::Client, img: &str) -> Option<String> {
-    let bytes = client.get(img).send().await.ok()?.bytes().await.ok()?;
-    if bytes.len() > PREVIEW_MAX_IMAGE_BYTES {
-        return None;
-    }
-    let decoded = image::load_from_memory(&bytes).ok()?;
-    let (w, h) = (decoded.width(), decoded.height());
-    let scaled = if w > PREVIEW_IMAGE_MAX_DIM || h > PREVIEW_IMAGE_MAX_DIM {
-        let scale = PREVIEW_IMAGE_MAX_DIM as f32 / w.max(h) as f32;
-        decoded.resize(
-            ((w as f32) * scale) as u32,
-            ((h as f32) * scale) as u32,
-            image::imageops::FilterType::Lanczos3,
-        )
-    } else {
-        decoded
-    };
-    let mut out = std::io::Cursor::new(Vec::new());
-    scaled.write_to(&mut out, image::ImageFormat::Jpeg).ok()?;
-    use base64::Engine;
-    let data = base64::engine::general_purpose::STANDARD.encode(out.into_inner());
-    Some(format!("data:image/jpeg;base64,{data}"))
+/// Fetch a preview image's processed JPEG bytes (disk/network cached), returning
+/// them directly. The caller builds a handle from these once and caches it in
+/// `media_handles`.
+async fn preview_fetch_image(img: &str) -> Option<Vec<u8>> {
+    cached_preview_jpeg(img).await
 }
 
 async fn fetch_link_preview(url: String) -> Option<LinkPreview> {
@@ -2780,14 +2933,16 @@ async fn fetch_link_preview(url: String) -> Option<LinkPreview> {
         }
     }
 
-    let mut images = Vec::new();
+    // Pre-fetch all images now (populates the processed-JPEG disk cache) so the
+    // subsequent handle build in `LinkPreviewLoaded` is a fast disk read.
+    let mut images: Vec<String> = Vec::new();
     for img in image_urls {
-        if let Some(data) = preview_fetch_image(&client, &img).await {
-            images.push(data);
+        if preview_fetch_image(&img).await.is_some() {
+            images.push(img);
         }
     }
 
-    Some(LinkPreview { url, title, description, images, image_handles: Vec::new() })
+    Some(LinkPreview { url, title, description, images })
 }
 
 // ---------------------------------------------------------------------------
@@ -3773,9 +3928,13 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
             }
             if let Some(preview) = state.link_previews.get(&url) {
                 let mut card_content = column![].spacing(state.z(4));
-                if !preview.image_handles.is_empty() {
-                    let imgs: Vec<Element<'_, Msg>> = preview.image_handles.iter().map(|handle| {
-                        iced::widget::Image::new(handle.clone())
+                let img_handles: Vec<iced::widget::image::Handle> = preview.images
+                    .iter()
+                    .filter_map(|img| state.media_handles.get(img).cloned())
+                    .collect();
+                if !img_handles.is_empty() {
+                    let imgs: Vec<Element<'_, Msg>> = img_handles.into_iter().map(|handle| {
+                        iced::widget::Image::new(handle)
                             .width(Length::Fill)
                             .height(Length::Shrink)
                             .into()
@@ -3825,9 +3984,12 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
 
             let mut card_content = column![].spacing(state.z(4));
 
-            // Full-res image if we hold the file (own send or downloaded).
+            // Full-res image if we hold the file (own send or downloaded). For
+            // own sent files the handle lives in `own_full_handles` (this
+            // session) or `downloaded` (persisted to disk, survives restart).
             let full_handle = if is_self {
                 state.own_full_handles.get(file_id).cloned()
+                    .or_else(|| state.downloaded.get(file_id).and_then(|d| d.image_handle.clone()))
             } else {
                 state.downloaded.get(file_id).and_then(|d| d.image_handle.clone())
             };
@@ -4000,9 +4162,14 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
                 .width(Length::Fill),
         ].spacing(state.z(8)).into()
     } else {
-        let attach_btn = button(text("📎").size(state.zs(16)))
-            .on_press(Msg::PickFile)
-            .padding([state.z(8.0), state.z(10.0)]);
+        let attach_btn: Element<'_, Msg> = if state.picking_file {
+            button(throbber(state.zs(16))).padding([state.z(8.0), state.z(10.0)]).into()
+        } else {
+            button(text("📎").size(state.zs(16)))
+                .on_press(Msg::PickFile)
+                .padding([state.z(8.0), state.z(10.0)])
+                .into()
+        };
         let send_btn: Element<'_, Msg> = if state.busy {
             button(throbber(state.zs(16))).padding([state.z(8.0), state.z(12.0)]).into()
         } else {
@@ -4011,6 +4178,20 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
                 .style(button::primary)
                 .padding([state.z(8.0), state.z(12.0)])
                 .into()
+        };
+        let processing_chip: Option<Element<'_, Msg>> = if state.picking_file {
+            Some(
+                container(
+                    row![throbber(state.z(14)), text("Processing…").size(state.zs(12)).color(iced::Color::from_rgb(0.5, 0.5, 0.5))]
+                        .spacing(state.z(8))
+                        .align_y(iced::Alignment::Center)
+                )
+                .padding(state.z(6))
+                .style(composer_style)
+                .into(),
+            )
+        } else {
+            None
         };
         let pending_chip: Option<Element<'_, Msg>> = state.pending_attachment.as_ref().map(|att| {
             let thumb = if !att.thumbnail.is_empty() {
@@ -4043,6 +4224,9 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
             send_btn,
         ].spacing(state.z(8)).align_y(iced::Alignment::Center);
         let mut col = column![input_row].spacing(state.z(6));
+        if let Some(chip) = processing_chip {
+            col = col.push(chip);
+        }
         if let Some(chip) = pending_chip {
             col = col.push(chip);
         }
@@ -4066,4 +4250,35 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
         .into();
 
     content
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_cache_path_is_deterministic() {
+        let url = "https://cdn.bsky.app/img/feed_fullsize/plain/did:plc:x/bafkrei1";
+        let p1 = media_cache_path(url);
+        let p2 = media_cache_path(url);
+        assert_eq!(p1, p2);
+        // Different URLs map to different cache files.
+        let p3 = media_cache_path("https://cdn.bsky.app/img/feed_fullsize/plain/did:plc:x/bafkrei2");
+        assert_ne!(p1, p3);
+        // Path is under the media cache dir and is a plain filename (no slashes).
+        let name = p1.file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(name.len(), 40, "sha1 hex is 40 chars");
+        assert!(!name.contains('/') && !name.contains('\\'));
+        assert!(p1.starts_with(files_cache_dir().join("media")));
+    }
+
+    #[test]
+    fn preview_cache_path_is_distinct_from_raw() {
+        let url = "https://cdn.bsky.app/img/feed_fullsize/plain/did:plc:x/bafkrei1";
+        // Processed preview cache is a .jpg file, separate from the raw cache,
+        // so a URL cached both ways never collides.
+        assert_ne!(preview_cache_path(url), media_cache_path(url));
+        assert!(preview_cache_path(url).extension().is_some());
+        assert!(preview_cache_path(url).starts_with(media_cache_dir()));
+    }
 }

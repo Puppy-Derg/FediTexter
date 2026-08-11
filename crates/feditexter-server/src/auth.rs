@@ -27,13 +27,13 @@ pub struct User {
 }
 
 #[derive(FromRow)]
-struct Session {
-    id: u64,
-    user_id: u64,
-    expires_at: chrono::NaiveDateTime,
-    is_2fa_pending: bool,
-    device_id: Option<String>,
-    login_ip: Option<String>,
+pub(crate) struct Session {
+    pub(crate) id: u64,
+    pub(crate) user_id: u64,
+    pub(crate) expires_at: chrono::NaiveDateTime,
+    pub(crate) is_2fa_pending: bool,
+    pub(crate) device_id: Option<String>,
+    pub(crate) login_ip: Option<String>,
 }
 
 pub struct AuthUser {
@@ -157,8 +157,13 @@ async fn load_auth_user(
 
 /// The device UUID presented by the client, if any.
 pub(crate) fn request_device_id(parts: &Parts) -> Option<String> {
-    parts
-        .headers
+    request_device_id_from_headers(&parts.headers)
+}
+
+/// Same as [`request_device_id`] but takes a plain header map so handlers that
+/// don't use [`FromRequestParts`] can also extract it.
+pub(crate) fn request_device_id_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
         .get("x-device-id")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string())
@@ -199,10 +204,13 @@ async fn enforce_session_binding(
             // The token is being used from a device it was never issued to (or
             // with no device header at all) — revoke the session so the token
             // can't be replayed anywhere else.
-            let _ = sqlx::query("DELETE FROM sessions WHERE id = ?")
+            if let Err(e) = sqlx::query("DELETE FROM sessions WHERE id = ?")
                 .bind(session.id)
                 .execute(&state.pool)
-                .await;
+                .await
+            {
+                tracing::error!("failed to revoke compromised session {}: {e}", session.id);
+            }
             return Err(ApiError::Unauthorized("session invalidated: token was used from another device"));
         }
         (None, Some(actual)) => {

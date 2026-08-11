@@ -62,6 +62,7 @@ pub struct InboxMessage {
     pub from_username: String,
     pub from_id: u64,
     pub to_id: u64,
+    #[serde(default)]
     pub body: String,
     #[serde(default)]
     pub sent_at: Option<String>,
@@ -79,6 +80,14 @@ pub struct InboxMessage {
     pub signal_kind: Option<String>,
     #[serde(default)]
     pub signal_data: Option<String>,
+    /// For message_edit / message_delete events.
+    #[serde(default)]
+    pub message_id: Option<u64>,
+    /// For message_edit events.
+    #[serde(default)]
+    pub original_body: Option<String>,
+    #[serde(default)]
+    pub edited_at: Option<String>,
 }
 
 pub async fn inbox(
@@ -131,6 +140,57 @@ pub async fn inbox(
         return Ok(Json(json!({ "status": "ok" })));
     }
 
+    if payload.kind == "message_edit" {
+        let message_id = payload.message_id.ok_or(ApiError::BadRequest("message_edit requires a message_id"))?;
+        let edited_at: Option<chrono::NaiveDateTime> = payload.edited_at
+            .as_deref()
+            .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f").ok())
+            .or(Some(chrono::Utc::now().naive_utc()));
+        sqlx::query("UPDATE messages SET body = ?, original_body = ?, edited_at = ? WHERE remote_message_id = ? AND sender_id = ?")
+            .bind(&payload.body)
+            .bind(&payload.original_body)
+            .bind(edited_at)
+            .bind(message_id)
+            .bind(sender_id)
+            .execute(&state.pool)
+            .await
+            .map_err(|_| ApiError::Internal("db error"))?;
+        // Re-read the updated row so we can publish the correct local id.
+        let edited: Message = sqlx::query_as(
+            "SELECT id, conversation_id, sender_id, body, created_at, attachment_mime, attachment_name, attachment_data,
+                    file_id, file_size, thumbnail_data, edited_at, original_body, deleted_at, remote_message_id FROM messages WHERE remote_message_id = ? AND sender_id = ?",
+        )
+        .bind(message_id)
+        .bind(sender_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?;
+        state.hub.publish_message_edited(edited);
+        return Ok(Json(json!({ "status": "ok" })));
+    }
+
+    if payload.kind == "message_delete" {
+        let message_id = payload.message_id.ok_or(ApiError::BadRequest("message_delete requires a message_id"))?;
+        let row: Option<(u64, u64)> = sqlx::query_as(
+            "SELECT id, conversation_id FROM messages WHERE remote_message_id = ? AND sender_id = ? AND deleted_at IS NULL",
+        )
+        .bind(message_id)
+        .bind(sender_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?;
+        if let Some((local_id, conv_id)) = row {
+            sqlx::query("UPDATE messages SET deleted_at = ? WHERE id = ?")
+                .bind(chrono::Utc::now().naive_utc())
+                .bind(local_id)
+                .execute(&state.pool)
+                .await
+                .map_err(|_| ApiError::Internal("db error"))?;
+            state.hub.publish_message_deleted(conv_id, local_id);
+        }
+        return Ok(Json(json!({ "status": "ok" })));
+    }
+
     if payload.kind != "message" {
         return Err(ApiError::BadRequest("unsupported event type"));
     }
@@ -143,8 +203,8 @@ pub async fn inbox(
     let created_at = chrono::Utc::now().naive_utc();
     let inserted = sqlx::query(
         "INSERT INTO messages (conversation_id, sender_id, body, created_at, attachment_mime, attachment_name,
-                               file_id, file_size, thumbnail_data)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                               file_id, file_size, thumbnail_data, remote_message_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(conversation_id)
     .bind(sender_id)
@@ -155,13 +215,14 @@ pub async fn inbox(
     .bind(&payload.file_id)
     .bind(payload.file_size)
     .bind(&payload.thumbnail_data)
+    .bind(payload.message_id)
     .execute(&state.pool)
     .await
     .map_err(|_| ApiError::Internal("db error"))?;
 
     let message: Message = sqlx::query_as(
         "SELECT id, conversation_id, sender_id, body, created_at, attachment_mime, attachment_name, attachment_data,
-                file_id, file_size, thumbnail_data FROM messages WHERE id = ?",
+                file_id, file_size, thumbnail_data, edited_at, original_body, deleted_at, remote_message_id FROM messages WHERE id = ?",
     )
     .bind(inserted.last_insert_id())
     .fetch_one(&state.pool)

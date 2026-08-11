@@ -27,6 +27,12 @@ pub struct Message {
     pub original_body: Option<String>,
     #[serde(default)]
     pub deleted_at: Option<chrono::NaiveDateTime>,
+    /// The sender's original message id, stored when the message arrived via
+    /// federation. Used to cross-reference edits/deletes (which arrive with the
+    /// remote id, not the local one).
+    #[serde(default)]
+    #[sqlx(default)]
+    pub remote_message_id: Option<u64>,
 }
 
 #[derive(FromRow, Debug, Clone)]
