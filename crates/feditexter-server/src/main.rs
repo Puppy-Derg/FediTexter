@@ -45,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build()
             .expect("failed to build http client"),
         presence: Default::default(),
+        voice: Default::default(),
     };
 
     // Clone the state for axum; keep an Arc for the background bot task.

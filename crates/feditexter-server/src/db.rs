@@ -1,5 +1,5 @@
 use sqlx::MySqlPool;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::chat::ChatHub;
@@ -20,4 +20,8 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// Users with an active WebSocket connection (presence).
     pub presence: Arc<Mutex<HashSet<u64>>>,
+    /// Voice channel occupancy: (guild_id, channel_id) -> user_id -> username.
+    /// In-memory only — voice presence is inherently per-process (the P2P mesh
+    /// only spans clients currently connected to this instance).
+    pub voice: Arc<Mutex<HashMap<(u64, u64), HashMap<u64, String>>>>,
 }

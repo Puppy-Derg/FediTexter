@@ -75,9 +75,13 @@ jobs:
           sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev \
             libwayland-dev libx11-dev libxcb1-dev libxcb-render0-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libgtk-3-dev \
-            libfontconfig1-dev libfreetype6-dev libssl-dev pkg-config
+            libfontconfig1-dev libfreetype6-dev libssl-dev pkg-config \
+            libasound2-dev libv4l-dev libpipewire-0.3-dev libspa-0.2-dev
           # The aarch64 job runs natively on an arm64 runner (ubuntu-24.04-arm),
           # so the packages above are native — no cross toolchain needed.
+          # libasound2-dev (cpal), libv4l-dev (nokhwa camera), and
+          # libpipewire/libspa (xcap screen capture) are required by the voice
+          # chat feature's audio/video capture stack.
 
       - name: Build client
         run: cargo build --release --target ${{ matrix.target }} -p feditexter-iced
@@ -123,6 +127,9 @@ jobs:
           plutil -insert LSMinimumSystemVersion -string "12.0" "FediTexter.app/Contents/Info.plist"
           plutil -insert NSHighResolutionCapable -bool YES "FediTexter.app/Contents/Info.plist"
           plutil -insert NSPrincipalClass -string "NSApplication" "FediTexter.app/Contents/Info.plist"
+          plutil -insert NSMicrophoneUsageDescription -string "FediTexter uses the microphone for voice channels." "FediTexter.app/Contents/Info.plist"
+          plutil -insert NSCameraUsageDescription -string "FediTexter uses the camera for video in voice channels." "FediTexter.app/Contents/Info.plist"
+          plutil -insert NSScreenCaptureUsageDescription -string "FediTexter shares your screen in voice channels when you choose to." "FediTexter.app/Contents/Info.plist"
           codesign --force --deep -s - "FediTexter.app"
 
       - name: Zip app bundle

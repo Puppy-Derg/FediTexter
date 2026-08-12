@@ -28,3 +28,10 @@ dirs-next = "2"
 infer = "0.16"
 open = "5"
 iced_aw = { version = "0.14.1", default-features = false, features = ["spinner"] }
+cpal = "0.18.1"
+audiopus = "0.2.0"
+rubato = "5.0.0"
+openh264 = "0.9.8"
+rtc = "0.20.2"
+nokhwa = { version = "0.10.11", default-features = false, features = ["decoding", "input-native"] }
+xcap = "0.9.8"

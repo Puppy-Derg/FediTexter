@@ -21,6 +21,17 @@ pub struct CreateGuildRequest {
 #[derive(Deserialize)]
 pub struct CreateChannelRequest {
     pub name: String,
+    /// "text" (default) or "voice".
+    #[serde(default = "default_text")]
+    pub channel_type: String,
+}
+
+fn default_text() -> String {
+    "text".to_string()
+}
+
+fn valid_channel_type(t: &str) -> bool {
+    matches!(t, "text" | "voice")
 }
 
 #[derive(Deserialize)]
@@ -169,10 +180,11 @@ async fn unsync_guild_member_channels(state: &AppState, guild_id: u64, user_id: 
     Ok(())
 }
 
-fn channel_json(_state: &AppState, conv_id: u64, name: &str) -> Value {
+fn channel_json(_state: &AppState, conv_id: u64, name: &str, channel_type: &str) -> Value {
     json!({
         "id": conv_id,
         "name": name,
+        "channel_type": channel_type,
     })
 }
 
@@ -195,8 +207,8 @@ pub async fn list_guilds(
 
     let mut out = Vec::new();
     for (gid, gname, owner_id) in guilds {
-        let channels: Vec<(u64, String)> = sqlx::query_as(
-            "SELECT id, name FROM conversations WHERE guild_id = ? AND name IS NOT NULL ORDER BY name",
+        let channels: Vec<(u64, String, String)> = sqlx::query_as(
+            "SELECT id, name, channel_type FROM conversations WHERE guild_id = ? AND name IS NOT NULL ORDER BY name",
         )
         .bind(gid)
         .fetch_all(&state.pool)
@@ -223,7 +235,7 @@ pub async fn list_guilds(
             "name": gname,
             "owner_id": owner_id,
             "member_count": member_count,
-            "channels": channels.iter().map(|(cid, name)| channel_json(&state, *cid, name)).collect::<Vec<_>>(),
+            "channels": channels.iter().map(|(cid, name, ctype)| channel_json(&state, *cid, name, ctype)).collect::<Vec<_>>(),
             "members": members.iter().map(|(id, username, display_name, _server_id)| json!({ "id": id, "username": username, "display_name": display_name })).collect::<Vec<_>>(),
         }));
     }
@@ -249,8 +261,8 @@ pub async fn guild_detail(
     let Some((name, owner_id)) = row else {
         return Err(ApiError::NotFound("guild not found"));
     };
-    let channels: Vec<(u64, String)> = sqlx::query_as(
-        "SELECT id, name FROM conversations WHERE guild_id = ? AND name IS NOT NULL ORDER BY name",
+    let channels: Vec<(u64, String, String)> = sqlx::query_as(
+        "SELECT id, name, channel_type FROM conversations WHERE guild_id = ? AND name IS NOT NULL ORDER BY name",
     )
     .bind(guild_id)
     .fetch_all(&state.pool)
@@ -318,7 +330,7 @@ pub async fn guild_detail(
         "name": name,
         "owner_id": owner_id,
         "can_manage": is_admin_viewer,
-        "channels": channels.iter().map(|(cid, name)| channel_json(&state, *cid, name)).collect::<Vec<_>>(),
+        "channels": channels.iter().map(|(cid, name, ctype)| channel_json(&state, *cid, name, ctype)).collect::<Vec<_>>(),
         "members": members.iter().map(|(id, username, display_name)| json!({ "id": id, "username": username, "display_name": display_name })).collect::<Vec<_>>(),
         "roles": roles,
         "bans": bans,
@@ -392,6 +404,9 @@ pub async fn create_channel(
     if name.is_empty() || name.len() > 100 {
         return Err(ApiError::BadRequest("channel name must be 1-100 characters"));
     }
+    if !valid_channel_type(&body.channel_type) {
+        return Err(ApiError::BadRequest("channel_type must be 'text' or 'voice'"));
+    }
     let exists: Option<(u64,)> = sqlx::query_as("SELECT id FROM guilds WHERE id = ?")
         .bind(guild_id)
         .fetch_optional(&state.pool)
@@ -405,9 +420,10 @@ pub async fn create_channel(
     }
 
     let mut tx = state.pool.begin().await.map_err(|_| ApiError::Internal("db error"))?;
-    let inserted = sqlx::query("INSERT INTO conversations (kind, guild_id, name) VALUES ('group', ?, ?)")
+    let inserted = sqlx::query("INSERT INTO conversations (kind, guild_id, name, channel_type) VALUES ('group', ?, ?, ?)")
         .bind(guild_id)
         .bind(&name)
+        .bind(&body.channel_type)
         .execute(&mut *tx)
         .await
         .map_err(|_| ApiError::Internal("db error"))?;
@@ -428,7 +444,7 @@ pub async fn create_channel(
     }
     tx.commit().await.map_err(|_| ApiError::Internal("db error"))?;
 
-    Ok(Json(json!({ "id": conv_id, "name": name })))
+    Ok(Json(json!({ "id": conv_id, "name": name, "channel_type": body.channel_type })))
 }
 
 /// Generate an invite code for the guild (owner only).

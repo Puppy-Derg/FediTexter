@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 mod p2p;
+mod voice;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use iced::widget::Id;
 use iced::{Element, Length, Subscription, Task};
 use p2p::{P2pEvent, P2pManager, ServingFile, SignalEvent};
 use tokio::sync::mpsc::UnboundedSender;
+use voice::{VoiceEvent, VoiceManager, VoiceVideoKind};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
@@ -105,6 +107,14 @@ struct GuildMember {
 struct GuildChannel {
     id: u64,
     name: String,
+    #[serde(default)]
+    channel_type: String,
+}
+
+impl GuildChannel {
+    fn is_voice(&self) -> bool {
+        self.channel_type == "voice"
+    }
 }
 
 /// A named role inside a guild (admin is the built-in one).
@@ -324,6 +334,10 @@ enum WsHubEvent {
         from_username: String,
     },
     Presence { user_id: u64, online: bool },
+    #[serde(rename = "voicepresence")]
+    VoicePresence { channel_id: u64, user_id: u64, username: String, joined: bool },
+    #[serde(rename = "voicestate")]
+    VoiceState { channel_id: u64, users: Vec<(u64, String)> },
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +441,13 @@ enum Msg {
     WsSenderReady(UnboundedSender<String>),
     P2pReady(Arc<P2pManager>),
     P2pEvent(P2pEvent),
+    VoiceReady(Arc<VoiceManager>),
+    VoiceEvent(VoiceEvent),
+    VoiceJoin(u64),
+    VoiceLeave,
+    VoiceToggleMute,
+    VoiceToggleCamera,
+    VoiceToggleScreen,
     PickFile,
     FilePicked(Result<Attachment, String>),
     ClearAttachment,
@@ -455,6 +476,7 @@ enum Msg {
     CreateChannelSubmit(u64),
     ChannelCreated(Result<(), String>),
     ChannelNameInput(String),
+    ChannelTypeChanged(bool),
     SetLeftTab(LeftTab),
     DeleteGuild(u64),
     GuildDeleteResult(Result<(), String>),
@@ -555,6 +577,7 @@ struct AppState {
     guild_name_input: String,
     guild_join_code_input: String,
     channel_name_input: String,
+    channel_is_voice: bool,
     guild_busy: bool,
     messages: Vec<ApiMsg>,
     selected_conversation: Option<u64>,
@@ -603,6 +626,10 @@ struct AppState {
     avatar_attempted: HashSet<u64>,
     ws_tx: Option<UnboundedSender<String>>,
     p2p: Option<Arc<P2pManager>>,
+    voice: Option<Arc<VoiceManager>>,
+    /// user_id -> kind -> (image handle, w, h) for the latest remote frame.
+    voice_frames: HashMap<(u64, VoiceVideoKind), (iced::widget::image::Handle, u32, u32)>,
+    voice_panel_open: bool,
     pending_attachment: Option<Attachment>,
     own_files: HashMap<String, OwnFile>,
     downloaded: HashMap<String, DownloadedFile>,
@@ -655,6 +682,7 @@ impl Default for AppState {
             guild_name_input: String::new(),
             guild_join_code_input: String::new(),
             channel_name_input: String::new(),
+            channel_is_voice: false,
             guild_busy: false,
             messages: Vec::new(),
             selected_conversation: None,
@@ -701,6 +729,9 @@ impl Default for AppState {
             avatar_attempted: HashSet::new(),
             ws_tx: None,
             p2p: None,
+            voice: None,
+            voice_frames: HashMap::new(),
+            voice_panel_open: false,
             pending_attachment: None,
             own_files: HashMap::new(),
             downloaded: HashMap::new(),
@@ -1242,10 +1273,13 @@ async fn ws_worker(
     let url = ws_url(&server);
     let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (p2p_tx, mut p2p_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
+    let (voice_tx, mut voice_rx) = tokio::sync::mpsc::unbounded_channel::<VoiceEvent>();
     let handle = tokio::runtime::Handle::current();
-    let p2p = P2pManager::new(handle, ws_tx.clone(), p2p_tx);
+    let p2p = P2pManager::new(handle.clone(), ws_tx.clone(), p2p_tx);
+    let voice = VoiceManager::new(handle, ws_tx.clone(), voice_tx);
     let _ = output.send(Msg::WsSenderReady(ws_tx.clone())).await;
     let _ = output.send(Msg::P2pReady(p2p.clone())).await;
+    let _ = output.send(Msg::VoiceReady(voice.clone())).await;
 
     loop {
         let mut request = match url.clone().into_client_request() {
@@ -1280,6 +1314,7 @@ async fn ws_worker(
                             }
                         }
                         ev = p2p_rx.recv() => ev.map(Msg::P2pEvent),
+                        ev = voice_rx.recv() => ev.map(Msg::VoiceEvent),
                         incoming = stream.next() => {
                             match incoming {
                                 Some(Ok(Message::Text(text))) => {
@@ -1424,6 +1459,13 @@ fn msg_short(msg: &Msg) -> String {
         Msg::WsSenderReady(_) => "WsSenderReady".into(),
         Msg::P2pReady(_) => "P2pReady".into(),
         Msg::P2pEvent(_) => "P2pEvent".into(),
+        Msg::VoiceReady(_) => "VoiceReady".into(),
+        Msg::VoiceEvent(_) => "VoiceEvent".into(),
+        Msg::VoiceJoin(_) => "VoiceJoin".into(),
+        Msg::VoiceLeave => "VoiceLeave".into(),
+        Msg::VoiceToggleMute => "VoiceToggleMute".into(),
+        Msg::VoiceToggleCamera => "VoiceToggleCamera".into(),
+        Msg::VoiceToggleScreen => "VoiceToggleScreen".into(),
         Msg::PickFile => "PickFile".into(),
         Msg::FilePicked(_) => "FilePicked".into(),
         Msg::ClearAttachment => "ClearAttachment".into(),
@@ -1452,6 +1494,7 @@ fn msg_short(msg: &Msg) -> String {
         Msg::CreateChannelSubmit(_) => "CreateChannelSubmit".into(),
         Msg::ChannelCreated(_) => "ChannelCreated".into(),
         Msg::ChannelNameInput(_) => "ChannelNameInput".into(),
+        Msg::ChannelTypeChanged(_) => "ChannelTypeChanged".into(),
         Msg::SetLeftTab(_) => "SetLeftTab".into(),
         Msg::DeleteGuild(_) => "DeleteGuild".into(),
         Msg::GuildDeleteResult(_) => "GuildDeleteResult".into(),
@@ -2203,7 +2246,13 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
         Msg::ShowOriginal(body) => { state.original_body_text = Some(body); Task::none() }
         Msg::CloseOriginal => { state.original_body_text = None; Task::none() }
         Msg::WsConnected => { state.ws_connected = true; Task::none() }
-        Msg::WsDisconnected => { state.ws_connected = false; Task::none() }
+        Msg::WsDisconnected => {
+            state.ws_connected = false;
+            if let Some(voice) = &state.voice {
+                voice.leave();
+            }
+            Task::none()
+        }
         Msg::WsEvent(ev) => {
             match ev {
                 WsHubEvent::Message { message } => {
@@ -2250,8 +2299,24 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                     Task::none()
                 }
                 WsHubEvent::Signal { signal } => {
-                    if let Some(p2p) = &state.p2p {
+                    if signal.file_id.starts_with("voice-") {
+                        if let Some(voice) = &state.voice {
+                            voice.handle_signal(signal);
+                        }
+                    } else if let Some(p2p) = &state.p2p {
                         p2p.handle_signal(signal);
+                    }
+                    Task::none()
+                }
+                WsHubEvent::VoicePresence { channel_id, user_id, username, joined } => {
+                    if let Some(voice) = &state.voice {
+                        voice.handle_voice_presence(channel_id, user_id, username, joined);
+                    }
+                    Task::none()
+                }
+                WsHubEvent::VoiceState { channel_id, users } => {
+                    if let Some(voice) = &state.voice {
+                        voice.handle_voice_state(channel_id, users);
                     }
                     Task::none()
                 }
@@ -2454,13 +2519,15 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
         }
         Msg::GuildJoined(Err(e)) => { state.guild_busy = false; handle_api_error(state, e) }
         Msg::ChannelNameInput(s) => { state.channel_name_input = s; Task::none() }
+        Msg::ChannelTypeChanged(v) => { state.channel_is_voice = v; Task::none() }
         Msg::CreateChannelSubmit(guild_id) => {
             state.guild_busy = true;
             let name = state.channel_name_input.trim().to_string();
             if name.is_empty() { state.guild_busy = false; return Task::none(); }
             let token = state.token.clone().unwrap_or_default();
             let server = state.server.clone();
-            Task::perform(create_channel_api(server, token, guild_id, name), Msg::ChannelCreated)
+            let channel_type = if state.channel_is_voice { "voice".to_string() } else { "text".to_string() };
+            Task::perform(create_channel_api(server, token, guild_id, name, channel_type), Msg::ChannelCreated)
         }
         Msg::ChannelCreated(Ok(())) => {
             state.guild_busy = false;
@@ -2637,6 +2704,66 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
         Msg::P2pReady(p2p) => {
             state.p2p = Some(p2p);
             auto_fetch_files(state);
+            Task::none()
+        }
+        Msg::VoiceReady(voice) => {
+            state.voice = Some(voice);
+            Task::none()
+        }
+        Msg::VoiceEvent(ev) => {
+            match ev {
+                VoiceEvent::Joined { .. } => {
+                    state.voice_frames.clear();
+                    state.voice_panel_open = true;
+                }
+                VoiceEvent::MemberLeft { user_id } => {
+                    state.voice_frames.retain(|(uid, _), _| *uid != user_id);
+                }
+                VoiceEvent::Video { user_id, kind, width, height, rgba } => {
+                    let handle = iced::widget::image::Handle::from_rgba(width, height, rgba);
+                    state.voice_frames.insert((user_id, kind), (handle, width, height));
+                }
+                VoiceEvent::Left => {
+                    state.voice_frames.clear();
+                    state.voice_panel_open = false;
+                }
+                VoiceEvent::MemberJoined { .. } | VoiceEvent::Error(_) => {}
+            }
+            Task::none()
+        }
+        Msg::VoiceJoin(channel_id) => {
+            let guild_id = state.guilds.iter().find_map(|g| {
+                g.channels.iter().find(|c| c.id == channel_id).map(|_| g.id)
+            });
+            let (Some(guild_id), Some(voice), Some(user)) = (guild_id, &state.voice, &state.user)
+            else {
+                return Task::none();
+            };
+            voice.join(guild_id, channel_id, user.id);
+            Task::none()
+        }
+        Msg::VoiceLeave => {
+            if let Some(voice) = &state.voice {
+                voice.leave();
+            }
+            Task::none()
+        }
+        Msg::VoiceToggleMute => {
+            if let Some(voice) = &state.voice {
+                voice.set_muted(!voice.is_muted());
+            }
+            Task::none()
+        }
+        Msg::VoiceToggleCamera => {
+            if let Some(voice) = &state.voice {
+                voice.set_camera(!voice.camera_on());
+            }
+            Task::none()
+        }
+        Msg::VoiceToggleScreen => {
+            if let Some(voice) = &state.voice {
+                voice.set_screen(!voice.screen_on());
+            }
             Task::none()
         }
         Msg::P2pEvent(ev) => {
@@ -3096,6 +3223,11 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             Task::none()
         }
         Msg::SessionExpired(reason) => {
+            if let Some(voice) = &state.voice {
+                voice.leave();
+            }
+            state.voice_frames.clear();
+            state.voice_panel_open = false;
             state.token = None;
             state.user = None;
             state.screen = Screen::Login;
@@ -3283,11 +3415,17 @@ async fn join_guild_api(server: String, token: String, code: String) -> Result<(
     }
 }
 
-async fn create_channel_api(server: String, token: String, guild_id: u64, name: String) -> Result<(), String> {
+async fn create_channel_api(
+    server: String,
+    token: String,
+    guild_id: u64,
+    name: String,
+    channel_type: String,
+) -> Result<(), String> {
     let client = make_client();
     let resp = client.post(format!("{server}/api/servers/{guild_id}/channels"))
         .bearer_auth(&token)
-        .json(&serde_json::json!({ "name": name }))
+        .json(&serde_json::json!({ "name": name, "channel_type": channel_type }))
         .send().await;
     match resp {
         Ok(r) => {
@@ -5240,9 +5378,20 @@ fn view_guild_modal(state: &AppState) -> Element<'_, Msg> {
                 .padding([state.z(6.0), state.z(14.0)])
                 .into()
         };
+        let channel_type_row = row![
+            button(text("# Text").size(state.zs(12)))
+                .on_press(Msg::ChannelTypeChanged(false))
+                .style(if state.channel_is_voice { button::secondary } else { button::primary })
+                .padding(state.z(4)),
+            button(text("🔊 Voice").size(state.zs(12)))
+                .on_press(Msg::ChannelTypeChanged(true))
+                .style(if state.channel_is_voice { button::primary } else { button::secondary })
+                .padding(state.z(4)),
+        ].spacing(state.z(6));
         content = Some(column![
             row![title, space::horizontal(), close_btn].align_y(iced::Alignment::Center),
             text(format!("Add a channel to {}", g.name)).size(state.zs(13)).color(iced::Color::from_rgb(0.75, 0.75, 0.75)),
+            channel_type_row,
             channel_input,
             channel_btn,
         ].spacing(state.z(10)).align_x(iced::Alignment::Start));
@@ -5383,7 +5532,7 @@ fn view_guild_settings(state: &AppState) -> Element<'_, Msg> {
                         .on_input(move |v| Msg::ChannelRenameInput { channel_id: ch.id, value: v })
                         .width(Length::Fixed(state.z(180.0)));
                     let row_el: Element<'_, Msg> = row![
-                        text("#").size(state.zs(13)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
+                        text(if ch.is_voice() { "🔊" } else { "#" }).size(state.zs(13)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
                         text(ch.name.clone()).size(state.zs(13)),
                         space::horizontal(),
                         rename_input,
@@ -5399,7 +5548,17 @@ fn view_guild_settings(state: &AppState) -> Element<'_, Msg> {
                     .on_input(Msg::ChannelNameInput)
                     .on_submit(Msg::CreateChannelSubmit(g.id))
                     .width(Length::Fixed(state.z(200.0)));
-                content = content.push(row![add_input, button(text("Add channel").size(state.zs(12))).on_press(Msg::CreateChannelSubmit(g.id)).padding(state.z(4))].spacing(state.z(8)).align_y(iced::Alignment::Center));
+                let add_type = row![
+                    button(text("#").size(state.zs(12)))
+                        .on_press(Msg::ChannelTypeChanged(false))
+                        .style(if state.channel_is_voice { button::secondary } else { button::primary })
+                        .padding(state.z(2)),
+                    button(text("🔊").size(state.zs(12)))
+                        .on_press(Msg::ChannelTypeChanged(true))
+                        .style(if state.channel_is_voice { button::primary } else { button::secondary })
+                        .padding(state.z(2)),
+                ].spacing(state.z(4));
+                content = content.push(row![add_type, add_input, button(text("Add channel").size(state.zs(12))).on_press(Msg::CreateChannelSubmit(g.id)).padding(state.z(4))].spacing(state.z(8)).align_y(iced::Alignment::Center));
             }
             GuildSettingsTab::Roles => {
                 content = content.push(
@@ -5831,8 +5990,54 @@ fn view_settings(state: &AppState) -> Element<'_, Msg> {
         .into()
 }
 
-fn view_sidebar(state: &AppState) -> Element<'_, Msg> {
-    let header = row![
+/// A single guild channel row in the sidebar: text channels open a
+/// conversation, voice channels join the voice chat.
+fn guild_channel_item<'a>(state: &'a AppState, ch: &'a GuildChannel) -> Element<'a, Msg> {
+    let is_selected = state.selected_conversation == Some(ch.id);
+    let is_in_voice = state.voice.as_ref().map(|v| v.in_channel()) == Some(Some(ch.id));
+    let unread = state.unread.get(&ch.id).copied().unwrap_or(0);
+    let prefix = if ch.is_voice() { "🔊" } else { "#" };
+    let label: Element<'_, Msg> = if unread > 0 && !ch.is_voice() {
+        row![
+            container(text(prefix).size(state.zs(14)).color(iced::Color::from_rgb(0.6, 0.6, 0.6))),
+            text(&ch.name).size(state.zs(14)),
+            space::horizontal(),
+            container(text(format!("{unread}")).size(state.zs(10)).color(iced::Color::WHITE))
+                .padding([state.z(1.0), state.z(5.0)])
+                .style(|_: &iced::Theme| iced::widget::container::Style {
+                    background: Some(state.accent.into()),
+                    border: iced::Border { radius: 9.0.into(), ..iced::Border::default() },
+                    ..iced::widget::container::Style::default()
+                }),
+        ].spacing(state.z(6)).align_y(iced::Alignment::Center).into()
+    } else {
+        row![
+            container(text(prefix).size(state.zs(14)).color(iced::Color::from_rgb(0.6, 0.6, 0.6))),
+            text(&ch.name).size(state.zs(14)),
+            space::horizontal(),
+        ].spacing(state.z(6)).align_y(iced::Alignment::Center).into()
+    };
+    let msg = if ch.is_voice() {
+        Msg::VoiceJoin(ch.id)
+    } else {
+        Msg::SelectConversation(ch.id)
+    };
+    let style = if is_selected {
+        button::primary
+    } else if is_in_voice {
+        button::success
+    } else {
+        button::secondary
+    };
+    button(label)
+        .on_press(msg)
+        .width(Length::Fill)
+        .padding([state.z(6.0), state.z(8.0)])
+        .style(style)
+        .into()
+}
+
+fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
         text("Conversations").size(state.zs(18)),
     ].align_y(iced::Alignment::Center).spacing(state.z(8));
 
@@ -5900,36 +6105,24 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {
         let guild = state.guilds.iter().find(|g| g.id == guild_id);
         match guild {
             Some(g) => {
-                let items: Vec<Element<'_, Msg>> = g.channels.iter().map(|ch| {
-                    let is_selected = state.selected_conversation == Some(ch.id);
-                    let unread = state.unread.get(&ch.id).copied().unwrap_or(0);
-                    let label: Element<'_, Msg> = if unread > 0 {
-                        row![
-                            container(text("#").size(state.zs(14)).color(iced::Color::from_rgb(0.6, 0.6, 0.6))),
-                            text(&ch.name).size(state.zs(14)),
-                            space::horizontal(),
-                            container(text(format!("{unread}")).size(state.zs(10)).color(iced::Color::WHITE))
-                                .padding([state.z(1.0), state.z(5.0)])
-                                .style(|_: &iced::Theme| iced::widget::container::Style {
-                                    background: Some(state.accent.into()),
-                                    border: iced::Border { radius: 9.0.into(), ..iced::Border::default() },
-                                    ..iced::widget::container::Style::default()
-                                }),
-                        ].spacing(state.z(6)).align_y(iced::Alignment::Center).into()
-                    } else {
-                        row![
-                            text("#").size(state.zs(14)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
-                            text(&ch.name).size(state.zs(14)),
-                            space::horizontal(),
-                        ].spacing(state.z(6)).align_y(iced::Alignment::Center).into()
-                    };
-                    let btn = button(label)
-                        .on_press(Msg::SelectConversation(ch.id))
-                        .width(Length::Fill)
-                        .padding([state.z(6.0), state.z(8.0)])
-                        .style(if is_selected { button::primary } else { button::secondary });
-                    btn.into()
-                }).collect();
+                let text_channels: Vec<&GuildChannel> =
+                    g.channels.iter().filter(|ch| !ch.is_voice()).collect();
+                let voice_channels: Vec<&GuildChannel> =
+                    g.channels.iter().filter(|ch| ch.is_voice()).collect();
+
+                let mut col = column![].spacing(state.z(2));
+                for ch in text_channels {
+                    col = col.push(guild_channel_item(state, ch));
+                }
+                if !voice_channels.is_empty() {
+                    col = col.push(
+                        container(text("VOICE").size(state.zs(10)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)))
+                            .padding([state.z(8.0), 0.0]),
+                    );
+                    for ch in voice_channels {
+                        col = col.push(guild_channel_item(state, ch));
+                    }
+                }
 
                 let add_channel_btn: Element<'_, Msg> = if state.guild_busy {
                     button(throbber(state.z(12))).padding(state.z(4)).into()
@@ -5940,7 +6133,7 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {
                         .into()
                 };
                 column![
-                    column(items).spacing(state.z(2)),
+                    col,
                     add_channel_btn,
                 ].spacing(state.z(6)).into()
             }
@@ -6143,9 +6336,9 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {
         .into()
 }
 
-fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
+ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
     let Some(conv_id) = state.selected_conversation else {
-        return container(
+        let placeholder: Element<'_, Msg> = container(
             column![
                 text("FediTexter").size(state.zs(28)),
                 text("Select a conversation").size(state.zs(14)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
@@ -6154,6 +6347,11 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
         .center_x(Length::Fill)
         .center_y(Length::Fill)
         .into();
+        return if let Some(panel) = view_voice_panel(state) {
+            column![panel, placeholder].spacing(state.z(6)).into()
+        } else {
+            placeholder
+        };
     };
 
     let conv = state.conversations.iter().find(|c| c.id == conv_id);
@@ -6678,14 +6876,141 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
         .height(Length::Fill)
         .into();
 
+    let base: Element<'_, Msg> = if let Some(panel) = view_voice_panel(state) {
+        column![panel, chat_pane].spacing(state.z(6)).into()
+    } else {
+        chat_pane
+    };
+
     if state.sticker_menu_open {
-        row![chat_pane, sticker_panel(state)]
+        row![base, sticker_panel(state)]
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
     } else {
-        chat_pane
+        base
     }
+}
+
+/// Top dock shown while connected to a voice channel: current members, control
+/// buttons (mute / camera / screen / leave) and live remote video tiles.
+fn view_voice_panel(state: &AppState) -> Option<Element<'_, Msg>> {
+    let voice = state.voice.as_ref()?;
+    let channel_id = voice.in_channel()?;
+    let channel_name = state
+        .guilds
+        .iter()
+        .flat_map(|g| g.channels.iter())
+        .find(|ch| ch.id == channel_id)
+        .map(|ch| ch.name.clone())
+        .unwrap_or_else(|| "Voice".to_string());
+    let members = voice.members();
+    let self_id = state.user.as_ref().map(|u| u.id);
+    let muted = voice.is_muted();
+    let camera_on = voice.camera_on();
+    let screen_on = voice.screen_on();
+
+    let member_chips: Vec<Element<'_, Msg>> = members
+        .iter()
+        .map(|(uid, name)| {
+            let is_self = Some(*uid) == self_id;
+            let label = if is_self { format!("{name} (you)") } else { name.clone() };
+            row![
+                text("🎤").size(state.zs(12)),
+                text(label).size(state.zs(12)),
+            ]
+            .spacing(state.z(4))
+            .align_y(iced::Alignment::Center)
+            .into()
+        })
+        .collect();
+
+    let mute_btn = button(
+        container(text(if muted { "🔇" } else { "🎤" }).size(state.zs(16)))
+            .padding(state.z(6)),
+    )
+    .on_press(Msg::VoiceToggleMute)
+    .style(if muted { button::danger } else { button::secondary })
+    .padding(state.z(0));
+    let cam_btn = button(
+        container(text(if camera_on { "📷" } else { "🚫" }).size(state.zs(16)))
+            .padding(state.z(6)),
+    )
+    .on_press(Msg::VoiceToggleCamera)
+    .style(if camera_on { button::primary } else { button::secondary })
+    .padding(state.z(0));
+    let screen_btn = button(
+        container(text(if screen_on { "🖥️" } else { "🚫" }).size(state.zs(16)))
+            .padding(state.z(6)),
+    )
+    .on_press(Msg::VoiceToggleScreen)
+    .style(if screen_on { button::primary } else { button::secondary })
+    .padding(state.z(0));
+    let leave_btn = button(text("📵 Leave").size(state.zs(13)))
+        .on_press(Msg::VoiceLeave)
+        .style(button::danger)
+        .padding([state.z(6.0), state.z(12.0)]);
+
+    let tiles: Vec<Element<'_, Msg>> = state
+        .voice_frames
+        .iter()
+        .map(|((uid, kind), (handle, _w, _h))| {
+            let name = members
+                .iter()
+                .find(|(u, _)| u == uid)
+                .map(|(_, n)| n.clone())
+                .unwrap_or_else(|| format!("User {uid}"));
+            let tag = match kind {
+                VoiceVideoKind::Camera => "📷",
+                VoiceVideoKind::Screen => "🖥️",
+            };
+            column![
+                iced::widget::Image::new(handle.clone())
+                    .width(Length::Fixed(state.z(160.0)))
+                    .height(Length::Fixed(state.z(90.0))),
+                row![text(tag).size(state.zs(11)), text(name).size(state.zs(11))]
+                    .spacing(state.z(4))
+                    .align_y(iced::Alignment::Center),
+            ]
+            .spacing(state.z(4))
+            .into()
+        })
+        .collect();
+
+    let controls = row![mute_btn, cam_btn, screen_btn, space::horizontal(), leave_btn]
+        .spacing(state.z(8))
+        .align_y(iced::Alignment::Center);
+
+    let mut body = column![
+        row![
+            text("🔊 Voice: ").size(state.zs(13)),
+            text(format!("#{channel_name}")).size(state.zs(13)).color(state.accent),
+            space::horizontal(),
+            controls,
+        ].spacing(state.z(6)).align_y(iced::Alignment::Center),
+    ].spacing(state.z(6));
+    if !member_chips.is_empty() {
+        body = body.push(row(member_chips).spacing(state.z(12)));
+    }
+    if !tiles.is_empty() {
+        body = body.push(row(tiles).spacing(state.z(10)));
+    }
+
+    Some(
+        container(body)
+            .padding(state.z(10))
+            .width(Length::Fill)
+            .style(|theme: &iced::Theme| iced::widget::container::Style {
+                background: Some(theme.extended_palette().background.weak.color.into()),
+                border: iced::Border {
+                    width: 1.0,
+                    color: theme.extended_palette().background.weak.color,
+                    radius: 10.0.into(),
+                },
+                ..iced::widget::container::Style::default()
+            })
+            .into(),
+    )
 }
 
 /// Right-hand sticker picker. Slides in when toggled: searchable by pack name

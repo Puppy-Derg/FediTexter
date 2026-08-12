@@ -31,6 +31,7 @@ async fn test_state() -> AppState {
         mailer: None,
         http: reqwest::Client::new(),
         presence: Default::default(),
+        voice: Default::default(),
     }
 }
 

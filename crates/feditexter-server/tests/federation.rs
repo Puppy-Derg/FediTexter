@@ -47,6 +47,7 @@ async fn start_instance(db_url: &str) -> TestInstance {
         mailer: None,
         http: reqwest::Client::new(),
         presence: Default::default(),
+        voice: Default::default(),
     };
     let app = build_app(state.clone());
     tokio::spawn(async move {

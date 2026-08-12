@@ -36,9 +36,20 @@ struct ClientSignal {
     data: Option<String>,
 }
 
+/// A voice-channel presence message (`voice_join` / `voice_leave`).
+#[derive(Deserialize)]
+struct VoiceSignal {
+    #[serde(rename = "type")]
+    kind: String,
+    guild_id: u64,
+    channel_id: u64,
+}
+
 async fn ws_loop(socket: WebSocket, state: AppState, auth: AuthUser) {
     let mut member_conversations = load_members(&state, auth.user.id).await;
     let mut rx = state.hub.subscribe();
+    // The voice channel this connection has joined, if any (for cleanup on drop).
+    let mut voice_channel: Option<(u64, u64)> = None;
 
     // Refresh the membership snapshot so conversations created after the
     // connection opened (e.g. the user starting a chat with the bot) still
@@ -139,6 +150,37 @@ async fn ws_loop(socket: WebSocket, state: AppState, auth: AuthUser) {
                             break;
                         }
                     }
+                    Ok(HubEvent::VoicePresence { channel_id, user_id, username, joined }) => {
+                        if event_belongs_to(&channel_id, &member_conversations) {
+                            let payload = match serde_json::to_string(&HubEvent::VoicePresence {
+                                channel_id,
+                                user_id,
+                                username,
+                                joined,
+                            }) {
+                                Ok(p) => p,
+                                Err(_) => continue,
+                            };
+                            if sink.send(WsMessage::Text(payload.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(HubEvent::VoiceState { channel_id, users, target_user_id }) => {
+                        if target_user_id == auth.user.id {
+                            let payload = match serde_json::to_string(&HubEvent::VoiceState {
+                                channel_id,
+                                users,
+                                target_user_id,
+                            }) {
+                                Ok(p) => p,
+                                Err(_) => continue,
+                            };
+                            if sink.send(WsMessage::Text(payload.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
                     Err(_) => break,
                 }
             }
@@ -155,6 +197,24 @@ async fn ws_loop(socket: WebSocket, state: AppState, auth: AuthUser) {
                                 auth.user.id,
                                 auth.user.username.clone(),
                             );
+                            continue;
+                        }
+                        // Voice channel join/leave presence messages.
+                        if let Ok(voice) = serde_json::from_str::<VoiceSignal>(&text) {
+                            match voice.kind.as_str() {
+                                "voice_join" => {
+                                    if voice_join(&state, &auth, voice.guild_id, voice.channel_id).await {
+                                        voice_channel = Some((voice.guild_id, voice.channel_id));
+                                    }
+                                }
+                                "voice_leave" => {
+                                    if voice_channel == Some((voice.guild_id, voice.channel_id)) {
+                                        voice_channel = None;
+                                        voice_leave(&state, &auth, voice.guild_id, voice.channel_id).await;
+                                    }
+                                }
+                                _ => {}
+                            }
                             continue;
                         }
                         if let Ok(sig) = serde_json::from_str::<ClientSignal>(&text) {
@@ -175,19 +235,109 @@ async fn ws_loop(socket: WebSocket, state: AppState, auth: AuthUser) {
         drop(online);
         state.hub.publish_presence(auth.user.id, false);
     }
+
+    // Leaving the voice channel if the connection dropped while connected.
+    if let Some((guild_id, channel_id)) = voice_channel {
+        voice_leave(&state, &auth, guild_id, channel_id).await;
+    }
 }
 
 fn event_belongs_to(conversation_id: &u64, member_conversations: &[(u64,)]) -> bool {
     member_conversations.iter().any(|(id,)| id == conversation_id)
 }
 
+/// Validate and record a `voice_join`: the channel must be a voice channel of a
+/// guild the caller belongs to. On success, tells the joining client who is
+/// already in the channel and announces the join to the other members.
+async fn voice_join(state: &AppState, auth: &AuthUser, guild_id: u64, channel_id: u64) -> bool {
+    let row: Option<(String, u64)> = sqlx::query_as(
+        "SELECT channel_type, guild_id FROM conversations WHERE id = ?",
+    )
+    .bind(channel_id)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or_default();
+    let Some((channel_type, actual_guild)) = row else {
+        return false;
+    };
+    if channel_type != "voice" || actual_guild != guild_id {
+        return false;
+    }
+    let member: Option<(u64,)> = sqlx::query_as(
+        "SELECT user_id FROM guild_members WHERE guild_id = ? AND user_id = ?",
+    )
+    .bind(guild_id)
+    .bind(auth.user.id)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or_default();
+    if member.is_none() {
+        return false;
+    }
+
+    let mut voice = state.voice.lock().unwrap();
+    let occupants = voice.entry((guild_id, channel_id)).or_default();
+    let was_present = occupants.contains_key(&auth.user.id);
+    let users_before: Vec<(u64, String)> = occupants
+        .iter()
+        .filter(|(uid, _)| **uid != auth.user.id)
+        .map(|(uid, name)| (*uid, name.clone()))
+        .collect();
+    occupants.insert(auth.user.id, auth.user.username.clone());
+    drop(voice);
+
+    if !was_present {
+        state.hub.publish_voice_presence(
+            channel_id,
+            auth.user.id,
+            auth.user.username.clone(),
+            true,
+        );
+    }
+    // The joiner connects out to the existing occupants.
+    state
+        .hub
+        .publish_voice_state(channel_id, users_before, auth.user.id);
+    true
+}
+
+/// Record a `voice_leave` and announce it to the channel's other members.
+async fn voice_leave(state: &AppState, auth: &AuthUser, guild_id: u64, channel_id: u64) {
+    let removed = {
+        let mut voice = state.voice.lock().unwrap();
+        let mut removed = false;
+        if let Some(occupants) = voice.get_mut(&(guild_id, channel_id)) {
+            if occupants.remove(&auth.user.id).is_some() {
+                removed = true;
+            }
+            if occupants.is_empty() {
+                voice.remove(&(guild_id, channel_id));
+            }
+        }
+        removed
+    };
+    if removed {
+        state.hub.publish_voice_presence(
+            channel_id,
+            auth.user.id,
+            auth.user.username.clone(),
+            false,
+        );
+    }
+}
+
 async fn route_signal(state: &AppState, auth: &AuthUser, sig: &ClientSignal) {
     let Some(kind) = SignalKind::from_str(&sig.kind) else {
         return;
     };
+    let is_voice = matches!(
+        kind,
+        SignalKind::VoiceOffer | SignalKind::VoiceAnswer | SignalKind::VoiceIce | SignalKind::VoiceHangup
+    );
     // Look up the target. If the target is a remote mirror, forward the
     // signaling to their server via the federation inbox. `remote_id` is NULL
-    // for local users, so it must decode as an Option.
+    // for local users, so it must decode as an Option. Voice signaling is
+    // guild-local only — never federated.
     let target: Option<(u64, Option<u64>, bool, String)> = sqlx::query_as(
         "SELECT u.server_id, u.remote_id, u.is_remote, COALESCE(s.domain, '')
          FROM users u LEFT JOIN servers s ON s.id = u.server_id
@@ -202,7 +352,7 @@ async fn route_signal(state: &AppState, auth: &AuthUser, sig: &ClientSignal) {
         return;
     };
 
-    if is_remote {
+    if is_remote && !is_voice {
         if let Some(remote_id) = remote_id {
             let _ = federation::deliver_signal_to_remote(
                 state,

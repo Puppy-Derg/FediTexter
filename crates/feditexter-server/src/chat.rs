@@ -59,6 +59,21 @@ pub enum HubEvent {
     },
     /// A user's online status changed.
     Presence { user_id: u64, online: bool },
+    /// A user joined/left a voice channel.
+    VoicePresence {
+        channel_id: u64,
+        user_id: u64,
+        username: String,
+        joined: bool,
+    },
+    /// The current occupants of a voice channel, delivered to a user right after
+    /// they join so they can build the P2P mesh.
+    VoiceState {
+        channel_id: u64,
+        users: Vec<(u64, String)>,
+        #[serde(skip_serializing)]
+        target_user_id: u64,
+    },
 }
 
 /// WebRTC signaling relayed between clients. `target_user_id` is used by the
@@ -92,6 +107,14 @@ pub enum SignalKind {
     Ice,
     /// Sender no longer has the file (e.g. restarted).
     Cancel,
+    /// Voice chat: SDP offer between two members of a voice channel.
+    VoiceOffer,
+    /// Voice chat: SDP answer.
+    VoiceAnswer,
+    /// Voice chat: ICE candidate.
+    VoiceIce,
+    /// Voice chat: tear down the peer connection.
+    VoiceHangup,
 }
 
 impl SignalKind {
@@ -102,6 +125,10 @@ impl SignalKind {
             "answer" => SignalKind::Answer,
             "ice" => SignalKind::Ice,
             "cancel" => SignalKind::Cancel,
+            "voice_offer" => SignalKind::VoiceOffer,
+            "voice_answer" => SignalKind::VoiceAnswer,
+            "voice_ice" => SignalKind::VoiceIce,
+            "voice_hangup" => SignalKind::VoiceHangup,
             _ => return None,
         })
     }
@@ -113,6 +140,10 @@ impl SignalKind {
             SignalKind::Answer => "answer",
             SignalKind::Ice => "ice",
             SignalKind::Cancel => "cancel",
+            SignalKind::VoiceOffer => "voice_offer",
+            SignalKind::VoiceAnswer => "voice_answer",
+            SignalKind::VoiceIce => "voice_ice",
+            SignalKind::VoiceHangup => "voice_hangup",
         }
     }
 }
@@ -166,5 +197,28 @@ impl ChatHub {
 
     pub fn publish_presence(&self, user_id: u64, online: bool) {
         let _ = self.tx.send(HubEvent::Presence { user_id, online });
+    }
+
+    pub fn publish_voice_presence(
+        &self,
+        channel_id: u64,
+        user_id: u64,
+        username: String,
+        joined: bool,
+    ) {
+        let _ = self.tx.send(HubEvent::VoicePresence {
+            channel_id,
+            user_id,
+            username,
+            joined,
+        });
+    }
+
+    pub fn publish_voice_state(&self, channel_id: u64, users: Vec<(u64, String)>, target_user_id: u64) {
+        let _ = self.tx.send(HubEvent::VoiceState {
+            channel_id,
+            users,
+            target_user_id,
+        });
     }
 }
