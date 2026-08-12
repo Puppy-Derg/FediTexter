@@ -852,7 +852,48 @@ fn accent_faint(c: iced::Color) -> iced::Color {
 fn app_theme(state: &AppState) -> iced::Theme {
     let mut p = iced::theme::Palette::DARK;
     p.primary = state.accent;
+    p.background = iced::Color::from_rgb(0.098, 0.11, 0.133);
+    p.text = iced::Color::from_rgb(0.93, 0.94, 0.97);
+    p.success = iced::Color::from_rgb(0.31, 0.75, 0.42);
+    p.warning = iced::Color::from_rgb(0.95, 0.68, 0.22);
+    p.danger = iced::Color::from_rgb(0.86, 0.31, 0.31);
     iced::Theme::custom("FediTexter", p)
+}
+
+/// App-wide semantic colours. Keeps the palette consistent instead of the
+/// scattered hardcoded grays the views used before.
+#[derive(Clone, Copy)]
+struct UiColors {
+    /// Deepest window background.
+    bg: iced::Color,
+    /// Panel/sidebar surface (slightly raised).
+    surface: iced::Color,
+    /// Cards, inputs, headers (raised).
+    raised: iced::Color,
+    /// Hairline borders.
+    border: iced::Color,
+    /// Primary text.
+    text: iced::Color,
+    /// Secondary text.
+    text_muted: iced::Color,
+    accent: iced::Color,
+    accent_light: iced::Color,
+    accent_dark: iced::Color,
+}
+
+fn ui(state: &AppState) -> UiColors {
+    let accent = state.accent;
+    UiColors {
+        bg: iced::Color::from_rgb(0.086, 0.096, 0.117),
+        surface: iced::Color::from_rgb(0.118, 0.133, 0.16),
+        raised: iced::Color::from_rgb(0.145, 0.163, 0.196),
+        border: iced::Color::from_rgb(0.22, 0.25, 0.30),
+        text: iced::Color::from_rgb(0.93, 0.94, 0.97),
+        text_muted: iced::Color::from_rgb(0.56, 0.59, 0.65),
+        accent,
+        accent_light: accent_light(accent),
+        accent_dark: accent_dark(accent),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3868,7 +3909,7 @@ fn bubble_sent(theme: &iced::Theme) -> iced::widget::container::Style {
         background: Some(p.primary.base.color.into()),
         text_color: Some(p.primary.base.text),
         border: iced::Border {
-            radius: 16.0.into(),
+            radius: iced::border::Radius::new(18.0).top_right(6.0).into(),
             ..iced::Border::default()
         },
         ..iced::widget::container::Style::default()
@@ -3878,10 +3919,10 @@ fn bubble_sent(theme: &iced::Theme) -> iced::widget::container::Style {
 fn bubble_received(theme: &iced::Theme) -> iced::widget::container::Style {
     let p = theme.extended_palette();
     iced::widget::container::Style {
-        background: Some(p.background.weak.color.into()),
+        background: Some(iced::Color::from_rgb(0.153, 0.173, 0.208).into()),
         text_color: Some(p.background.weak.text),
         border: iced::Border {
-            radius: 16.0.into(),
+            radius: iced::border::Radius::new(18.0).top_left(6.0).into(),
             ..iced::Border::default()
         },
         ..iced::widget::container::Style::default()
@@ -3894,35 +3935,37 @@ fn danger_text_button(theme: &iced::Theme, status: button::Status) -> button::St
     style
 }
 
-fn sidebar_style(theme: &iced::Theme) -> iced::widget::container::Style {
-    let p = theme.extended_palette();
+fn sidebar_style(_theme: &iced::Theme) -> iced::widget::container::Style {
     iced::widget::container::Style {
-        background: Some(p.background.weakest.color.into()),
-        ..iced::widget::container::Style::default()
-    }
-}
-
-fn header_style(theme: &iced::Theme) -> iced::widget::container::Style {
-    let p = theme.extended_palette();
-    iced::widget::container::Style {
-        background: Some(p.background.weak.color.into()),
+        background: Some(iced::Color::from_rgb(0.118, 0.133, 0.16).into()),
         border: iced::Border {
-            width: 0.0,
-            color: p.background.weak.color,
+            width: 1.0,
+            color: iced::Color::from_rgb(0.18, 0.20, 0.24),
             ..iced::Border::default()
         },
         ..iced::widget::container::Style::default()
     }
 }
 
-fn composer_style(theme: &iced::Theme) -> iced::widget::container::Style {
-    let p = theme.extended_palette();
+fn header_style(_theme: &iced::Theme) -> iced::widget::container::Style {
     iced::widget::container::Style {
-        background: Some(p.background.weakest.color.into()),
+        background: Some(iced::Color::from_rgb(0.128, 0.144, 0.173).into()),
         border: iced::Border {
             width: 1.0,
-            color: p.background.weak.color,
-            radius: 12.0.into(),
+            color: iced::Color::from_rgb(0.18, 0.20, 0.24),
+            ..iced::Border::default()
+        },
+        ..iced::widget::container::Style::default()
+    }
+}
+
+fn composer_style(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(iced::Color::from_rgb(0.14, 0.158, 0.19).into()),
+        border: iced::Border {
+            width: 1.0,
+            color: iced::Color::from_rgb(0.19, 0.215, 0.26),
+            radius: 14.0.into(),
             ..iced::Border::default()
         },
         ..iced::widget::container::Style::default()
@@ -4753,12 +4796,50 @@ fn view(state: &AppState) -> Element<'_, Msg> {
     }
 }
 
+/// Full-window background fill for a screen.
+fn shell<'a>(state: &AppState, content: Element<'a, Msg>) -> Element<'a, Msg> {
+    let ui = ui(state);
+    container(content)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |_: &iced::Theme| iced::widget::container::Style {
+            background: Some(ui.bg.into()),
+            ..iced::widget::container::Style::default()
+        })
+        .into()
+}
+
+/// Centered card used by the auth / verify / 2FA screens.
+fn auth_card<'a>(state: &AppState, content: Element<'a, Msg>) -> Element<'a, Msg> {
+    let ui = ui(state);
+    let card = container(content)
+        .padding([state.z(32.0), state.z(40.0)])
+        .style(move |_: &iced::Theme| iced::widget::container::Style {
+            background: Some(ui.surface.into()),
+            border: iced::Border {
+                radius: 18.0.into(),
+                color: ui.border,
+                width: 1.0,
+            },
+            ..iced::widget::container::Style::default()
+        });
+    shell(
+        state,
+        container(card).center_x(Length::Fill).center_y(Length::Fill).into(),
+    )
+}
+
 fn view_auth(state: &AppState) -> Element<'_, Msg> {
     let is_register = state.screen == Screen::Register;
 
-    let logo: Element<'_, Msg> = text("FediTexter").size(state.zs(36)).into();
+    let ui = ui(state);
+
+    let logo: Element<'_, Msg> = text("FediTexter")
+        .size(state.zs(34))
+        .color(ui.accent_light)
+        .into();
     let subtitle: Element<'_, Msg> = text(if is_register { "Create account" } else { "Sign in" }).size(state.zs(16))
-        .color(iced::Color::from_rgb(0.6, 0.6, 0.6)).into();
+        .color(ui.text_muted).into();
 
     let server: Element<'_, Msg> = text_input("Server URL", &state.server)
         .on_input(Msg::LoginServerChanged)
@@ -4797,11 +4878,11 @@ fn view_auth(state: &AppState) -> Element<'_, Msg> {
     };
 
     let login_btn: Element<'_, Msg> = if state.auth_busy {
-        button(throbber(state.zs(16))).width(Length::Fixed(state.z(320.0))).into()
+        button(throbber(state.zs(16))).width(Length::Fixed(state.z(320.0))).style(button::primary).into()
     } else if is_register {
-        button("Create account").on_press(Msg::RegisterSubmit).width(Length::Fixed(state.z(320.0))).into()
+        button("Create account").on_press(Msg::RegisterSubmit).width(Length::Fixed(state.z(320.0))).style(button::primary).into()
     } else {
-        button("Sign in").on_press(Msg::LoginSubmit).width(Length::Fixed(state.z(320.0))).into()
+        button("Sign in").on_press(Msg::LoginSubmit).width(Length::Fixed(state.z(320.0))).style(button::primary).into()
     };
 
     let remember_row: Option<Element<'_, Msg>> = if is_register {
@@ -4816,12 +4897,14 @@ fn view_auth(state: &AppState) -> Element<'_, Msg> {
     };
 
     let toggle: Element<'_, Msg> = if is_register {
-        button(text("Already have an account? Sign in").size(state.zs(13)))
+        button(text("Already have an account? Sign in").size(state.zs(13)).color(ui.accent_light))
             .on_press(Msg::ShowRegister(false))
+            .style(button::text)
             .into()
     } else {
-        button(text("Create account").size(state.zs(13)))
+        button(text("Create account").size(state.zs(13)).color(ui.accent_light))
             .on_press(Msg::ShowRegister(true))
+            .style(button::text)
             .into()
     };
 
@@ -4859,10 +4942,7 @@ fn view_auth(state: &AppState) -> Element<'_, Msg> {
         );
     }
 
-    container(form)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)
-        .into()
+    auth_card(state, form.into())
 }
 
 fn view_verify(state: &AppState) -> Element<'_, Msg> {
@@ -4902,7 +4982,7 @@ fn view_2fa(state: &AppState) -> Element<'_, Msg> {
     if !state.error.is_empty() {
         form = form.push(text(&state.error).color(iced::Color::from_rgb(0.9, 0.3, 0.2)));
     }
-    container(form).center_x(Length::Fill).center_y(Length::Fill).into()
+    auth_card(state, form.into())
 }
 
 /// Mandatory 2FA setup: show the QR + secret and let the user confirm a code
@@ -4950,7 +5030,7 @@ fn view_2fa_setup(state: &AppState) -> Element<'_, Msg> {
     if !state.error.is_empty() {
         form = form.push(text(&state.error).color(iced::Color::from_rgb(0.9, 0.3, 0.2)));
     }
-    container(form).center_x(Length::Fill).center_y(Length::Fill).into()
+    auth_card(state, form.into())
 }
 
 fn clamp_menu_pos(state: &AppState, x: f32, y: f32, w: f32, h: f32) -> (f32, f32) {
@@ -4982,6 +5062,8 @@ fn view_chat(state: &AppState) -> Element<'_, Msg> {
         .width(Length::Fill)
         .height(Length::Fill)
         .into();
+
+    let main_content = shell(state, main_content);
 
     let mut layers: Vec<Element<'_, Msg>> = vec![main_content];
 
