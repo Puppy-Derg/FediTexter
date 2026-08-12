@@ -24,6 +24,10 @@ pub struct User {
     pub totp_enabled: bool,
     #[serde(default)]
     pub is_bot: bool,
+    #[serde(default)]
+    pub bio: String,
+    #[serde(default)]
+    pub profile_visible: bool,
 }
 
 #[derive(FromRow)]
@@ -145,7 +149,7 @@ async fn load_auth_user(
     enforce_session_binding(state, parts, &session).await?;
 
     let user: User = sqlx::query_as(
-        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot FROM users WHERE id = ?",
+        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot, bio, profile_visible FROM users WHERE id = ?",
     )
     .bind(session.user_id)
     .fetch_one(&state.pool)

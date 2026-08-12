@@ -38,6 +38,10 @@ struct User {
     totp_enabled: bool,
     #[serde(default)]
     is_bot: bool,
+    #[serde(default)]
+    bio: String,
+    #[serde(default = "default_true")]
+    profile_visible: bool,
 }
 fn default_true() -> bool { true }
 
@@ -79,12 +83,74 @@ struct Guild {
     member_count: u64,
     #[serde(default)]
     channels: Vec<GuildChannel>,
+    #[serde(default)]
+    members: Vec<GuildMember>,
+    #[serde(default)]
+    can_manage: bool,
+    #[serde(default)]
+    roles: Vec<GuildRole>,
+    #[serde(default)]
+    bans: Vec<GuildMember>,
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+struct GuildMember {
+    id: u64,
+    username: String,
+    #[serde(default)]
+    display_name: String,
 }
 
 #[derive(serde::Deserialize, Clone, Debug)]
 struct GuildChannel {
     id: u64,
     name: String,
+}
+
+/// A named role inside a guild (admin is the built-in one).
+#[derive(serde::Deserialize, Clone, Debug)]
+struct GuildRole {
+    id: u64,
+    name: String,
+    #[serde(default)]
+    is_admin: bool,
+    #[serde(default)]
+    member_ids: Vec<u64>,
+}
+
+/// A sticker inside a pack (metadata only; image bytes fetched separately).
+#[derive(serde::Deserialize, Clone, Debug)]
+struct Sticker {
+    id: u64,
+    name: String,
+    #[serde(default)]
+    mime: String,
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+struct StickerPack {
+    id: u64,
+    name: String,
+    #[serde(default)]
+    owner_id: u64,
+    #[serde(default)]
+    owner_name: String,
+    #[serde(default)]
+    stickers: Vec<Sticker>,
+}
+
+/// A logged-in device/session shown in Settings -> Devices.
+#[derive(serde::Deserialize, Clone, Debug)]
+struct SessionInfo {
+    id: u64,
+    #[serde(default)]
+    device_id: Option<String>,
+    #[serde(default)]
+    login_ip: Option<String>,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    current: bool,
 }
 
 #[derive(serde::Deserialize, Clone, Debug)]
@@ -161,6 +227,8 @@ struct ApiMsg {
     original_body: Option<String>,
     #[serde(default)]
     deleted_at: Option<String>,
+    #[serde(default)]
+    read: bool,
 }
 
 #[derive(serde::Deserialize, Clone, Debug)]
@@ -190,6 +258,10 @@ struct Profile {
     muted: bool,
     #[serde(default)]
     blocked_by: bool,
+    #[serde(default)]
+    restricted: bool,
+    #[serde(default)]
+    bio: String,
 }
 
 #[derive(serde::Deserialize, Clone, Debug)]
@@ -278,6 +350,7 @@ enum Msg {
     RegisterEmailChanged(String),
     RegisterUsernameChanged(String),
     RegisterPasswordChanged(String),
+    RegisterBirthdateChanged(String),
     RegisterSubmit,
     RegisterResult(Result<(String, User), String>),
     TwoFaCodeChanged(String),
@@ -371,6 +444,7 @@ enum Msg {
     GuildsLoaded(Result<Vec<Guild>, String>),
     SelectGuild(Option<u64>),
     OpenGuildModal,
+    OpenServerModal,
     CloseGuildModal,
     GuildNameInput(String),
     GuildJoinCodeInput(String),
@@ -382,6 +456,64 @@ enum Msg {
     ChannelCreated(Result<(), String>),
     ChannelNameInput(String),
     SetLeftTab(LeftTab),
+    DeleteGuild(u64),
+    GuildDeleteResult(Result<(), String>),
+    CreateInvite(u64),
+    InviteResult(Result<String, String>),
+    SetRole { guild_id: u64, user_id: u64, is_admin: bool },
+    TransferOwner { guild_id: u64, user_id: u64 },
+    KickMember { guild_id: u64, user_id: u64 },
+    GuildMemberAction(Result<(), String>),
+    ToggleStickerMenu,
+    StickerSearchChanged(String),
+    StickersLoaded(Result<Vec<StickerPack>, String>),
+    SendSticker(u64),
+    StickerImageFetched { sticker_id: u64, result: Result<Vec<u8>, String> },
+    StickerPackNameInput(String),
+    ToggleStickerPackCreate,
+    CreateStickerPackSubmit,
+    StickerPackCreated(Result<u64, String>),
+    PickStickerImages(u64),
+    StickerImagesPicked { pack_id: u64, result: Result<Vec<(String, String, Vec<u8>)>, String> },
+    StickerAction(Result<(), String>),
+    DeleteSticker { pack_id: u64, sticker_id: u64 },
+    DeleteStickerPack(u64),
+    OpenGuildSettings,
+    CloseGuildSettings,
+    GuildSettingsLoaded(Result<Guild, String>),
+    GuildSettingsTabChanged(GuildSettingsTab),
+    RoleNameInput(String),
+    CreateRoleSubmit(u64),
+    DeleteRole { guild_id: u64, role_id: u64 },
+    AssignRole { guild_id: u64, role_id: u64, user_id: u64, on: bool },
+    RenameChannel { channel_id: u64, name: String },
+    ChannelRenameInput { channel_id: u64, value: String },
+    DeleteChannel { channel_id: u64 },
+    BanMember { guild_id: u64, user_id: u64 },
+    UnbanMember { guild_id: u64, user_id: u64 },
+    GuildAdminAction(Result<(), String>),
+    SettingsTabChanged(SettingsTab),
+    BioChanged(String),
+    ProfileVisibleToggled(bool),
+    SessionsLoaded(Result<Vec<SessionInfo>, String>),
+    RevokeSession(u64),
+    SessionRevoked(Result<(), String>),
+    AccentHexChanged(String),
+    ApplyAccentHex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuildSettingsTab {
+    Channels,
+    Roles,
+    Bans,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsTab {
+    General,
+    Privacy,
+    Devices,
 }
 
 // ---------------------------------------------------------------------------
@@ -407,6 +539,7 @@ struct AppState {
     register_email: String,
     register_username: String,
     register_password: String,
+    register_birthdate: String,
     twofa_code: String,
     verify_code: String,
     token: Option<String>,
@@ -476,6 +609,23 @@ struct AppState {
     p2p_status: HashMap<String, String>,
     thumb_handles: HashMap<String, iced::widget::image::Handle>,
     own_full_handles: HashMap<String, iced::widget::image::Handle>,
+    sticker_menu_open: bool,
+    sticker_search: String,
+    sticker_packs: Vec<StickerPack>,
+    sticker_busy: bool,
+    sticker_bytes: HashMap<u64, Vec<u8>>,
+    sticker_handles: HashMap<u64, iced::widget::image::Handle>,
+    sticker_pack_name_input: String,
+    sticker_pack_create_open: bool,
+    guild_settings_open: bool,
+    guild_settings_tab: GuildSettingsTab,
+    role_name_input: String,
+    channel_rename_inputs: HashMap<u64, String>,
+    settings_tab: SettingsTab,
+    bio_input: String,
+    sessions: Vec<SessionInfo>,
+    sessions_busy: bool,
+    accent_hex_input: String,
 }
 
 impl Default for AppState {
@@ -489,6 +639,7 @@ impl Default for AppState {
             register_email: String::new(),
             register_username: String::new(),
             register_password: String::new(),
+            register_birthdate: String::new(),
             twofa_code: String::new(),
             verify_code: String::new(),
             token: None,
@@ -556,6 +707,23 @@ impl Default for AppState {
             p2p_status: HashMap::new(),
             thumb_handles: HashMap::new(),
             own_full_handles: HashMap::new(),
+            sticker_menu_open: false,
+            sticker_search: String::new(),
+            sticker_packs: Vec::new(),
+            sticker_busy: false,
+            sticker_bytes: HashMap::new(),
+            sticker_handles: HashMap::new(),
+            sticker_pack_name_input: String::new(),
+            sticker_pack_create_open: false,
+            guild_settings_open: false,
+            guild_settings_tab: GuildSettingsTab::Channels,
+            role_name_input: String::new(),
+            channel_rename_inputs: HashMap::new(),
+            settings_tab: SettingsTab::General,
+            bio_input: String::new(),
+            sessions: Vec::new(),
+            sessions_busy: false,
+            accent_hex_input: String::new(),
         }
     }
 }
@@ -618,6 +786,27 @@ fn save_accent(c: iced::Color) {
 
 fn color_eq(a: iced::Color, b: iced::Color) -> bool {
     (a.r - b.r).abs() < 0.01 && (a.g - b.g).abs() < 0.01 && (a.b - b.b).abs() < 0.01
+}
+
+// Auto-generated accent shades: lighter (for highlights/glows) and darker
+// (for borders/active states). Derived from the base accent colour.
+fn accent_light(c: iced::Color) -> iced::Color {
+    let factor = 0.35;
+    iced::Color::from_rgb(
+        c.r + (1.0 - c.r) * factor,
+        c.g + (1.0 - c.g) * factor,
+        c.b + (1.0 - c.b) * factor,
+    )
+}
+
+fn accent_dark(c: iced::Color) -> iced::Color {
+    let factor = 0.45;
+    iced::Color::from_rgb(c.r * (1.0 - factor), c.g * (1.0 - factor), c.b * (1.0 - factor))
+}
+
+fn accent_faint(c: iced::Color) -> iced::Color {
+    let light = accent_light(c);
+    iced::Color::from_rgba(light.r, light.g, light.b, 0.18)
 }
 
 fn app_theme(state: &AppState) -> iced::Theme {
@@ -1158,6 +1347,7 @@ fn msg_short(msg: &Msg) -> String {
         Msg::RegisterEmailChanged(_) => "RegisterEmailChanged".into(),
         Msg::RegisterUsernameChanged(_) => "RegisterUsernameChanged".into(),
         Msg::RegisterPasswordChanged(_) => "RegisterPasswordChanged".into(),
+        Msg::RegisterBirthdateChanged(_) => "RegisterBirthdateChanged".into(),
         Msg::RegisterSubmit => "RegisterSubmit".into(),
         Msg::RegisterResult(r) => format!("RegisterResult({})", if r.is_ok() { "Ok" } else { "Err" }),
         Msg::TwoFaCodeChanged(_) => "TwoFaCodeChanged".into(),
@@ -1251,6 +1441,7 @@ fn msg_short(msg: &Msg) -> String {
         Msg::GuildsLoaded(_) => "GuildsLoaded".into(),
         Msg::SelectGuild(_) => "SelectGuild".into(),
         Msg::OpenGuildModal => "OpenGuildModal".into(),
+        Msg::OpenServerModal => "OpenServerModal".into(),
         Msg::CloseGuildModal => "CloseGuildModal".into(),
         Msg::GuildNameInput(_) => "GuildNameInput".into(),
         Msg::GuildJoinCodeInput(_) => "GuildJoinCodeInput".into(),
@@ -1262,6 +1453,50 @@ fn msg_short(msg: &Msg) -> String {
         Msg::ChannelCreated(_) => "ChannelCreated".into(),
         Msg::ChannelNameInput(_) => "ChannelNameInput".into(),
         Msg::SetLeftTab(_) => "SetLeftTab".into(),
+        Msg::DeleteGuild(_) => "DeleteGuild".into(),
+        Msg::GuildDeleteResult(_) => "GuildDeleteResult".into(),
+        Msg::CreateInvite(_) => "CreateInvite".into(),
+        Msg::InviteResult(_) => "InviteResult".into(),
+        Msg::SetRole { .. } => "SetRole".into(),
+        Msg::TransferOwner { .. } => "TransferOwner".into(),
+        Msg::KickMember { .. } => "KickMember".into(),
+        Msg::GuildMemberAction(_) => "GuildMemberAction".into(),
+        Msg::ToggleStickerMenu => "ToggleStickerMenu".into(),
+        Msg::StickerSearchChanged(_) => "StickerSearchChanged".into(),
+        Msg::StickersLoaded(_) => "StickersLoaded".into(),
+        Msg::SendSticker(_) => "SendSticker".into(),
+        Msg::StickerImageFetched { .. } => "StickerImageFetched".into(),
+        Msg::StickerPackNameInput(_) => "StickerPackNameInput".into(),
+        Msg::ToggleStickerPackCreate => "ToggleStickerPackCreate".into(),
+        Msg::CreateStickerPackSubmit => "CreateStickerPackSubmit".into(),
+        Msg::StickerPackCreated(_) => "StickerPackCreated".into(),
+        Msg::PickStickerImages(_) => "PickStickerImages".into(),
+        Msg::StickerImagesPicked { .. } => "StickerImagesPicked".into(),
+        Msg::StickerAction(_) => "StickerAction".into(),
+        Msg::DeleteSticker { .. } => "DeleteSticker".into(),
+        Msg::DeleteStickerPack(_) => "DeleteStickerPack".into(),
+        Msg::OpenGuildSettings => "OpenGuildSettings".into(),
+        Msg::CloseGuildSettings => "CloseGuildSettings".into(),
+        Msg::GuildSettingsLoaded(_) => "GuildSettingsLoaded".into(),
+        Msg::GuildSettingsTabChanged(_) => "GuildSettingsTabChanged".into(),
+        Msg::RoleNameInput(_) => "RoleNameInput".into(),
+        Msg::CreateRoleSubmit(_) => "CreateRoleSubmit".into(),
+        Msg::DeleteRole { .. } => "DeleteRole".into(),
+        Msg::AssignRole { .. } => "AssignRole".into(),
+        Msg::RenameChannel { .. } => "RenameChannel".into(),
+        Msg::ChannelRenameInput { .. } => "ChannelRenameInput".into(),
+        Msg::DeleteChannel { .. } => "DeleteChannel".into(),
+        Msg::BanMember { .. } => "BanMember".into(),
+        Msg::UnbanMember { .. } => "UnbanMember".into(),
+        Msg::GuildAdminAction(_) => "GuildAdminAction".into(),
+        Msg::SettingsTabChanged(_) => "SettingsTabChanged".into(),
+        Msg::BioChanged(_) => "BioChanged".into(),
+        Msg::ProfileVisibleToggled(_) => "ProfileVisibleToggled".into(),
+        Msg::SessionsLoaded(_) => "SessionsLoaded".into(),
+        Msg::RevokeSession(_) => "RevokeSession".into(),
+        Msg::SessionRevoked(_) => "SessionRevoked".into(),
+        Msg::AccentHexChanged(_) => "AccentHexChanged".into(),
+        Msg::ApplyAccentHex => "ApplyAccentHex".into(),
     }
 }
 
@@ -1366,17 +1601,19 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
         Msg::RegisterEmailChanged(e) => { state.register_email = e; Task::none() }
         Msg::RegisterUsernameChanged(u) => { state.register_username = u; Task::none() }
         Msg::RegisterPasswordChanged(p) => { state.register_password = p; Task::none() }
+        Msg::RegisterBirthdateChanged(d) => { state.register_birthdate = d; Task::none() }
         Msg::RegisterSubmit => {
             state.error.clear();
             state.auth_busy = true;
             let email = state.register_email.clone();
             let username = state.register_username.clone();
             let password = state.register_password.clone();
+            let birthdate = state.register_birthdate.clone();
             let server = state.server.clone();
             Task::perform(async move {
                 let client = make_client();
                 let resp = client.post(format!("{server}/api/register"))
-                    .json(&serde_json::json!({ "email": email, "username": username, "password": password }))
+                    .json(&serde_json::json!({ "email": email, "username": username, "password": password, "birthdate": birthdate }))
                     .send().await;
                 match resp {
                     Ok(r) if r.status().is_success() => {
@@ -1542,6 +1779,17 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                         state.messages = msgs;
                         build_thumb_handles(state);
                         auto_fetch_files(state);
+                        // Mark the conversation as read up to the newest message.
+                        if let Some(last) = state.messages.last() {
+                            let server = state.server.clone();
+                            let token = state.token.clone().unwrap_or_default();
+                            let cid = conversation_id;
+                            let mid = last.id;
+                            tasks.push(Task::perform(
+                                mark_read_api(server, token, cid, mid),
+                                |r| match r { Ok(_) => Msg::Noop, Err(e) => Msg::Error(e) },
+                            ));
+                        }
                     }
                     Err(e) => {
                         if e == AUTH_FAILED {
@@ -1574,81 +1822,308 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             }
             Task::none()
         }
-        Msg::SendMessage => {
-            let body = state.draft.trim().to_string();
-            let conv = match state.selected_conversation { Some(c) => c, None => return Task::none() };
-            let attachment = state.pending_attachment.take();
-            let has_attach = attachment.is_some();
-            if body.is_empty() && !has_attach { return Task::none(); }
-            state.draft.clear();
-            state.busy = true;
-            if let Some(att) = &attachment {
-                if let Some(p2p) = &state.p2p {
-                    p2p.serve(ServingFile {
-                        file_id: att.file_id.clone(),
-                        mime: att.mime.clone(),
-                        name: att.name.clone(),
-                        size: att.file_size,
-                        bytes: att.bytes.clone(),
-                    });
-                }
-                if att.mime.starts_with("image/") {
-                    state.own_full_handles.insert(att.file_id.clone(), iced::widget::image::Handle::from_bytes(att.bytes.clone()));
-                }
-                state.own_files.insert(
-                    att.file_id.clone(),
-                    OwnFile { thumbnail: att.thumbnail.clone(), bytes: att.bytes.clone() },
-                );
-                // Persist the bytes to the on-disk cache so our own sent file
-                // survives a restart (the bubble can then render it full-res and
-                // OpenFile can read it back — otherwise the bytes are RAM-only
-                // and P2P-fetching from ourselves makes no sense).
-                let path = cache_path_for(&att.file_id);
-                if let Some(dir) = path.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                let _ = std::fs::write(&path, &att.bytes);
-                let image_handle = if att.mime.starts_with("image/") {
-                    Some(iced::widget::image::Handle::from_bytes(att.bytes.clone()))
-                } else {
-                    None
-                };
-                state.downloaded.insert(
-                    att.file_id.clone(),
-                    DownloadedFile { image_handle, path: Some(path) },
-                );
+        Msg::ToggleStickerMenu => {
+            state.sticker_menu_open = !state.sticker_menu_open;
+            if state.sticker_menu_open && state.sticker_packs.is_empty() {
+                let server = state.server.clone();
+                let token = state.token.clone().unwrap_or_default();
+                let q = state.sticker_search.clone();
+                Task::perform(load_sticker_packs(server, token, q), Msg::StickersLoaded)
+            } else {
+                Task::none()
             }
-            let token = state.token.clone().unwrap_or_default();
+        }
+        Msg::StickerSearchChanged(q) => {
+            state.sticker_search = q.clone();
             let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            Task::perform(load_sticker_packs(server, token, q), Msg::StickersLoaded)
+        }
+        Msg::StickersLoaded(Ok(packs)) => {
+            state.sticker_busy = false;
+            state.sticker_packs = packs;
+            // Eagerly fetch each sticker's image bytes so the grid can render
+            // instantly and clicking one has bytes to send.
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            let ids: Vec<u64> = state.sticker_packs.iter()
+                .flat_map(|p| p.stickers.iter())
+                .filter(|s| !state.sticker_bytes.contains_key(&s.id))
+                .map(|s| s.id)
+                .collect();
+            if ids.is_empty() {
+                Task::none()
+            } else {
+                let tasks: Vec<Task<Msg>> = ids.into_iter().map(|id| {
+                    let server = server.clone();
+                    let token = token.clone();
+                    Task::perform(sticker_image_api(server, token, id), move |result| {
+                        Msg::StickerImageFetched { sticker_id: id, result }
+                    })
+                }).collect();
+                Task::batch(tasks)
+            }
+        }
+        Msg::StickersLoaded(Err(e)) => { state.sticker_busy = false; handle_api_error(state, e) }
+        Msg::StickerImageFetched { sticker_id, result } => {
+            match result {
+                Ok(bytes) => {
+                    state.sticker_bytes.insert(sticker_id, bytes.clone());
+                    state.sticker_handles.insert(sticker_id, iced::widget::image::Handle::from_bytes(bytes));
+                }
+                Err(_) => {}
+            }
+            Task::none()
+        }
+        Msg::StickerPackNameInput(s) => { state.sticker_pack_name_input = s; Task::none() }
+        Msg::ToggleStickerPackCreate => { state.sticker_pack_create_open = !state.sticker_pack_create_open; Task::none() }
+        Msg::CreateStickerPackSubmit => {
+            let name = state.sticker_pack_name_input.trim().to_string();
+            if name.is_empty() { return Task::none(); }
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            Task::perform(create_sticker_pack_api(server, token, name), Msg::StickerPackCreated)
+        }
+        Msg::StickerPackCreated(Ok(id)) => {
+            state.sticker_pack_name_input.clear();
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            Task::perform(load_sticker_packs(server, token, state.sticker_search.clone()), Msg::StickersLoaded).then(move |_| {
+                Task::done(Msg::PickStickerImages(id))
+            })
+        }
+        Msg::StickerPackCreated(Err(e)) => handle_api_error(state, e),
+        Msg::PickStickerImages(pack_id) => {
+            let pack_id_clone = pack_id;
+            Task::perform(
+                async move {
+                    let files = rfd::AsyncFileDialog::new().pick_files().await;
+                    let Some(files) = files else { return Err("no files selected".to_string()) };
+                    let mut out = Vec::new();
+                    for f in files {
+                        let bytes = f.read().await;
+                        if bytes.is_empty() || bytes.len() > 512 * 1024 {
+                            return Err("sticker image too large (max 512 KiB)".to_string());
+                        }
+                        let path = f.path();
+                        let mime = mime_from_path(path).to_string();
+                        if !mime.starts_with("image/") {
+                            return Err("stickers must be image files".to_string());
+                        }
+                        let name = path.file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "sticker".to_string());
+                        out.push((name, mime, bytes));
+                    }
+                    Ok(out)
+                },
+                move |result| Msg::StickerImagesPicked { pack_id: pack_id_clone, result },
+            )
+        }
+        Msg::StickerImagesPicked { pack_id, result } => {
+            let items = match result {
+                Ok(items) => items,
+                Err(e) => { state.error = e; return Task::none(); }
+            };
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            let tasks: Vec<Task<Msg>> = items.into_iter().map(|(name, mime, data)| {
+                let server = server.clone();
+                let token = token.clone();
+                Task::perform(upload_sticker_api(server, token, pack_id, name, data, mime), Msg::StickerAction)
+            }).collect();
+            Task::batch(tasks)
+        }
+        Msg::StickerAction(Ok(())) => {
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            let q = state.sticker_search.clone();
+            Task::perform(load_sticker_packs(server, token, q), Msg::StickersLoaded)
+        }
+        Msg::StickerAction(Err(e)) => handle_api_error(state, e),
+        Msg::DeleteSticker { pack_id, sticker_id } => {
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            Task::perform(delete_sticker_api(server, token, pack_id, sticker_id), Msg::StickerAction)
+        }
+        Msg::DeleteStickerPack(pack_id) => {
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            Task::perform(delete_sticker_pack_api(server, token, pack_id), Msg::StickerAction)
+        }
+        Msg::OpenGuildSettings => {
+            let Some(guild_id) = state.selected_guild else { return Task::none() };
+            state.guild_settings_open = true;
+            state.guild_settings_tab = GuildSettingsTab::Channels;
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            Task::perform(load_guild_detail(server, token, guild_id), Msg::GuildSettingsLoaded)
+        }
+        Msg::CloseGuildSettings => { state.guild_settings_open = false; Task::none() }
+        Msg::GuildSettingsLoaded(Ok(g)) => {
+            if let Some(existing) = state.guilds.iter_mut().find(|x| x.id == g.id) {
+                *existing = g;
+            }
+            Task::none()
+        }
+        Msg::GuildSettingsLoaded(Err(e)) => handle_api_error(state, e),
+        Msg::GuildSettingsTabChanged(t) => { state.guild_settings_tab = t; Task::none() }
+        Msg::RoleNameInput(s) => { state.role_name_input = s; Task::none() }
+        Msg::CreateRoleSubmit(guild_id) => {
+            let name = state.role_name_input.trim().to_string();
+            if name.is_empty() { return Task::none(); }
+            state.role_name_input.clear();
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            Task::perform(create_role_api(server, token, guild_id, name), Msg::GuildAdminAction)
+        }
+        Msg::DeleteRole { guild_id, role_id } => {
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            Task::perform(delete_role_api(server, token, guild_id, role_id), Msg::GuildAdminAction)
+        }
+        Msg::AssignRole { guild_id, role_id, user_id, on } => {
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            Task::perform(assign_role_api(server, token, guild_id, role_id, user_id, on), Msg::GuildAdminAction)
+        }
+        Msg::RenameChannel { channel_id, name } => {
+            let Some(guild_id) = state.selected_guild else { return Task::none() };
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            Task::perform(rename_channel_api(server, token, guild_id, channel_id, name), Msg::GuildAdminAction)
+        }
+        Msg::ChannelRenameInput { channel_id, value } => {
+            state.channel_rename_inputs.insert(channel_id, value);
+            Task::none()
+        }
+        Msg::DeleteChannel { channel_id } => {
+            let Some(guild_id) = state.selected_guild else { return Task::none() };
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            Task::perform(delete_channel_api(server, token, guild_id, channel_id), Msg::GuildAdminAction)
+        }
+        Msg::BanMember { guild_id, user_id } => {
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            Task::perform(ban_member_api(server, token, guild_id, user_id), Msg::GuildAdminAction)
+        }
+        Msg::UnbanMember { guild_id, user_id } => {
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            Task::perform(unban_member_api(server, token, guild_id, user_id), Msg::GuildAdminAction)
+        }
+        Msg::GuildAdminAction(Ok(())) => {
+            if let Some(guild_id) = state.selected_guild {
+                let server = state.server.clone();
+                let token = state.token.clone().unwrap_or_default();
+                return Task::perform(load_guild_detail(server, token, guild_id), Msg::GuildSettingsLoaded);
+            }
+            Task::none()
+        }
+        Msg::GuildAdminAction(Err(e)) => handle_api_error(state, e),
+        Msg::SettingsTabChanged(t) => {
+            state.settings_tab = t;
+            if t == SettingsTab::Devices && state.sessions.is_empty() && !state.sessions_busy {
+                state.sessions_busy = true;
+                let server = state.server.clone();
+                let token = state.token.clone().unwrap_or_default();
+                Task::perform(load_sessions_api(server, token), Msg::SessionsLoaded)
+            } else {
+                Task::none()
+            }
+        }
+        Msg::BioChanged(s) => { state.bio_input = s; Task::none() }
+        Msg::ProfileVisibleToggled(visible) => {
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
             Task::perform(async move {
                 let client = make_client();
-                let mut payload = serde_json::json!({ "body": body });
-                if let Some(att) = attachment {
-                    payload["attachment_mime"] = serde_json::json!(att.mime);
-                    payload["attachment_name"] = serde_json::json!(att.name);
-                    payload["file_id"] = serde_json::json!(att.file_id);
-                    payload["file_size"] = serde_json::json!(att.file_size);
-                    if !att.thumbnail.is_empty() {
-                        payload["thumbnail_data"] = serde_json::json!(att.thumbnail);
-                    }
-                }
-                let resp = client.post(format!("{server}/api/conversations/{conv}/messages"))
+                let resp = client.patch(format!("{server}/api/me"))
                     .bearer_auth(&token)
-                    .json(&payload)
+                    .json(&serde_json::json!({ "profile_visible": visible }))
                     .send().await;
                 match resp {
-                    Ok(r) if r.status().is_success() => {
-                        let v: serde_json::Value = r.json().await.unwrap_or_default();
-                        serde_json::from_value::<ApiMsg>(v.get("message").cloned().unwrap_or_default())
-                            .map_err(|_| String::from("parse error"))
-                    }
                     Ok(r) => {
                         auth_aware_error(&r)?;
-                        Err(format!("send failed: {}", r.status()))
+                        let v: serde_json::Value = r.json().await.unwrap_or_default();
+                        serde_json::from_value::<User>(v.get("user").cloned().unwrap_or_default())
+                            .map_err(|_| String::from("parse error"))
                     }
                     Err(e) => Err(format!("{e}")),
                 }
-            }, Msg::MessageSent)
+            }, Msg::SettingsResult)
+        }
+        Msg::SessionsLoaded(Ok(sessions)) => { state.sessions_busy = false; state.sessions = sessions; Task::none() }
+        Msg::SessionsLoaded(Err(e)) => { state.sessions_busy = false; handle_api_error(state, e) }
+        Msg::RevokeSession(session_id) => {
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            Task::perform(revoke_session_api(server, token, session_id), Msg::SessionRevoked)
+        }
+        Msg::SessionRevoked(Ok(())) => {
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            Task::perform(load_sessions_api(server, token), Msg::SessionsLoaded)
+        }
+        Msg::SessionRevoked(Err(e)) => handle_api_error(state, e),
+        Msg::AccentHexChanged(s) => { state.accent_hex_input = s; Task::none() }
+        Msg::ApplyAccentHex => {
+            let s = state.accent_hex_input.trim().trim_start_matches('#');
+            if s.len() == 6 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+                if let (Ok(r), Ok(g), Ok(b)) = (u8::from_str_radix(&s[0..2], 16), u8::from_str_radix(&s[2..4], 16), u8::from_str_radix(&s[4..6], 16)) {
+                    let color = iced::Color::from_rgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+                    state.accent = color;
+                    save_accent(color);
+                    return Task::none();
+                }
+            }
+            state.error = "Invalid hex colour (e.g. #7a5cf0)".to_string();
+            Task::none()
+        }
+        Msg::SendMessage => do_send(state),
+        Msg::SendSticker(sticker_id) => {
+            let Some(bytes) = state.sticker_bytes.get(&sticker_id).cloned() else { return Task::none() };
+            let Some(conv) = state.selected_conversation else { return Task::none() };
+            let _ = conv;
+            let mime = state.sticker_packs.iter()
+                .flat_map(|p| p.stickers.iter())
+                .find(|s| s.id == sticker_id)
+                .map(|s| s.mime.clone())
+                .unwrap_or_else(|| "image/webp".to_string());
+            let file_id = uuid::Uuid::new_v4().to_string();
+            // Compress the 1024x1024 sticker into a small bubble thumbnail.
+            let thumbnail = image::load_from_memory(&bytes)
+                .ok()
+                .map(|img| {
+                    let max_dim = 480u32;
+                    let img = if img.width() > max_dim || img.height() > max_dim {
+                        let scale = max_dim as f32 / img.width().max(img.height()) as f32;
+                        img.resize(
+                            ((img.width() as f32) * scale) as u32,
+                            ((img.height() as f32) * scale) as u32,
+                            image::imageops::FilterType::Lanczos3,
+                        )
+                    } else {
+                        img
+                    };
+                    let mut out = std::io::Cursor::new(Vec::new());
+                    let _ = img.write_to(&mut out, image::ImageFormat::Jpeg);
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD.encode(out.get_ref())
+                })
+                .unwrap_or_default();
+            state.pending_attachment = Some(Attachment {
+                mime: mime.clone(),
+                name: "sticker".to_string(),
+                file_id,
+                file_size: bytes.len() as u64,
+                thumbnail,
+                bytes,
+            });
+            state.draft.clear();
+            state.busy = true;
+            do_send(state)
         }
         Msg::MessageSent(Ok(m)) => {
             state.busy = false;
@@ -1929,6 +2404,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             Task::none()
         }
         Msg::OpenGuildModal => { state.guild_modal_open = true; Task::none() }
+        Msg::OpenServerModal => { state.selected_guild = None; state.guild_modal_open = true; Task::none() }
         Msg::CloseGuildModal => { state.guild_modal_open = false; Task::none() }
         Msg::GuildNameInput(s) => { state.guild_name_input = s; Task::none() }
         Msg::GuildJoinCodeInput(s) => { state.guild_join_code_input = s; Task::none() }
@@ -1999,16 +2475,78 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             ])
         }
         Msg::ChannelCreated(Err(e)) => { state.guild_busy = false; handle_api_error(state, e) }
+        Msg::DeleteGuild(guild_id) => {
+            state.guild_busy = true;
+            let token = state.token.clone().unwrap_or_default();
+            let server = state.server.clone();
+            Task::perform(delete_guild_api(server, token, guild_id), Msg::GuildDeleteResult)
+        }
+        Msg::GuildDeleteResult(Ok(())) => {
+            state.guild_busy = false;
+            state.guild_modal_open = false;
+            state.selected_guild = None;
+            let token = state.token.clone().unwrap_or_default();
+            let server = state.server.clone();
+            let load = load_guilds(server.clone(), token.clone());
+            let convs = load_conversations(server, token);
+            Task::batch(vec![
+                Task::perform(load, Msg::GuildsLoaded),
+                Task::perform(convs, Msg::ConversationsLoaded),
+            ])
+        }
+        Msg::GuildDeleteResult(Err(e)) => { state.guild_busy = false; handle_api_error(state, e) }
+        Msg::CreateInvite(guild_id) => {
+            state.guild_busy = true;
+            let token = state.token.clone().unwrap_or_default();
+            let server = state.server.clone();
+            Task::perform(create_invite_api(server, token, guild_id), Msg::InviteResult)
+        }
+        Msg::InviteResult(Ok(code)) => {
+            state.guild_busy = false;
+            state.info = format!("Invite code: {code} (valid 7 days)");
+            let _ = iced::clipboard::write::<Msg>(code);
+            Task::none()
+        }
+        Msg::InviteResult(Err(e)) => { state.guild_busy = false; handle_api_error(state, e) }
+        Msg::SetRole { guild_id, user_id, is_admin } => {
+            let token = state.token.clone().unwrap_or_default();
+            let server = state.server.clone();
+            Task::perform(set_role_api(server, token, guild_id, user_id, is_admin), Msg::GuildMemberAction)
+        }
+        Msg::TransferOwner { guild_id, user_id } => {
+            let token = state.token.clone().unwrap_or_default();
+            let server = state.server.clone();
+            Task::perform(transfer_owner_api(server, token, guild_id, user_id), Msg::GuildMemberAction)
+        }
+        Msg::KickMember { guild_id, user_id } => {
+            let token = state.token.clone().unwrap_or_default();
+            let server = state.server.clone();
+            Task::perform(kick_member_api(server, token, guild_id, user_id), Msg::GuildMemberAction)
+        }
+        Msg::GuildMemberAction(Ok(())) => {
+            // Refresh the guild list + conversations after a role/kick change.
+            let token = state.token.clone().unwrap_or_default();
+            let server = state.server.clone();
+            let load = load_guilds(server.clone(), token.clone());
+            let convs = load_conversations(server, token);
+            Task::batch(vec![
+                Task::perform(load, Msg::GuildsLoaded),
+                Task::perform(convs, Msg::ConversationsLoaded),
+            ])
+        }
+        Msg::GuildMemberAction(Err(e)) => handle_api_error(state, e),
         Msg::DisplayNameChanged(s) => { state.display_name_input = s; Task::none() }
         Msg::SaveSettings => {
             let token = state.token.clone().unwrap_or_default();
             let display_name = state.display_name_input.clone();
+            let bio = state.bio_input.clone();
+            let profile_visible = state.user.as_ref().map(|u| u.profile_visible).unwrap_or(true);
             let server = state.server.clone();
             Task::perform(async move {
                 let client = make_client();
                 let resp = client.patch(format!("{server}/api/me"))
                     .bearer_auth(&token)
-                    .json(&serde_json::json!({ "display_name": display_name }))
+                    .json(&serde_json::json!({ "display_name": display_name, "bio": bio, "profile_visible": profile_visible }))
                     .send().await;
                 match resp {
                     Ok(r) if r.status().is_success() => {
@@ -2026,7 +2564,6 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
         }
         Msg::SettingsResult(Ok(u)) => {
             state.user = Some(u);
-            state.settings_open = false;
             ensure_avatars(state)
         }
         Msg::SettingsResult(Err(e)) => handle_api_error(state, e),
@@ -2236,7 +2773,19 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             }
             Task::none()
         }
-        Msg::ToggleSettings => { state.settings_open = !state.settings_open; Task::none() }
+        Msg::ToggleSettings => {
+            state.settings_open = !state.settings_open;
+            if state.settings_open {
+                if let Some(u) = &state.user {
+                    state.display_name_input = u.display_name.clone();
+                    state.bio_input = u.bio.clone();
+                }
+                if state.accent_hex_input.is_empty() {
+                    state.accent_hex_input = accent_to_hex(state.accent);
+                }
+            }
+            Task::none()
+        }
         Msg::Error(e) => handle_api_error(state, e),
         Msg::Info(i) => { state.info = i; Task::none() }
         Msg::RefreshConversations => {
@@ -2579,6 +3128,85 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
     }
 }
 
+/// Send the current draft + pending attachment (if any) to the selected
+/// conversation. Shared by `Msg::SendMessage` and sticker sends.
+fn do_send(state: &mut AppState) -> Task<Msg> {
+    let body = state.draft.trim().to_string();
+    let conv = match state.selected_conversation { Some(c) => c, None => return Task::none() };
+    let attachment = state.pending_attachment.take();
+    let has_attach = attachment.is_some();
+    if body.is_empty() && !has_attach { return Task::none(); }
+    state.draft.clear();
+    state.busy = true;
+    if let Some(att) = &attachment {
+        if let Some(p2p) = &state.p2p {
+            p2p.serve(ServingFile {
+                file_id: att.file_id.clone(),
+                mime: att.mime.clone(),
+                name: att.name.clone(),
+                size: att.file_size,
+                bytes: att.bytes.clone(),
+            });
+        }
+        if att.mime.starts_with("image/") {
+            state.own_full_handles.insert(att.file_id.clone(), iced::widget::image::Handle::from_bytes(att.bytes.clone()));
+        }
+        state.own_files.insert(
+            att.file_id.clone(),
+            OwnFile { thumbnail: att.thumbnail.clone(), bytes: att.bytes.clone() },
+        );
+        // Persist the bytes to the on-disk cache so our own sent file
+        // survives a restart (the bubble can then render it full-res and
+        // OpenFile can read it back — otherwise the bytes are RAM-only
+        // and P2P-fetching from ourselves makes no sense).
+        let path = cache_path_for(&att.file_id);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, &att.bytes);
+        let image_handle = if att.mime.starts_with("image/") {
+            Some(iced::widget::image::Handle::from_bytes(att.bytes.clone()))
+        } else {
+            None
+        };
+        state.downloaded.insert(
+            att.file_id.clone(),
+            DownloadedFile { image_handle, path: Some(path) },
+        );
+    }
+    let token = state.token.clone().unwrap_or_default();
+    let server = state.server.clone();
+    Task::perform(async move {
+        let client = make_client();
+        let mut payload = serde_json::json!({ "body": body });
+        if let Some(att) = attachment {
+            payload["attachment_mime"] = serde_json::json!(att.mime);
+            payload["attachment_name"] = serde_json::json!(att.name);
+            payload["file_id"] = serde_json::json!(att.file_id);
+            payload["file_size"] = serde_json::json!(att.file_size);
+            if !att.thumbnail.is_empty() {
+                payload["thumbnail_data"] = serde_json::json!(att.thumbnail);
+            }
+        }
+        let resp = client.post(format!("{server}/api/conversations/{conv}/messages"))
+            .bearer_auth(&token)
+            .json(&payload)
+            .send().await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let v: serde_json::Value = r.json().await.unwrap_or_default();
+                serde_json::from_value::<ApiMsg>(v.get("message").cloned().unwrap_or_default())
+                    .map_err(|_| String::from("parse error"))
+            }
+            Ok(r) => {
+                auth_aware_error(&r)?;
+                Err(format!("send failed: {}", r.status()))
+            }
+            Err(e) => Err(format!("{e}")),
+        }
+    }, Msg::MessageSent)
+}
+
 async fn load_conversations(server: String, token: String) -> Result<Vec<Conversation>, String> {
     let client = make_client();
     let resp = client.get(format!("{server}/api/conversations"))
@@ -2589,6 +3217,21 @@ async fn load_conversations(server: String, token: String) -> Result<Vec<Convers
             let v: serde_json::Value = r.json().await.unwrap_or_default();
             Ok(serde_json::from_value(v.get("conversations").cloned().unwrap_or_default())
                 .unwrap_or_default())
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn mark_read_api(server: String, token: String, conv_id: u64, message_id: u64) -> Result<(), String> {
+    let client = make_client();
+    let resp = client.post(format!("{server}/api/conversations/{conv_id}/read"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "message_id": message_id }))
+        .send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            if r.status().is_success() { Ok(()) } else { Err(format!("read failed: {}", r.status())) }
         }
         Err(e) => Err(format!("{e}")),
     }
@@ -2650,6 +3293,318 @@ async fn create_channel_api(server: String, token: String, guild_id: u64, name: 
         Ok(r) => {
             auth_aware_error(&r)?;
             if r.status().is_success() { Ok(()) } else { Err(format!("create failed: {}", r.status())) }
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn delete_guild_api(server: String, token: String, guild_id: u64) -> Result<(), String> {
+    let client = make_client();
+    let resp = client.delete(format!("{server}/api/servers/{guild_id}"))
+        .bearer_auth(&token)
+        .send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            if r.status().is_success() { Ok(()) } else { Err(format!("delete failed: {}", r.status())) }
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn create_invite_api(server: String, token: String, guild_id: u64) -> Result<String, String> {
+    let client = make_client();
+    let resp = client.post(format!("{server}/api/servers/{guild_id}/invite"))
+        .bearer_auth(&token)
+        .send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            let v: serde_json::Value = r.json().await.unwrap_or_default();
+            v.get("code").and_then(|c| c.as_str()).map(str::to_string)
+                .ok_or_else(|| "missing invite code".to_string())
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn set_role_api(server: String, token: String, guild_id: u64, user_id: u64, is_admin: bool) -> Result<(), String> {
+    let client = make_client();
+    let resp = client.post(format!("{server}/api/servers/{guild_id}/role"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "user_id": user_id, "is_admin": is_admin }))
+        .send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            if r.status().is_success() { Ok(()) } else { Err(format!("role failed: {}", r.status())) }
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn transfer_owner_api(server: String, token: String, guild_id: u64, user_id: u64) -> Result<(), String> {
+    let client = make_client();
+    let resp = client.post(format!("{server}/api/servers/{guild_id}/transfer"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "user_id": user_id }))
+        .send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            if r.status().is_success() { Ok(()) } else { Err(format!("transfer failed: {}", r.status())) }
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn kick_member_api(server: String, token: String, guild_id: u64, user_id: u64) -> Result<(), String> {
+    let client = make_client();
+    let resp = client.post(format!("{server}/api/servers/{guild_id}/kick"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "user_id": user_id }))
+        .send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            if r.status().is_success() { Ok(()) } else { Err(format!("kick failed: {}", r.status())) }
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn load_sticker_packs(server: String, token: String, query: String) -> Result<Vec<StickerPack>, String> {
+    let client = make_client();
+    let url = if query.is_empty() {
+        format!("{server}/api/stickers")
+    } else {
+        format!("{server}/api/stickers?q={}", url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>())
+    };
+    let resp = client.get(&url).bearer_auth(&token).send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            let v: serde_json::Value = r.json().await.unwrap_or_default();
+            serde_json::from_value(v.get("packs").cloned().unwrap_or_default())
+                .map_err(|e| format!("parse error: {e}"))
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn create_sticker_pack_api(server: String, token: String, name: String) -> Result<u64, String> {
+    let client = make_client();
+    let resp = client.post(format!("{server}/api/stickers/packs"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": name }))
+        .send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            let v: serde_json::Value = r.json().await.unwrap_or_default();
+            v.get("id").and_then(|x| x.as_u64()).ok_or_else(|| "missing pack id".to_string())
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn sticker_image_api(server: String, token: String, sticker_id: u64) -> Result<Vec<u8>, String> {
+    let client = make_client();
+    let resp = client.get(format!("{server}/api/stickers/{sticker_id}/image"))
+        .bearer_auth(&token)
+        .send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            if r.status().is_success() {
+                r.bytes().await.map(|b| b.to_vec()).map_err(|e| format!("{e}"))
+            } else {
+                Err(format!("sticker fetch failed: {}", r.status()))
+            }
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn upload_sticker_api(server: String, token: String, pack_id: u64, name: String, data: Vec<u8>, mime: String) -> Result<(), String> {
+    use base64::Engine;
+    let data_b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+    let client = make_client();
+    let resp = client.post(format!("{server}/api/stickers/packs/{pack_id}/stickers"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": name, "data": data_b64, "mime": mime }))
+        .send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            if r.status().is_success() { Ok(()) } else { Err(format!("upload failed: {}", r.status())) }
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn delete_sticker_api(server: String, token: String, pack_id: u64, sticker_id: u64) -> Result<(), String> {
+    let client = make_client();
+    let resp = client.delete(format!("{server}/api/stickers/packs/{pack_id}/stickers/{sticker_id}"))
+        .bearer_auth(&token).send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            if r.status().is_success() { Ok(()) } else { Err(format!("delete failed: {}", r.status())) }
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn delete_sticker_pack_api(server: String, token: String, pack_id: u64) -> Result<(), String> {
+    let client = make_client();
+    let resp = client.delete(format!("{server}/api/stickers/packs/{pack_id}"))
+        .bearer_auth(&token).send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            if r.status().is_success() { Ok(()) } else { Err(format!("delete failed: {}", r.status())) }
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn load_guild_detail(server: String, token: String, guild_id: u64) -> Result<Guild, String> {
+    let client = make_client();
+    let resp = client.get(format!("{server}/api/servers/{guild_id}"))
+        .bearer_auth(&token).send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            let v: serde_json::Value = r.json().await.unwrap_or_default();
+            serde_json::from_value(v).map_err(|e| format!("parse error: {e}"))
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn create_role_api(server: String, token: String, guild_id: u64, name: String) -> Result<(), String> {
+    let client = make_client();
+    let resp = client.post(format!("{server}/api/servers/{guild_id}/roles"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": name }))
+        .send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            if r.status().is_success() { Ok(()) } else { Err(format!("role failed: {}", r.status())) }
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn delete_role_api(server: String, token: String, guild_id: u64, role_id: u64) -> Result<(), String> {
+    let client = make_client();
+    let resp = client.delete(format!("{server}/api/servers/{guild_id}/roles/{role_id}"))
+        .bearer_auth(&token).send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            if r.status().is_success() { Ok(()) } else { Err(format!("role failed: {}", r.status())) }
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn assign_role_api(server: String, token: String, guild_id: u64, role_id: u64, user_id: u64, on: bool) -> Result<(), String> {
+    let client = make_client();
+    let resp = client.post(format!("{server}/api/servers/{guild_id}/roles/{role_id}/assign"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "user_id": user_id, "on": on }))
+        .send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            if r.status().is_success() { Ok(()) } else { Err(format!("assign failed: {}", r.status())) }
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn rename_channel_api(server: String, token: String, guild_id: u64, channel_id: u64, name: String) -> Result<(), String> {
+    let client = make_client();
+    let resp = client.patch(format!("{server}/api/servers/{guild_id}/channels/{channel_id}"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": name }))
+        .send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            if r.status().is_success() { Ok(()) } else { Err(format!("rename failed: {}", r.status())) }
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn delete_channel_api(server: String, token: String, guild_id: u64, channel_id: u64) -> Result<(), String> {
+    let client = make_client();
+    let resp = client.delete(format!("{server}/api/servers/{guild_id}/channels/{channel_id}"))
+        .bearer_auth(&token).send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            if r.status().is_success() { Ok(()) } else { Err(format!("delete failed: {}", r.status())) }
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn ban_member_api(server: String, token: String, guild_id: u64, user_id: u64) -> Result<(), String> {
+    let client = make_client();
+    let resp = client.post(format!("{server}/api/servers/{guild_id}/bans"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "user_id": user_id }))
+        .send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            if r.status().is_success() { Ok(()) } else { Err(format!("ban failed: {}", r.status())) }
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn unban_member_api(server: String, token: String, guild_id: u64, user_id: u64) -> Result<(), String> {
+    let client = make_client();
+    let resp = client.delete(format!("{server}/api/servers/{guild_id}/bans/{user_id}"))
+        .bearer_auth(&token).send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            if r.status().is_success() { Ok(()) } else { Err(format!("unban failed: {}", r.status())) }
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn load_sessions_api(server: String, token: String) -> Result<Vec<SessionInfo>, String> {
+    let client = make_client();
+    let resp = client.get(format!("{server}/api/me/sessions"))
+        .bearer_auth(&token).send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            let v: serde_json::Value = r.json().await.unwrap_or_default();
+            serde_json::from_value(v.get("sessions").cloned().unwrap_or_default())
+                .map_err(|e| format!("parse error: {e}"))
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn revoke_session_api(server: String, token: String, session_id: u64) -> Result<(), String> {
+    let client = make_client();
+    let resp = client.delete(format!("{server}/api/me/sessions/{session_id}"))
+        .bearer_auth(&token).send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            if r.status().is_success() { Ok(()) } else { Err(format!("revoke failed: {}", r.status())) }
         }
         Err(e) => Err(format!("{e}")),
     }
@@ -3610,23 +4565,45 @@ fn view(state: &AppState) -> Element<'_, Msg> {
 fn view_auth(state: &AppState) -> Element<'_, Msg> {
     let is_register = state.screen == Screen::Register;
 
-    let logo = text("FediTexter").size(state.zs(36));
-    let subtitle = text(if is_register { "Create account" } else { "Sign in" }).size(state.zs(16))
-        .color(iced::Color::from_rgb(0.6, 0.6, 0.6));
+    let logo: Element<'_, Msg> = text("FediTexter").size(state.zs(36)).into();
+    let subtitle: Element<'_, Msg> = text(if is_register { "Create account" } else { "Sign in" }).size(state.zs(16))
+        .color(iced::Color::from_rgb(0.6, 0.6, 0.6)).into();
 
-    let server = text_input("Server URL", &state.server)
+    let server: Element<'_, Msg> = text_input("Server URL", &state.server)
         .on_input(Msg::LoginServerChanged)
-        .width(Length::Fixed(state.z(320.0)));
+        .width(Length::Fixed(state.z(320.0)))
+        .into();
 
-    let email = text_input("Email", &state.login_email)
-        .on_input(Msg::LoginEmailChanged)
-        .width(Length::Fixed(state.z(320.0)));
+    let email: Element<'_, Msg> = text_input("Email", if is_register { &state.register_email } else { &state.login_email })
+        .on_input(if is_register { Msg::RegisterEmailChanged } else { Msg::LoginEmailChanged })
+        .width(Length::Fixed(state.z(320.0)))
+        .into();
 
-    let password = text_input("Password", &state.login_password)
-        .on_input(Msg::LoginPasswordChanged)
-        .on_submit(Msg::LoginSubmit)
+    let username: Option<Element<'_, Msg>> = if is_register {
+        Some(text_input("Username", &state.register_username)
+            .on_input(Msg::RegisterUsernameChanged)
+            .width(Length::Fixed(state.z(320.0)))
+            .into())
+    } else {
+        None
+    };
+
+    let password: Element<'_, Msg> = text_input("Password", if is_register { &state.register_password } else { &state.login_password })
+        .on_input(if is_register { Msg::RegisterPasswordChanged } else { Msg::LoginPasswordChanged })
+        .on_submit(if is_register { Msg::RegisterSubmit } else { Msg::LoginSubmit })
         .secure(true)
-        .width(Length::Fixed(state.z(320.0)));
+        .width(Length::Fixed(state.z(320.0)))
+        .into();
+
+    let birthdate: Option<Element<'_, Msg>> = if is_register {
+        Some(text_input("Date of birth (YYYY-MM-DD, 18+)", &state.register_birthdate)
+            .on_input(Msg::RegisterBirthdateChanged)
+            .on_submit(Msg::RegisterSubmit)
+            .width(Length::Fixed(state.z(320.0)))
+            .into())
+    } else {
+        None
+    };
 
     let login_btn: Element<'_, Msg> = if state.auth_busy {
         button(throbber(state.zs(16))).width(Length::Fixed(state.z(320.0))).into()
@@ -3647,17 +4624,28 @@ fn view_auth(state: &AppState) -> Element<'_, Msg> {
         )
     };
 
-    let toggle = if is_register {
+    let toggle: Element<'_, Msg> = if is_register {
         button(text("Already have an account? Sign in").size(state.zs(13)))
             .on_press(Msg::ShowRegister(false))
+            .into()
     } else {
         button(text("Create account").size(state.zs(13)))
             .on_press(Msg::ShowRegister(true))
+            .into()
     };
 
-    let mut form = column![logo, subtitle, server, email, password]
-        .spacing(state.z(14))
-        .align_x(iced::Alignment::Center);
+    let mut form: iced::widget::Column<'_, Msg> = column![].spacing(state.z(14)).align_x(iced::Alignment::Center);
+    form = form.push(logo);
+    form = form.push(subtitle);
+    form = form.push(server);
+    form = form.push(email);
+    if let Some(u) = username {
+        form = form.push(u);
+    }
+    form = form.push(password);
+    if let Some(b) = birthdate {
+        form = form.push(b);
+    }
     if let Some(remember) = remember_row {
         form = form.push(remember);
     }
@@ -3838,6 +4826,19 @@ fn view_chat(state: &AppState) -> Element<'_, Msg> {
                             ..iced::widget::container::Style::default()
                         })
                 );
+            }
+
+            if profile.restricted {
+                info = info.push(
+                    container(row![
+                        text("🔒").size(state.zs(12)),
+                        text("This profile is private — no bio or avatar shown").size(state.zs(11)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
+                    ].spacing(state.z(6)).align_y(iced::Alignment::Center))
+                        .padding([state.z(6.0), state.z(12.0)])
+                        .style(composer_style)
+                );
+            } else if !profile.bio.is_empty() {
+                info = info.push(text(&profile.bio).size(state.zs(13)).color(iced::Color::from_rgb(0.75, 0.75, 0.75)));
             }
 
             if !profile.is_self {
@@ -4041,6 +5042,10 @@ fn view_chat(state: &AppState) -> Element<'_, Msg> {
         layers.push(view_guild_modal(state));
     }
 
+    if state.guild_settings_open {
+        layers.push(view_guild_settings(state));
+    }
+
     iced::widget::Stack::from_vec(layers)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -4074,7 +5079,7 @@ fn view_new_conv(state: &AppState) -> Element<'_, Msg> {
                 text("Create or join a server").size(state.zs(10)).color(iced::Color::from_rgb(0.75, 0.75, 0.75)),
             ].spacing(state.z(2)).align_x(iced::Alignment::Center).width(Length::Fill)
         )
-        .on_press(Msg::OpenGuildModal)
+        .on_press(Msg::OpenServerModal)
         .width(Length::Fill)
         .height(Length::Fixed(state.z(64.0)))
         .padding([state.z(8.0), state.z(8.0)]),
@@ -4213,70 +5218,82 @@ fn view_new_conv(state: &AppState) -> Element<'_, Msg> {
 
 fn view_guild_modal(state: &AppState) -> Element<'_, Msg> {
     let close_btn = button(text("✕").size(state.zs(14))).on_press(Msg::CloseGuildModal).padding(state.z(4));
-    let title = text("Servers & channels").size(state.zs(18));
 
-    let name_input = text_input("Server name (e.g. My Server)", &state.guild_name_input)
-        .on_input(Msg::GuildNameInput)
-        .on_submit(Msg::CreateGuildSubmit)
-        .width(Length::Fill);
-    let create_btn: Element<'_, Msg> = if state.guild_busy {
-        button(throbber(state.zs(14))).padding(state.z(6)).into()
-    } else {
-        button(text("Create server").size(state.zs(13)))
-            .on_press(Msg::CreateGuildSubmit)
-            .style(button::primary)
-            .padding([state.z(6.0), state.z(14.0)])
-            .into()
-    };
+    let selected_guild = state.selected_guild
+        .and_then(|gid| state.guilds.iter().find(|g| g.id == gid));
 
-    let join_code_input = text_input("Invite code (e.g. 5f3a9c2b1d7e8a4f)", &state.guild_join_code_input)
-        .on_input(Msg::GuildJoinCodeInput)
-        .on_submit(Msg::JoinGuildSubmit)
-        .width(Length::Fill);
-    let join_btn: Element<'_, Msg> = if state.guild_busy {
-        button(throbber(state.zs(14))).padding(state.z(6)).into()
-    } else {
-        button(text("Join server").size(state.zs(13)))
-            .on_press(Msg::JoinGuildSubmit)
-            .padding([state.z(6.0), state.z(14.0)])
-            .into()
-    };
+    let mut content: Option<iced::widget::Column<'_, Msg>> = None;
 
-    let mut content = column![
-        row![title, space::horizontal(), close_btn].align_y(iced::Alignment::Center),
-        text("Create a new server").size(state.zs(13)).color(iced::Color::from_rgb(0.75, 0.75, 0.75)),
-        name_input,
-        create_btn,
-        rule::horizontal(1),
-        text("Join an existing server").size(state.zs(13)).color(iced::Color::from_rgb(0.75, 0.75, 0.75)),
-        join_code_input,
-        join_btn,
-    ].spacing(state.z(10)).align_x(iced::Alignment::Start);
-
-    // When a guild is selected, offer channel creation too.
-    if let Some(guild_id) = state.selected_guild
-        && let Some(g) = state.guilds.iter().find(|g| g.id == guild_id)
-    {
+    if let Some(g) = selected_guild {
+        // A guild is selected: the modal is only about adding a channel.
+        let title = text("Add channel").size(state.zs(18));
         let channel_input = text_input("Channel name (e.g. general)", &state.channel_name_input)
             .on_input(Msg::ChannelNameInput)
-            .on_submit(Msg::CreateChannelSubmit(guild_id))
+            .on_submit(Msg::CreateChannelSubmit(g.id))
             .width(Length::Fill);
         let channel_btn: Element<'_, Msg> = if state.guild_busy {
             button(throbber(state.zs(14))).padding(state.z(6)).into()
         } else {
             button(text("Add channel").size(state.zs(13)))
-                .on_press(Msg::CreateChannelSubmit(guild_id))
+                .on_press(Msg::CreateChannelSubmit(g.id))
+                .style(button::primary)
                 .padding([state.z(6.0), state.z(14.0)])
                 .into()
         };
-        content = content.push(rule::horizontal(1));
-        content = content.push(text(format!("Add a channel to {}", g.name)).size(state.zs(13)).color(iced::Color::from_rgb(0.75, 0.75, 0.75)));
-        content = content.push(channel_input);
-        content = content.push(channel_btn);
+        content = Some(column![
+            row![title, space::horizontal(), close_btn].align_y(iced::Alignment::Center),
+            text(format!("Add a channel to {}", g.name)).size(state.zs(13)).color(iced::Color::from_rgb(0.75, 0.75, 0.75)),
+            channel_input,
+            channel_btn,
+        ].spacing(state.z(10)).align_x(iced::Alignment::Start));
+    } else {
+        let title = text("Servers").size(state.zs(18));
+        let name_input = text_input("Server name (e.g. My Server)", &state.guild_name_input)
+            .on_input(Msg::GuildNameInput)
+            .on_submit(Msg::CreateGuildSubmit)
+            .width(Length::Fill);
+        let create_btn: Element<'_, Msg> = if state.guild_busy {
+            button(throbber(state.zs(14))).padding(state.z(6)).into()
+        } else {
+            button(text("Create server").size(state.zs(13)))
+                .on_press(Msg::CreateGuildSubmit)
+                .style(button::primary)
+                .padding([state.z(6.0), state.z(14.0)])
+                .into()
+        };
+
+        let join_code_input = text_input("Invite code (e.g. 5f3a9c2b1d7e8a4f)", &state.guild_join_code_input)
+            .on_input(Msg::GuildJoinCodeInput)
+            .on_submit(Msg::JoinGuildSubmit)
+            .width(Length::Fill);
+        let join_btn: Element<'_, Msg> = if state.guild_busy {
+            button(throbber(state.zs(14))).padding(state.z(6)).into()
+        } else {
+            button(text("Join server").size(state.zs(13)))
+                .on_press(Msg::JoinGuildSubmit)
+                .padding([state.z(6.0), state.z(14.0)])
+                .into()
+        };
+
+        content = Some(column![
+            row![title, space::horizontal(), close_btn].align_y(iced::Alignment::Center),
+            text("Create a new server").size(state.zs(13)).color(iced::Color::from_rgb(0.75, 0.75, 0.75)),
+            name_input,
+            create_btn,
+            rule::horizontal(1),
+            text("Join an existing server").size(state.zs(13)).color(iced::Color::from_rgb(0.75, 0.75, 0.75)),
+            join_code_input,
+            join_btn,
+        ].spacing(state.z(10)).align_x(iced::Alignment::Start));
     }
+
+    let mut content = content.unwrap();
 
     if !state.error.is_empty() {
         content = content.push(text(&state.error).size(state.zs(12)).color(iced::Color::from_rgb(0.9, 0.3, 0.2)));
+    }
+    if !state.info.is_empty() {
+        content = content.push(text(&state.info).size(state.zs(12)).color(iced::Color::from_rgb(0.5, 0.8, 0.5)));
     }
 
     let popup = container(content)
@@ -4321,11 +5338,233 @@ fn view_guild_modal(state: &AppState) -> Element<'_, Msg> {
         .into()
 }
 
+fn view_guild_settings(state: &AppState) -> Element<'_, Msg> {
+    let close_btn = button(text("✕").size(state.zs(14))).on_press(Msg::CloseGuildSettings).padding(state.z(4));
+    let guild = state.selected_guild.and_then(|id| state.guilds.iter().find(|g| g.id == id));
+    let guild_name = guild.map(|g| g.name.clone()).unwrap_or_else(|| "Server".to_string());
+    let title = text(format!("{guild_name} settings")).size(state.zs(18));
+    let can_manage = guild.map(|g| g.can_manage).unwrap_or(false);
+    let self_id = state.user.as_ref().map(|u| u.id);
+    let is_owner = guild.map(|g| self_id == Some(g.owner_id)).unwrap_or(false);
+
+    let tab_bar: Vec<Element<'_, Msg>> = [GuildSettingsTab::Channels, GuildSettingsTab::Roles, GuildSettingsTab::Bans].iter().map(|t| {
+        let selected = state.guild_settings_tab == *t;
+        let label = match t {
+            GuildSettingsTab::Channels => "Channels",
+            GuildSettingsTab::Roles => "Roles",
+            GuildSettingsTab::Bans => "Bans",
+        };
+        button(text(label).size(state.zs(13)).color(if selected { iced::Color::WHITE } else { iced::Color::from_rgb(0.7, 0.7, 0.7) }))
+            .on_press(Msg::GuildSettingsTabChanged(*t))
+            .style(if selected { button::primary } else { button::secondary })
+            .padding([state.z(6.0), state.z(12.0)])
+            .into()
+    }).collect();
+
+    let mut content = column![
+        row![title, space::horizontal(), close_btn].align_y(iced::Alignment::Center),
+        row(tab_bar).spacing(state.z(6)),
+        rule::horizontal(1),
+    ].spacing(state.z(10));
+
+    if !can_manage {
+        content = content.push(
+            text("Only the owner or an admin can manage this server.").size(state.zs(12)).color(iced::Color::from_rgb(0.6, 0.6, 0.6))
+        );
+    } else if let Some(g) = guild {
+        match state.guild_settings_tab {
+            GuildSettingsTab::Channels => {
+                content = content.push(
+                    text("Rename or delete channels, or add a new one.").size(state.zs(12)).color(iced::Color::from_rgb(0.75, 0.75, 0.75))
+                );
+                for ch in &g.channels {
+                    let rename_value = state.channel_rename_inputs.get(&ch.id).map(String::as_str).unwrap_or(ch.name.as_str());
+                    let rename_input = text_input("Channel name", rename_value)
+                        .on_input(move |v| Msg::ChannelRenameInput { channel_id: ch.id, value: v })
+                        .width(Length::Fixed(state.z(180.0)));
+                    let row_el: Element<'_, Msg> = row![
+                        text("#").size(state.zs(13)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
+                        text(ch.name.clone()).size(state.zs(13)),
+                        space::horizontal(),
+                        rename_input,
+                        button(text("Rename").size(state.zs(11))).on_press(Msg::RenameChannel { channel_id: ch.id, name: rename_value.to_string() }).padding(state.z(4)),
+                        button(text("Delete").size(state.zs(11)).color(iced::Color::from_rgb(0.9, 0.5, 0.5)))
+                            .on_press(Msg::DeleteChannel { channel_id: ch.id })
+                            .style(button::text)
+                            .padding(state.z(4)),
+                    ].spacing(state.z(8)).align_y(iced::Alignment::Center).into();
+                    content = content.push(row_el);
+                }
+                let add_input = text_input("New channel name", &state.channel_name_input)
+                    .on_input(Msg::ChannelNameInput)
+                    .on_submit(Msg::CreateChannelSubmit(g.id))
+                    .width(Length::Fixed(state.z(200.0)));
+                content = content.push(row![add_input, button(text("Add channel").size(state.zs(12))).on_press(Msg::CreateChannelSubmit(g.id)).padding(state.z(4))].spacing(state.z(8)).align_y(iced::Alignment::Center));
+            }
+            GuildSettingsTab::Roles => {
+                content = content.push(
+                    text("Roles are shown per member; toggling assigns or revokes them.").size(state.zs(12)).color(iced::Color::from_rgb(0.75, 0.75, 0.75))
+                );
+                for role in &g.roles {
+                    let role_tag = if role.is_admin { " (admin)" } else { "" };
+                    let role_header: Element<'_, Msg> = row![
+                        text(format!("{}{role_tag}", role.name)).size(state.zs(13)),
+                        if role.is_admin || !is_owner {
+                            let spacer: Element<'_, Msg> = space::horizontal().into();
+                            spacer
+                        } else {
+                            row![space::horizontal(), button(text("delete").size(state.zs(10)).color(iced::Color::from_rgb(0.9, 0.5, 0.5)))
+                                .on_press(Msg::DeleteRole { guild_id: g.id, role_id: role.id })
+                                .style(button::text).padding(state.z(0))].into()
+                        },
+                    ].spacing(state.z(6)).align_y(iced::Alignment::Center).into();
+                    content = content.push(role_header);
+                    if !role.is_admin {
+                        for m in &g.members {
+                            if Some(m.id) == self_id { continue; }
+                            let assigned = role.member_ids.contains(&m.id);
+                            let name = if m.display_name.is_empty() { m.username.as_str() } else { m.display_name.as_str() };
+                            let toggle = button(text(if assigned { "✓ on" } else { "off" }).size(state.zs(11)))
+                                .on_press(Msg::AssignRole { guild_id: g.id, role_id: role.id, user_id: m.id, on: !assigned })
+                                .padding(state.z(2));
+                            content = content.push(row![text(name.to_string()).size(state.zs(12)), space::horizontal(), toggle].spacing(state.z(8)).align_y(iced::Alignment::Center));
+                        }
+                    }
+                }
+                let role_input = text_input("New role name", &state.role_name_input)
+                    .on_input(Msg::RoleNameInput)
+                    .on_submit(Msg::CreateRoleSubmit(g.id))
+                    .width(Length::Fixed(state.z(180.0)));
+                content = content.push(row![role_input, button(text("Create role").size(state.zs(12))).on_press(Msg::CreateRoleSubmit(g.id)).padding(state.z(4))].spacing(state.z(8)).align_y(iced::Alignment::Center));
+            }
+            GuildSettingsTab::Bans => {
+                content = content.push(text("Banned users").size(state.zs(13)).color(iced::Color::from_rgb(0.75, 0.75, 0.75)));
+                if g.bans.is_empty() {
+                    content = content.push(text("No banned users").size(state.zs(12)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)));
+                }
+                for b in &g.bans {
+                    let name = if b.display_name.is_empty() { b.username.as_str() } else { b.display_name.as_str() };
+                    content = content.push(row![text(name.to_string()).size(state.zs(12)), space::horizontal(),
+                        button(text("Unban").size(state.zs(11)).color(iced::Color::from_rgb(0.5, 0.8, 0.5)))
+                            .on_press(Msg::UnbanMember { guild_id: g.id, user_id: b.id })
+                            .style(button::text).padding(state.z(0))]
+                        .spacing(state.z(8)).align_y(iced::Alignment::Center));
+                }
+                content = content.push(rule::horizontal(1));
+                content = content.push(text("Members").size(state.zs(13)).color(iced::Color::from_rgb(0.75, 0.75, 0.75)));
+                let admin_ids: Vec<u64> = g.roles.iter()
+                    .filter(|r| r.is_admin)
+                    .flat_map(|r| r.member_ids.iter().copied())
+                    .collect();
+                for m in &g.members {
+                    if Some(m.id) == self_id { continue; }
+                    let name = if m.display_name.is_empty() { m.username.as_str() } else { m.display_name.as_str() };
+                    let is_owner_target = Some(m.id) == Some(g.owner_id);
+                    let is_admin_member = admin_ids.contains(&m.id);
+                    let mut ctrl: Vec<Element<'_, Msg>> = Vec::new();
+                    if is_owner_target {
+                        ctrl.push(text("👑 owner").size(state.zs(11)).color(iced::Color::from_rgb(0.9, 0.8, 0.3)).into());
+                    }
+                    if is_admin_member {
+                        ctrl.push(text("admin").size(state.zs(11)).color(iced::Color::from_rgb(0.5, 0.8, 0.5)).into());
+                    }
+                    if is_owner {
+                        if !is_owner_target {
+                            ctrl.push(button(text(if is_admin_member { "demote" } else { "promote" }).size(state.zs(11)))
+                                .on_press(Msg::SetRole { guild_id: g.id, user_id: m.id, is_admin: !is_admin_member })
+                                .style(button::text).padding(state.z(0)).into());
+                            ctrl.push(button(text("transfer").size(state.zs(11)).color(iced::Color::from_rgb(0.9, 0.8, 0.3)))
+                                .on_press(Msg::TransferOwner { guild_id: g.id, user_id: m.id })
+                                .style(button::text).padding(state.z(0)).into());
+                        }
+                    }
+                    if can_manage && !is_owner_target {
+                        ctrl.push(button(text("Ban").size(state.zs(11)).color(iced::Color::from_rgb(0.9, 0.5, 0.5)))
+                            .on_press(Msg::BanMember { guild_id: g.id, user_id: m.id })
+                            .style(button::text).padding(state.z(0)).into());
+                    }
+                    content = content.push(row![
+                        text(name.to_string()).size(state.zs(12)),
+                        space::horizontal(),
+                        row(ctrl).spacing(state.z(8)).align_y(iced::Alignment::Center),
+                    ].spacing(state.z(8)).align_y(iced::Alignment::Center));
+                }
+            }
+        }
+        if is_owner {
+            content = content.push(rule::horizontal(1));
+            content = content.push(button(text("Delete server…").size(state.zs(12))).on_press(Msg::DeleteGuild(g.id)).style(danger_text_button));
+        }
+    }
+
+    if !state.error.is_empty() {
+        content = content.push(text(&state.error).size(state.zs(12)).color(iced::Color::from_rgb(0.9, 0.3, 0.2)));
+    }
+
+    let popup = container(scrollable(content).height(Length::Shrink))
+        .padding(state.z(20))
+        .width(Length::Fixed(state.z(460.0)))
+        .max_height(state.z(560.0))
+        .style(|theme: &iced::Theme| {
+            let p = theme.extended_palette();
+            iced::widget::container::Style {
+                background: Some(p.background.weakest.color.into()),
+                border: iced::Border {
+                    width: 1.0,
+                    color: p.background.weak.color,
+                    radius: 12.0.into(),
+                },
+                shadow: iced::Shadow { color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.4), offset: iced::Vector::new(0.0, 4.0), blur_radius: 12.0 },
+                ..iced::widget::container::Style::default()
+            }
+        });
+
+    let dim = mouse_area(
+        container(space::horizontal())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_: &iced::Theme| iced::widget::container::Style {
+                background: Some(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.55).into()),
+                ..iced::widget::container::Style::default()
+            })
+    )
+    .on_press(Msg::CloseGuildSettings)
+    .into();
+
+    let centered = container(mouse_area(popup).on_press(Msg::Noop))
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into();
+
+    iced::widget::Stack::from_vec(vec![dim, centered])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
 fn view_settings(state: &AppState) -> Element<'_, Msg> {
     let back_btn = button(text("← Back").size(state.zs(14))).on_press(Msg::ToggleSettings);
     let title = text("Settings").size(state.zs(24));
     let username = state.user.as_ref().map(|u| u.username.as_str()).unwrap_or("");
     let email = state.user.as_ref().map(|u| u.email.as_str()).unwrap_or("");
+
+    // Sub-tabs: General / Privacy / Devices.
+    let tab_bar: Vec<Element<'_, Msg>> = [SettingsTab::General, SettingsTab::Privacy, SettingsTab::Devices].iter().map(|t| {
+        let selected = state.settings_tab == *t;
+        let label = match t {
+            SettingsTab::General => "General",
+            SettingsTab::Privacy => "Privacy",
+            SettingsTab::Devices => "Devices",
+        };
+        button(text(label).size(state.zs(13)).color(if selected { iced::Color::WHITE } else { iced::Color::from_rgb(0.7, 0.7, 0.7) }))
+            .on_press(Msg::SettingsTabChanged(*t))
+            .style(if selected { button::primary } else { button::secondary })
+            .padding([state.z(6.0), state.z(12.0)])
+            .into()
+    }).collect();
+    let tab_row = row(tab_bar).spacing(state.z(6));
 
     let display_name_label = text("Display name").size(state.zs(14))
         .color(iced::Color::from_rgb(0.6, 0.6, 0.6));
@@ -4375,6 +5614,24 @@ fn view_settings(state: &AppState) -> Element<'_, Msg> {
     }).collect();
 
     let accent_row = row(swatches).spacing(state.z(8));
+
+    // Auto-shades preview: light / base / dark generated from the current accent.
+    let shade_swatch = |c: iced::Color| {
+        container(text("").size(state.zs(1)))
+            .width(Length::Fixed(state.z(30.0)))
+            .height(Length::Fixed(state.z(18.0)))
+            .style(move |_: &iced::Theme| iced::widget::container::Style {
+                background: Some(c.into()),
+                border: iced::Border { radius: 4.0.into(), width: 1.0, color: iced::Color::from_rgb(0.3, 0.3, 0.3), ..iced::Border::default() },
+                ..iced::widget::container::Style::default()
+            })
+    };
+    let shades_row = row![
+        shade_swatch(accent_light(state.accent)),
+        shade_swatch(state.accent),
+        shade_swatch(accent_dark(state.accent)),
+        text("auto-shades").size(state.zs(10)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+    ].spacing(state.z(6)).align_y(iced::Alignment::Center);
 
     let pfp_label = text("Profile picture").size(state.zs(14))
         .color(iced::Color::from_rgb(0.6, 0.6, 0.6));
@@ -4459,30 +5716,116 @@ fn view_settings(state: &AppState) -> Element<'_, Msg> {
         col.into()
     };
 
-    let content = column![
-        back_btn,
-        title,
-        text(format!("Username: {username}")).size(state.zs(14)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
-        text(format!("Email: {email}")).size(state.zs(14)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
+    let bio_label = text("Bio").size(state.zs(14))
+        .color(iced::Color::from_rgb(0.6, 0.6, 0.6));
+    let bio_input = text_input("A short bio shown on your profile", &state.bio_input)
+        .on_input(Msg::BioChanged)
+        .width(Length::Fixed(state.z(320.0)));
+
+    let accent_hex_input = text_input("#rrggbb", &state.accent_hex_input)
+        .on_input(Msg::AccentHexChanged)
+        .on_submit(Msg::ApplyAccentHex)
+        .width(Length::Fixed(state.z(110.0)));
+    let apply_hex_btn = button(text("Apply").size(state.zs(12)))
+        .on_press(Msg::ApplyAccentHex)
+        .padding([state.z(5.0), state.z(10.0)]);
+
+    // General tab: profile fields, accent (swatches + custom hex), 2FA.
+    let general_tab = column![
         rule::horizontal(1),
         pfp_label,
         pfp_row,
         rule::horizontal(1),
         display_name_label,
         display_name_input,
+        bio_label,
+        bio_input,
         save_btn,
         rule::horizontal(1),
         accent_label,
         accent_row,
+        shades_row,
+        row![accent_hex_input, apply_hex_btn].spacing(state.z(6)).align_y(iced::Alignment::Center),
+        text("Custom colour (auto shades are generated from it)").size(state.zs(10)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
         rule::horizontal(1),
         twofa_label,
-    ].spacing(state.z(12)).padding(state.z(24)).max_width(state.z(480));
-    let content = content
-        .push(twofa_section)
-        .push(rule::horizontal(1))
-        .push(logout_btn);
+        twofa_section,
+    ].spacing(state.z(12));
 
-    container(content)
+    // Privacy tab: profile visibility.
+    let profile_visible = state.user.as_ref().map(|u| u.profile_visible).unwrap_or(true);
+    let privacy_tab = column![
+        rule::horizontal(1),
+        text("Profile visibility").size(state.zs(14)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
+        text("When hidden, other users can still find and message you, but your profile (bio, avatar) appears bare-bones.").size(state.zs(11)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+        row![
+            text(if profile_visible { "Visible to everyone" } else { "Hidden (bare-bones for others)" }).size(state.zs(12)),
+            space::horizontal(),
+            button(text(if profile_visible { "Hide" } else { "Show" }).size(state.zs(12)))
+                .on_press(Msg::ProfileVisibleToggled(!profile_visible))
+                .padding([state.z(5.0), state.z(12.0)]),
+        ].spacing(state.z(8)).align_y(iced::Alignment::Center),
+    ].spacing(state.z(10));
+
+    // Devices tab: logged-in sessions.
+    let mut devices_tab = column![
+        rule::horizontal(1),
+        text("Logged-in devices").size(state.zs(14)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
+    ].spacing(state.z(10));
+    if state.sessions_busy {
+        devices_tab = devices_tab.push(row![throbber(state.z(14)), text("Loading…").size(state.zs(11)).color(iced::Color::from_rgb(0.5, 0.5, 0.5))]
+            .spacing(state.z(6)).align_y(iced::Alignment::Center));
+    } else if state.sessions.is_empty() {
+        devices_tab = devices_tab.push(text("No other devices found").size(state.zs(12)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)));
+    } else {
+        for s in &state.sessions {
+            let dev = s.device_id.clone().unwrap_or_else(|| "Unknown device".to_string());
+            let ip = s.login_ip.clone().unwrap_or_else(|| "unknown IP".to_string());
+            let tag = if s.current { "this device" } else { "" };
+            let revoke: Element<'_, Msg> = if s.current {
+                text("").into()
+            } else {
+                button(text("Revoke").size(state.zs(11)).color(iced::Color::from_rgb(0.9, 0.5, 0.5)))
+                    .on_press(Msg::RevokeSession(s.id))
+                    .style(button::text)
+                    .padding(state.z(0))
+                    .into()
+            };
+            let row_el: Element<'_, Msg> = container(
+                row![
+                    column![
+                        text(format!("{dev} {tag}")).size(state.zs(12)),
+                        text(format!("{ip} · {}", format_local_time(&s.created_at))).size(state.zs(10)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+                    ].spacing(state.z(2)),
+                    space::horizontal(),
+                    revoke,
+                ].spacing(state.z(8)).align_y(iced::Alignment::Center),
+            )
+            .padding(state.z(8))
+            .style(composer_style)
+            .into();
+            devices_tab = devices_tab.push(row_el);
+        }
+    }
+
+    let tab_content: Element<'_, Msg> = match state.settings_tab {
+        SettingsTab::General => general_tab.into(),
+        SettingsTab::Privacy => privacy_tab.into(),
+        SettingsTab::Devices => devices_tab.into(),
+    };
+
+    let content = column![
+        back_btn,
+        title,
+        text(format!("Username: {username}")).size(state.zs(14)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
+        text(format!("Email: {email}")).size(state.zs(14)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
+        tab_row,
+        tab_content,
+        rule::horizontal(1),
+        logout_btn,
+    ].spacing(state.z(12)).padding(state.z(24)).max_width(state.z(560));
+
+    container(scrollable(content))
         .center_x(Length::Fill)
         .center_y(Length::Fill)
         .into()
@@ -4494,8 +5837,7 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {
     ].align_y(iced::Alignment::Center).spacing(state.z(8));
 
     // ----- Server rail (leftmost, Discord-style) -----
-    let guild_rail_items: Vec<Element<'_, Msg>> = state.guilds.iter().map(|g| {
-        let selected = state.selected_guild == Some(g.id);
+    let guild_rail_items: Vec<Element<'_, Msg>> = state.guilds.iter().map(|g| {        let selected = state.selected_guild == Some(g.id);
         let initials = user_initials(&g.name);
         let hue = name_hue(&g.name);
         let btn = button(
@@ -4521,11 +5863,33 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {
             .into()
     }).collect();
 
+    let new_guild_btn = button(
+        container(text("＋").size(state.zs(20)).color(state.accent))
+            .width(state.z(44.0))
+            .height(state.z(44.0))
+            .center_x(Length::Fixed(state.z(44.0)))
+            .center_y(Length::Fixed(state.z(44.0)))
+            .style(|_: &iced::Theme| iced::widget::container::Style {
+                background: Some(iced::Color::from_rgb(0.16, 0.17, 0.19).into()),
+                border: iced::Border {
+                    radius: 22.0.into(),
+                    width: 1.0,
+                    color: iced::Color::from_rgb(0.3, 0.3, 0.3),
+                    ..iced::Border::default()
+                },
+                ..iced::widget::container::Style::default()
+            })
+    )
+    .on_press(Msg::OpenServerModal)
+    .style(button::text)
+    .padding(state.z(2));
+
     let guild_rail = column(
         guild_rail_items
             .into_iter()
             .collect::<Vec<_>>()
     )
+    .push(new_guild_btn)
     .spacing(state.z(6))
     .padding(state.z(8))
     .width(Length::Fixed(state.z(56.0)))
@@ -4582,13 +5946,13 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {
             }
             None => text("Guild not found").size(state.zs(13)).into(),
         }
-    } else if state.conversations.is_empty() {
+    } else if state.conversations.iter().all(|c| c.guild_id.is_some()) {
         container(text("No conversations yet").size(state.zs(13)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)))
             .center_x(Length::Fill)
             .center_y(Length::Fill)
             .into()
     } else {
-        let items: Vec<Element<'_, Msg>> = state.conversations.iter().map(|c| {
+        let items: Vec<Element<'_, Msg>> = state.conversations.iter().filter(|c| c.guild_id.is_none()).map(|c| {
             let other = c.members.iter()
                 .find(|m| Some(m.id) != state.user.as_ref().map(|u| u.id));
 
@@ -4698,8 +6062,16 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {
         ].spacing(state.z(8)).padding(state.z(12)).into(),
         LeftTab::Servers => {
             if state.selected_guild.is_some() {
+                let guild = state.guilds.iter().find(|g| Some(g.id) == state.selected_guild);
+                let guild_header = row![
+                    text(guild.map(|g| g.name.clone()).unwrap_or_default()).size(state.zs(16)),
+                    space::horizontal(),
+                    button(text("⚙").size(state.zs(14)))
+                        .on_press(Msg::OpenGuildSettings)
+                        .padding(state.z(2)),
+                ].spacing(state.z(8)).align_y(iced::Alignment::Center);
                 column![
-                    text(if let Some(g) = state.guilds.iter().find(|g| Some(g.id) == state.selected_guild) { g.name.clone() } else { String::new() }).size(state.zs(16)),
+                    guild_header,
                     scrollable(conv_list).height(Length::Fill),
                 ].spacing(state.z(8)).padding(state.z(12)).into()
             } else {
@@ -4708,7 +6080,7 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {
                     text("Pick a server from the left rail, or create one").size(state.zs(12)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
                     space::vertical().height(state.z(4)),
                     button(text("＋ Create / join a server").size(state.zs(13)))
-                        .on_press(Msg::OpenGuildModal)
+                        .on_press(Msg::OpenServerModal)
                         .width(Length::Fill)
                         .style(button::primary)
                         .padding([state.z(8.0), state.z(10.0)]),
@@ -4792,17 +6164,33 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
     let other_member = conv
         .and_then(|c| c.members.iter().find(|m| Some(m.id) != self_id));
 
-    let header_name = if is_group {
-        let label = match conv.map(|c| c.kind.as_str()) {
-            Some("large_group") => "Channel",
-            _ => "Group",
-        };
-        format!("{label} · {} members", members.len())
+    let guild_name = state.selected_guild.and_then(|id| state.guilds.iter().find(|g| g.id == id).map(|g| g.name.clone()));
+    let channel_name = if is_group {
+        conv.and_then(|c| c.guild_id.and_then(|_| {
+            state.selected_guild.and_then(|gid| state.guilds.iter().find(|g| g.id == gid))
+                .and_then(|g| g.channels.iter().find(|ch| ch.id == conv_id).map(|ch| ch.name.clone()))
+        }))
+    } else {
+        None
+    };
+
+    let header_name = if let Some(gname) = &guild_name {
+        gname.clone()
+    } else if is_group {
+        format!("Group · {} members", members.len())
     } else {
         other_member
             .map(|m| if m.display_name.is_empty() { m.username.as_str() } else { m.display_name.as_str() })
             .unwrap_or("Unknown")
             .to_string()
+    };
+
+    let header_sub = if let Some(cname) = &channel_name {
+        Some(cname.clone())
+    } else if is_group {
+        Some(format!("{} members", members.len()))
+    } else {
+        None
     };
 
     let header_initials = user_initials(&header_name);
@@ -4812,7 +6200,7 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
         .map(|m| state.presence.get(&m.id).copied().unwrap_or(false))
         .unwrap_or(false);
     let status = if is_group {
-        "Group conversation".to_string()
+        header_sub.clone().unwrap_or_else(|| "Group conversation".to_string())
     } else if online {
         "Online".to_string()
     } else {
@@ -4871,7 +6259,7 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
         ].spacing(state.z(10)).align_y(iced::Alignment::Center)
     };
 
-    let header = container(header_content)
+    let header = container(row![header_content, space::horizontal()])
         .padding([state.z(10.0), state.z(16.0)])
         .width(Length::Fill)
         .style(header_style);
@@ -5036,7 +6424,12 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
                 } else {
                     iced::widget::Image::new(iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 0]))
                 };
-                card_content = card_content.push(img_el);
+                card_content = card_content.push(
+                    button(img_el)
+                        .on_press(Msg::OpenFile(m.id))
+                        .style(button::text)
+                        .padding(state.z(0))
+                );
             }
 
             let held = is_self || state.downloaded.contains_key(file_id);
@@ -5055,23 +6448,27 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
                 card_content = card_content.push(status_el);
             }
 
-            let file_line = row![
+            let mut file_row = row![
                 text("📎").size(state.zs(14)),
                 text(name).size(state.zs(12)),
                 text(human_size(size)).size(state.zs(10)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
                 space::horizontal(),
-                if held {
-                    button(text("Open").size(state.zs(11)).color(iced::Color::from_rgb(0.6, 0.8, 1.0)))
-                        .on_press(Msg::OpenFile(m.id))
-                        .style(button::text)
-                        .padding(state.z(0))
-                } else {
-                    button(text("Open").size(state.zs(11)).color(iced::Color::from_rgb(0.4, 0.4, 0.4)))
-                        .style(button::text)
-                        .padding(state.z(0))
-                },
-            ].spacing(state.z(8)).align_y(iced::Alignment::Center);
-            card_content = card_content.push(file_line);
+            ];
+            if !is_image {
+                file_row = file_row.push(
+                    if held {
+                        button(text("Open").size(state.zs(11)).color(iced::Color::from_rgb(0.6, 0.8, 1.0)))
+                            .on_press(Msg::OpenFile(m.id))
+                            .style(button::text)
+                            .padding(state.z(0))
+                    } else {
+                        button(text("Open").size(state.zs(11)).color(iced::Color::from_rgb(0.4, 0.4, 0.4)))
+                            .style(button::text)
+                            .padding(state.z(0))
+                    }
+                );
+            }
+            card_content = card_content.push(file_row);
 
             let card = container(card_content)
                 .padding(state.z(8))
@@ -5198,6 +6595,9 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
                 .padding([state.z(8.0), state.z(10.0)])
                 .into()
         };
+        let sticker_btn = button(text("🖼️").size(state.zs(16)))
+            .on_press(Msg::ToggleStickerMenu)
+            .padding([state.z(8.0), state.z(10.0)]);
         let send_btn: Element<'_, Msg> = if state.busy {
             button(throbber(state.zs(16))).padding([state.z(8.0), state.z(12.0)]).into()
         } else {
@@ -5245,6 +6645,7 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
         });
         let input_row = row![
             attach_btn,
+            sticker_btn,
             text_input("Type a message…", &state.draft)
                 .on_input(Msg::DraftChanged)
                 .on_submit(Msg::SendMessage)
@@ -5272,12 +6673,127 @@ fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
         composer_container,
     ].spacing(state.z(0));
 
-    let content: Element<'_, Msg> = container(chat_content)
+    let chat_pane: Element<'_, Msg> = container(chat_content)
         .width(Length::Fill)
         .height(Length::Fill)
         .into();
 
-    content
+    if state.sticker_menu_open {
+        row![chat_pane, sticker_panel(state)]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    } else {
+        chat_pane
+    }
+}
+
+/// Right-hand sticker picker. Slides in when toggled: searchable by pack name
+/// and sticker name, plus a pack-creation UI for the user's own packs.
+fn sticker_panel(state: &AppState) -> Element<'_, Msg> {
+    let self_id = state.user.as_ref().map(|u| u.id);
+
+    let header = row![
+        text("Stickers").size(state.zs(16)),
+        space::horizontal(),
+        button(text("✕").size(state.zs(14))).on_press(Msg::ToggleStickerMenu).padding(state.z(4)),
+    ].spacing(state.z(6)).align_y(iced::Alignment::Center);
+
+    let search_input = text_input("Search packs or stickers…", &state.sticker_search)
+        .on_input(Msg::StickerSearchChanged)
+        .width(Length::Fill);
+
+    let new_pack_btn: Element<'_, Msg> = if state.sticker_pack_create_open {
+        column![
+            text_input("Pack name", &state.sticker_pack_name_input)
+                .on_input(Msg::StickerPackNameInput)
+                .on_submit(Msg::CreateStickerPackSubmit)
+                .width(Length::Fill),
+            button(text("Create pack").size(state.zs(12))).on_press(Msg::CreateStickerPackSubmit),
+        ].spacing(state.z(4)).into()
+    } else {
+        button(text("＋ New pack").size(state.zs(12)))
+            .on_press(Msg::ToggleStickerPackCreate)
+            .into()
+    };
+
+    let mut body: Vec<Element<'_, Msg>> = Vec::new();
+    if state.sticker_busy {
+        body.push(row![throbber(state.z(14)), text("Loading…").size(state.zs(11)).color(iced::Color::from_rgb(0.5, 0.5, 0.5))]
+            .spacing(state.z(6)).align_y(iced::Alignment::Center).into());
+    } else if state.sticker_packs.is_empty() {
+        body.push(text("No sticker packs found").size(state.zs(12)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)).into());
+    }
+
+    for pack in &state.sticker_packs {
+        let is_owner = self_id == Some(pack.owner_id);
+        let mut pack_header = row![
+            text(&pack.name).size(state.zs(13)),
+            text(format!("by {}", pack.owner_name)).size(state.zs(10)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+            space::horizontal(),
+        ].spacing(state.z(6)).align_y(iced::Alignment::Center);
+        if is_owner {
+            pack_header = pack_header.push(
+                button(text("＋").size(state.zs(13)))
+                    .on_press(Msg::PickStickerImages(pack.id))
+                    .padding(state.z(2))
+            );
+            pack_header = pack_header.push(
+                button(text("🗑").size(state.zs(13)))
+                    .on_press(Msg::DeleteStickerPack(pack.id))
+                    .padding(state.z(2))
+            );
+        }
+
+        let grid: Vec<Element<'_, Msg>> = pack.stickers.iter().map(|s| {
+            let img_el: Element<'_, Msg> = match state.sticker_handles.get(&s.id) {
+                Some(h) => iced::widget::Image::new(h.clone()).width(state.z(64)).height(state.z(64)).into(),
+                None => container(text("…").size(state.zs(12))).width(state.z(64)).height(state.z(64)).center_x(Length::Fixed(state.z(64))).center_y(Length::Fixed(state.z(64))).into(),
+            };
+            button(img_el)
+                .on_press(Msg::SendSticker(s.id))
+                .padding(state.z(2))
+                .into()
+        }).collect();
+
+        let pack_body = column![pack_header, row(grid).spacing(state.z(4))].spacing(state.z(4));
+        body.push(
+            container(pack_body)
+                .padding(state.z(8))
+                .width(Length::Fill)
+                .style(composer_style)
+                .into(),
+        );
+    }
+
+    container(
+        column![
+            header,
+            search_input,
+            new_pack_btn,
+            rule::horizontal(1),
+            scrollable(column(body).spacing(state.z(8))).width(Length::Fill).height(Length::Fill),
+        ]
+        .spacing(state.z(8))
+        .padding(state.z(12)),
+    )
+    .width(Length::Fixed(state.z(300.0)))
+    .height(Length::Fill)
+    .style(|_: &iced::Theme| {
+        let accent_faint_bg = accent_faint(state.accent);
+        let accent_border = accent_dark(state.accent);
+        iced::widget::container::Style {
+            background: Some(accent_faint_bg.into()),
+            border: iced::Border {
+                width: 1.0,
+                color: accent_border,
+                radius: 0.0.into(),
+                ..iced::Border::default()
+            },
+            ..iced::widget::container::Style::default()
+        }
+    })
+    .into()
 }
 
 #[cfg(test)]

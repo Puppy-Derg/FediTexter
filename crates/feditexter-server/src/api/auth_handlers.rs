@@ -1,4 +1,4 @@
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Deserialize;
@@ -40,6 +40,9 @@ pub struct RegisterRequest {
     pub email: String,
     pub username: String,
     pub password: String,
+    /// Date of birth (YYYY-MM-DD). Used to enforce the minimum age (18 in AU).
+    #[serde(default)]
+    pub birthdate: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -70,6 +73,16 @@ pub async fn register(
     }
     if !body.username.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err(ApiError::BadRequest("username may only contain letters, numbers, and underscores"));
+    }
+    // Age gate (AU legal requirement): require an 18+ birthdate.
+    const MIN_AGE_YEARS: u32 = 18;
+    let birthdate = body.birthdate.as_deref().unwrap_or("");
+    let dob = chrono::NaiveDate::parse_from_str(birthdate, "%Y-%m-%d")
+        .map_err(|_| ApiError::BadRequest("birthdate is required and must be YYYY-MM-DD"))?;
+    let today = chrono::Utc::now().date_naive();
+    let age_years = today.signed_duration_since(dob).num_days() / 365;
+    if age_years < MIN_AGE_YEARS as i64 {
+        return Err(ApiError::Forbidden("you must be at least 18 years old to use FediTexter"));
     }
 
     let password_hash = hash_password(&body.password)
@@ -110,6 +123,8 @@ pub async fn register(
         avatar_url: None,
         totp_enabled: false,
         is_bot: false,
+        bio: String::new(),
+        profile_visible: true,
     };
 
     let device_id = headers.get("x-device-id").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
@@ -168,7 +183,7 @@ pub async fn login(
         return Err(ApiError::Unauthorized("invalid credentials"));
     }
 
-    let user = User { id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot };
+    let user = User { id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot, bio: String::new(), profile_visible: true };
     let device_id = headers.get("x-device-id").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let login_ip = crate::auth::client_ip(&headers, None);
 
@@ -261,7 +276,7 @@ pub async fn login_2fa(
         .map_err(|_| ApiError::Internal("db error"))?;
 
     let user: User = sqlx::query_as(
-        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot FROM users WHERE id = ?",
+        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot, bio, profile_visible FROM users WHERE id = ?",
     )
     .bind(user_id)
     .fetch_one(&state.pool)
@@ -330,7 +345,7 @@ pub async fn two_fa_enable(
     }
 
     let user: User = sqlx::query_as(
-        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot FROM users WHERE id = ?",
+        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot, bio, profile_visible FROM users WHERE id = ?",
     )
     .bind(auth.user.id)
     .fetch_one(&state.pool)
@@ -380,9 +395,64 @@ pub async fn me(auth: AuthUser) -> Json<Value> {
     Json(json!({ "user": auth.user }))
 }
 
+/// List all of the caller's logged-in devices (sessions).
+pub async fn list_sessions(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> Result<Json<Value>, ApiError> {
+    let sessions: Vec<(u64, Option<String>, Option<String>, chrono::NaiveDateTime)> = sqlx::query_as(
+        "SELECT id, device_id, login_ip, created_at FROM sessions WHERE user_id = ? ORDER BY created_at DESC",
+    )
+    .bind(auth.user.id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
+    Ok(Json(json!({ "sessions": sessions.iter().map(|(id, device_id, login_ip, created_at)| json!({
+        "id": id,
+        "device_id": device_id,
+        "login_ip": login_ip,
+        "created_at": created_at,
+        "current": *id == auth.session_id,
+    })).collect::<Vec<_>>() })))
+}
+
+/// Revoke another session of the caller's. The current session cannot be
+/// revoked through this endpoint.
+pub async fn revoke_session(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(session_id): Path<u64>,
+) -> Result<Json<Value>, ApiError> {
+    if session_id == auth.session_id {
+        return Err(ApiError::BadRequest("cannot revoke the current session"));
+    }
+    let row: Option<(u64,)> = sqlx::query_as(
+        "SELECT id FROM sessions WHERE id = ? AND user_id = ?",
+    )
+    .bind(session_id)
+    .bind(auth.user.id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
+    let Some((sid,)) = row else {
+        return Err(ApiError::NotFound("session not found"));
+    };
+    sqlx::query("DELETE FROM sessions WHERE id = ?")
+        .bind(sid)
+        .execute(&state.pool)
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?;
+    Ok(Json(json!({ "status": "ok" })))
+}
+
 #[derive(Deserialize)]
 pub struct UpdateMeRequest {
-    pub display_name: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub bio: Option<String>,
+    #[serde(default)]
+    pub profile_visible: Option<bool>,
 }
 
 pub async fn update_me(
@@ -390,20 +460,40 @@ pub async fn update_me(
     auth: AuthUser,
     Json(body): Json<UpdateMeRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let display_name = body.display_name.trim().to_string();
-    if display_name.len() > 64 {
-        return Err(ApiError::BadRequest("display name too long (max 64)"));
+    if let Some(name) = &body.display_name {
+        let display_name = name.trim().to_string();
+        if display_name.len() > 64 {
+            return Err(ApiError::BadRequest("display name too long (max 64)"));
+        }
+        sqlx::query("UPDATE users SET display_name = ? WHERE id = ?")
+            .bind(&display_name)
+            .bind(auth.user.id)
+            .execute(&state.pool)
+            .await
+            .map_err(|_| ApiError::Internal("db error"))?;
+    }
+    if let Some(bio) = &body.bio {
+        if bio.len() > 500 {
+            return Err(ApiError::BadRequest("bio too long (max 500)"));
+        }
+        sqlx::query("UPDATE users SET bio = ? WHERE id = ?")
+            .bind(bio)
+            .bind(auth.user.id)
+            .execute(&state.pool)
+            .await
+            .map_err(|_| ApiError::Internal("db error"))?;
+    }
+    if let Some(visible) = body.profile_visible {
+        sqlx::query("UPDATE users SET profile_visible = ? WHERE id = ?")
+            .bind(visible)
+            .bind(auth.user.id)
+            .execute(&state.pool)
+            .await
+            .map_err(|_| ApiError::Internal("db error"))?;
     }
 
-    sqlx::query("UPDATE users SET display_name = ? WHERE id = ?")
-        .bind(&display_name)
-        .bind(auth.user.id)
-        .execute(&state.pool)
-        .await
-        .map_err(|_| ApiError::Internal("db error"))?;
-
     let user: User = sqlx::query_as(
-        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot FROM users WHERE id = ?",
+        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot, bio, profile_visible FROM users WHERE id = ?",
     )
     .bind(auth.user.id)
     .fetch_one(&state.pool)
@@ -444,7 +534,7 @@ pub async fn verify(
     }
 
     let user: User = sqlx::query_as(
-        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot FROM users WHERE id = ?",
+        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot, bio, profile_visible FROM users WHERE id = ?",
     )
     .bind(auth.user.id)
     .fetch_one(&state.pool)
@@ -488,7 +578,7 @@ pub async fn resend_verification(
     }
 
     let user: User = sqlx::query_as(
-        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot FROM users WHERE id = ?",
+        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot, bio, profile_visible FROM users WHERE id = ?",
     )
     .bind(auth.user.id)
     .fetch_one(&state.pool)
@@ -534,7 +624,7 @@ pub async fn set_avatar(
         .map_err(|_| ApiError::Internal("db error"))?;
 
     let user: User = sqlx::query_as(
-        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot FROM users WHERE id = ?",
+        "SELECT id, email, username, display_name, email_verified, avatar_url, totp_enabled, is_bot, bio, profile_visible FROM users WHERE id = ?",
     )
     .bind(auth.user.id)
     .fetch_one(&state.pool)

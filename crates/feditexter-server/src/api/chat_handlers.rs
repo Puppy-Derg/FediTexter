@@ -39,6 +39,11 @@ pub struct SendMessageRequest {
     pub thumbnail_data: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct MarkReadRequest {
+    pub message_id: u64,
+}
+
 async fn is_member(state: &AppState, conversation_id: u64, user_id: u64) -> Result<bool, ApiError> {
     let row: Option<(u64,)> = sqlx::query_as(
         "SELECT user_id FROM conversation_members WHERE conversation_id = ? AND user_id = ?",
@@ -288,7 +293,50 @@ pub async fn list_messages(
     .await
     .map_err(|_| ApiError::Internal("db error"))?;
 
-    Ok(Json(json!({ "messages": messages })))
+    let read_up_to: i64 = sqlx::query_scalar(
+        "SELECT last_read_message_id FROM conversation_reads WHERE conversation_id = ? AND user_id = ?",
+    )
+    .bind(conversation_id)
+    .bind(auth.user.id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?
+    .unwrap_or(0);
+
+    let msgs: Vec<Value> = messages
+        .iter()
+        .map(|m| {
+            let mut v = serde_json::to_value(m).unwrap_or_default();
+            v["read"] = json!(m.id <= read_up_to as u64);
+            v
+        })
+        .collect();
+
+    Ok(Json(json!({ "messages": msgs, "read_up_to": read_up_to })))
+}
+
+/// Record that the viewer has read up to `message_id` in a conversation.
+pub async fn mark_read(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(conversation_id): Path<u64>,
+    Json(body): Json<MarkReadRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if !is_member(&state, conversation_id, auth.user.id).await? {
+        return Err(ApiError::NotFound("conversation not found"));
+    }
+    sqlx::query(
+        "INSERT INTO conversation_reads (conversation_id, user_id, last_read_message_id)
+         VALUES (?, ?, ?)
+         ON DUPLICATE KEY UPDATE last_read_message_id = GREATEST(last_read_message_id, VALUES(last_read_message_id))",
+    )
+    .bind(conversation_id)
+    .bind(auth.user.id)
+    .bind(body.message_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| ApiError::Internal("db error"))?;
+    Ok(Json(json!({ "status": "ok" })))
 }
 
 pub async fn send_message(

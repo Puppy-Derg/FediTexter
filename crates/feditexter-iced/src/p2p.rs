@@ -476,7 +476,7 @@ impl P2pManager {
                                     }
                                 }
                                 Some("done") => {
-                                    if let Some((fid, _expected, name, mime, mut file, received, tmp)) = download.take() {
+                                    if let Some((fid, _expected, name, mime, file, received, tmp)) = download.take() {
                                         // Flush and finalize: rename the .part file to its
                                         // final cache path (keyed by file_id).
                                         let _ = file.sync_all();

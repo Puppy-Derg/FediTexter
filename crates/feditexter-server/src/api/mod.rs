@@ -5,4 +5,5 @@ pub mod federation_handlers;
 pub mod guilds;
 pub mod moderation;
 pub mod preview;
+pub mod stickers;
 pub mod ws;

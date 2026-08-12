@@ -1961,7 +1961,7 @@ dependencies = [
 
 [[package]]
 name = "feditexter-iced"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1999,7 +1999,7 @@ dependencies = [
 
 [[package]]
 name = "feditexter-server"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "argon2",
  "axum",
