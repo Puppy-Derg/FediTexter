@@ -1,13 +1,36 @@
-use feditexter_server::{bot, build_app, db::AppState, federation::Federation};
+use feditexter_server::{bot, build_app, db::AppState, federation::Federation, tui};
+use std::collections::VecDeque;
 use std::env;
-use std::sync::Arc;
+use std::io::IsTerminal;
+use std::sync::{Arc, Mutex};
 use sqlx::MySqlPool;
 use tracing::info;
+use tracing_subscriber::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
-    tracing_subscriber::fmt::init();
+
+    // `--tui` launches the btop++-style dashboard. When active, server logs are
+    // routed into the dashboard's log ring instead of stdout so they don't
+    // corrupt the alternate screen.
+    let enable_tui = env::args().any(|a| a == "--tui") && std::io::stdout().is_terminal();
+    let log_ring: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+
+    if enable_tui {
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        let ring = log_ring.clone();
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(move || tui::RingLog::new(ring.clone(), 2000))
+                    .with_filter(filter),
+            )
+            .init();
+    } else {
+        tracing_subscriber::fmt::init();
+    }
 
     let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set in .env");
     let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -56,10 +79,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = format!("{bind_addr}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("listening on http://{addr}");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await?;
+
+    let server = async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    };
+
+    if enable_tui {
+        let (quit_tx, quit_rx) = tokio::sync::oneshot::channel();
+        let state_for_tui = shared.as_ref().clone();
+        let ring = log_ring.clone();
+        let rt = tokio::runtime::Handle::current();
+        std::thread::spawn(move || {
+            if let Err(e) = tui::run_tui(state_for_tui, ring, rt, quit_tx) {
+                eprintln!("[tui] dashboard error: {e}");
+            }
+        });
+        tokio::pin!(server);
+        tokio::select! {
+            result = &mut server => {
+                result?;
+            }
+            _ = quit_rx => {
+                info!("dashboard quit — shutting down");
+            }
+        }
+    } else {
+        server.await?;
+    }
     Ok(())
 }

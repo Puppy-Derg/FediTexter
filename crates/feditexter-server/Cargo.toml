@@ -27,6 +27,9 @@ totp-rs = "5"
 qrcode = { version = "0.14", features = ["image"] }
 futures-util = "0.3"
 url = "2"
+ratatui = "0.30.2"
+crossterm = "0.29.0"
+sysinfo = "0.39.6"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
