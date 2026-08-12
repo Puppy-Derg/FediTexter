@@ -201,27 +201,27 @@ impl Tui {
                 } else {
                     body
                 };
-                self.push_line(LogKind::Message, format!("✉ conv#{} user#{}: {}", message.conversation_id, message.sender_id, text));
+                self.push_line(LogKind::Message, format!("MSG conv#{} user#{}: {}", message.conversation_id, message.sender_id, text));
             }
             HubEvent::MessageEdited { message } => {
-                self.push_line(LogKind::Message, format!("✎ edited user#{}: {}", message.sender_id, message.body));
+                self.push_line(LogKind::Message, format!("EDIT user#{}: {}", message.sender_id, message.body));
             }
             HubEvent::MessageDeleted { conversation_id, message_id } => {
-                self.push_line(LogKind::Message, format!("✕ deleted conv#{conversation_id} msg#{message_id}"));
+                self.push_line(LogKind::Message, format!("DEL conv#{conversation_id} msg#{message_id}"));
             }
             HubEvent::Typing { from_username, .. } => {
-                self.push_line(LogKind::Typing, format!("✎ {from_username} is typing"));
+                self.push_line(LogKind::Typing, format!("TYPING {from_username}"));
             }
             HubEvent::Presence { user_id, online } => {
                 let state = if online { "online" } else { "offline" };
-                self.push_line(LogKind::Presence, format!("◉ user#{user_id} {state}"));
+                self.push_line(LogKind::Presence, format!("USER #{user_id} {state}"));
             }
             HubEvent::Signal { .. } => {
                 // Signaling is chattier than is useful on the dashboard.
             }
             HubEvent::VoicePresence { channel_id, username, joined, .. } => {
                 let action = if joined { "joined" } else { "left" };
-                self.push_line(LogKind::Voice, format!("🔊 {username} {action} voice #{channel_id}"));
+                self.push_line(LogKind::Voice, format!("♪ {username} {action} voice #{channel_id}"));
             }
             HubEvent::VoiceState { .. } => {}
         }
@@ -461,7 +461,7 @@ impl Tui {
             let mut users: Vec<String> = occupants.values().cloned().collect();
             users.sort();
             let line = Line::from(vec![
-                Span::styled("🔊 ", Style::new().fg(Color::Magenta)),
+                Span::styled("♪ ", Style::new().fg(Color::Magenta)),
                 Span::styled(name, Style::new().fg(Color::White)),
                 Span::raw("  "),
                 Span::styled(users.join(", "), Style::new().fg(Color::Magenta)),

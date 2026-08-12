@@ -149,6 +149,13 @@ struct StickerPack {
     stickers: Vec<Sticker>,
 }
 
+/// Voice occupancy for one channel, from the periodic polling endpoint.
+#[derive(serde::Deserialize, Clone, Debug)]
+struct VoiceChannelOccupancy {
+    channel_id: u64,
+    users: Vec<(u64, String)>,
+}
+
 /// A logged-in device/session shown in Settings -> Devices.
 #[derive(serde::Deserialize, Clone, Debug)]
 struct SessionInfo {
@@ -448,6 +455,8 @@ enum Msg {
     VoiceToggleMute,
     VoiceToggleCamera,
     VoiceToggleScreen,
+    RefreshVoiceOccupancy,
+    VoiceOccupancy(Result<Vec<VoiceChannelOccupancy>, String>),
     PickFile,
     FilePicked(Result<Attachment, String>),
     ClearAttachment,
@@ -1235,6 +1244,7 @@ fn subscription(state: &AppState) -> iced::Subscription<Msg> {
     }));
     if state.token.is_some() && state.screen == Screen::Chat {
         subs.push(iced::time::every(Duration::from_secs(1)).map(|_| Msg::TypingExpired));
+        subs.push(iced::time::every(Duration::from_secs(60)).map(|_| Msg::RefreshVoiceOccupancy));
         subs.push(iced::event::listen_with(|event, _status, _window| {
             match event {
                 iced::Event::Mouse(mouse_event) => Some(Msg::MouseClicked(mouse_event)),
@@ -1466,6 +1476,8 @@ fn msg_short(msg: &Msg) -> String {
         Msg::VoiceToggleMute => "VoiceToggleMute".into(),
         Msg::VoiceToggleCamera => "VoiceToggleCamera".into(),
         Msg::VoiceToggleScreen => "VoiceToggleScreen".into(),
+        Msg::RefreshVoiceOccupancy => "RefreshVoiceOccupancy".into(),
+        Msg::VoiceOccupancy(_) => "VoiceOccupancy".into(),
         Msg::PickFile => "PickFile".into(),
         Msg::FilePicked(_) => "FilePicked".into(),
         Msg::ClearAttachment => "ClearAttachment".into(),
@@ -2739,7 +2751,8 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             else {
                 return Task::none();
             };
-            voice.join(guild_id, channel_id, user.id);
+            let username = user.username.clone();
+            voice.join(guild_id, channel_id, user.id, username);
             Task::none()
         }
         Msg::VoiceLeave => {
@@ -2766,6 +2779,26 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             }
             Task::none()
         }
+        Msg::RefreshVoiceOccupancy => {
+            if state.token.is_some() && state.voice.is_some() {
+                let server = state.server.clone();
+                let token = state.token.clone().unwrap_or_default();
+                Task::perform(load_voice_occupancy(server, token), Msg::VoiceOccupancy)
+            } else {
+                Task::none()
+            }
+        }
+        Msg::VoiceOccupancy(Ok(channels)) => {
+            if let Some(voice) = &state.voice {
+                let data: Vec<(u64, Vec<(u64, String)>)> = channels
+                    .into_iter()
+                    .map(|c| (c.channel_id, c.users))
+                    .collect();
+                voice.set_occupancy(data);
+            }
+            Task::none()
+        }
+        Msg::VoiceOccupancy(Err(e)) => { state.error = e; Task::none() }
         Msg::P2pEvent(ev) => {
             match ev {
                 P2pEvent::Status { file_id, status } => {
@@ -3364,6 +3397,24 @@ async fn mark_read_api(server: String, token: String, conv_id: u64, message_id: 
         Ok(r) => {
             auth_aware_error(&r)?;
             if r.status().is_success() { Ok(()) } else { Err(format!("read failed: {}", r.status())) }
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+/// Voice occupancy for every channel we can see (polled every minute; the
+/// server only pushes presence in real time to members currently in the
+/// channel).
+async fn load_voice_occupancy(server: String, token: String) -> Result<Vec<VoiceChannelOccupancy>, String> {
+    let client = make_client();
+    let resp = client.get(format!("{server}/api/voice/occupancy"))
+        .bearer_auth(&token).send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            let v: serde_json::Value = r.json().await.unwrap_or_default();
+            serde_json::from_value(v.get("channels").cloned().unwrap_or_default())
+                .map_err(|e| format!("parse error: {e}"))
         }
         Err(e) => Err(format!("{e}")),
     }
@@ -5532,7 +5583,7 @@ fn view_guild_settings(state: &AppState) -> Element<'_, Msg> {
                         .on_input(move |v| Msg::ChannelRenameInput { channel_id: ch.id, value: v })
                         .width(Length::Fixed(state.z(180.0)));
                     let row_el: Element<'_, Msg> = row![
-                        text(if ch.is_voice() { "🔊" } else { "#" }).size(state.zs(13)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
+                        text(if ch.is_voice() { "♪" } else { "#" }).size(state.zs(13)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
                         text(ch.name.clone()).size(state.zs(13)),
                         space::horizontal(),
                         rename_input,
@@ -5553,7 +5604,7 @@ fn view_guild_settings(state: &AppState) -> Element<'_, Msg> {
                         .on_press(Msg::ChannelTypeChanged(false))
                         .style(if state.channel_is_voice { button::secondary } else { button::primary })
                         .padding(state.z(2)),
-                    button(text("🔊").size(state.zs(12)))
+                    button(text("♪").size(state.zs(12)))
                         .on_press(Msg::ChannelTypeChanged(true))
                         .style(if state.channel_is_voice { button::primary } else { button::secondary })
                         .padding(state.z(2)),
@@ -5996,7 +6047,7 @@ fn guild_channel_item<'a>(state: &'a AppState, ch: &'a GuildChannel) -> Element<
     let is_selected = state.selected_conversation == Some(ch.id);
     let is_in_voice = state.voice.as_ref().map(|v| v.in_channel()) == Some(Some(ch.id));
     let unread = state.unread.get(&ch.id).copied().unwrap_or(0);
-    let prefix = if ch.is_voice() { "🔊" } else { "#" };
+    let prefix = if ch.is_voice() { "♪" } else { "#" };
     let label: Element<'_, Msg> = if unread > 0 && !ch.is_voice() {
         row![
             container(text(prefix).size(state.zs(14)).color(iced::Color::from_rgb(0.6, 0.6, 0.6))),
@@ -6121,6 +6172,22 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
                     );
                     for ch in voice_channels {
                         col = col.push(guild_channel_item(state, ch));
+                        // Who's in the channel, indented underneath it. Empty
+                        // channels show nothing. Data comes from real-time
+                        // presence events plus a once-a-minute poll.
+                        let occ = state.voice.as_ref().map(|v| v.occupants(ch.id)).unwrap_or_default();
+                        let self_id = state.user.as_ref().map(|u| u.id);
+                        for (uid, name) in occ {
+                            let display = if Some(uid) == self_id {
+                                format!("{name} (you)")
+                            } else {
+                                name.clone()
+                            };
+                            col = col.push(
+                                container(text(format!("♪  {display}")).size(state.zs(12)).color(iced::Color::from_rgb(0.75, 0.75, 0.75)))
+                                    .padding([state.z(2.0), state.z(12.0)]),
+                            );
+                        }
                     }
                 }
 
@@ -6867,6 +6934,20 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
 
     let chat_content = column![
         header,
+        if state.error.is_empty() {
+            let spacer: Element<'_, Msg> = space::vertical().height(0.0).into();
+            spacer
+        } else {
+            container(text(state.error.as_str()).size(state.zs(12)).color(iced::Color::from_rgb(0.9, 0.35, 0.3)))
+                .padding(state.z(6))
+                .width(Length::Fill)
+                .style(|_: &iced::Theme| iced::widget::container::Style {
+                    background: Some(iced::Color::from_rgba(0.4, 0.1, 0.1, 0.6).into()),
+                    border: iced::Border { radius: 8.0.into(), ..iced::Border::default() },
+                    ..iced::widget::container::Style::default()
+                })
+                .into()
+        },
         scroll_with_btn,
         composer_container,
     ].spacing(state.z(0));
@@ -6905,48 +6986,32 @@ fn view_voice_panel(state: &AppState) -> Option<Element<'_, Msg>> {
         .map(|ch| ch.name.clone())
         .unwrap_or_else(|| "Voice".to_string());
     let members = voice.members();
-    let self_id = state.user.as_ref().map(|u| u.id);
     let muted = voice.is_muted();
     let camera_on = voice.camera_on();
     let screen_on = voice.screen_on();
 
-    let member_chips: Vec<Element<'_, Msg>> = members
-        .iter()
-        .map(|(uid, name)| {
-            let is_self = Some(*uid) == self_id;
-            let label = if is_self { format!("{name} (you)") } else { name.clone() };
-            row![
-                text("🎤").size(state.zs(12)),
-                text(label).size(state.zs(12)),
-            ]
-            .spacing(state.z(4))
-            .align_y(iced::Alignment::Center)
-            .into()
-        })
-        .collect();
-
     let mute_btn = button(
-        container(text(if muted { "🔇" } else { "🎤" }).size(state.zs(16)))
+        container(text(if muted { "Unmute" } else { "Mute" }).size(state.zs(12)))
             .padding(state.z(6)),
     )
     .on_press(Msg::VoiceToggleMute)
     .style(if muted { button::danger } else { button::secondary })
     .padding(state.z(0));
     let cam_btn = button(
-        container(text(if camera_on { "📷" } else { "🚫" }).size(state.zs(16)))
+        container(text(if camera_on { "Cam On" } else { "Cam Off" }).size(state.zs(12)))
             .padding(state.z(6)),
     )
     .on_press(Msg::VoiceToggleCamera)
     .style(if camera_on { button::primary } else { button::secondary })
     .padding(state.z(0));
     let screen_btn = button(
-        container(text(if screen_on { "🖥️" } else { "🚫" }).size(state.zs(16)))
+        container(text(if screen_on { "Share On" } else { "Share Off" }).size(state.zs(12)))
             .padding(state.z(6)),
     )
     .on_press(Msg::VoiceToggleScreen)
     .style(if screen_on { button::primary } else { button::secondary })
     .padding(state.z(0));
-    let leave_btn = button(text("📵 Leave").size(state.zs(13)))
+    let leave_btn = button(text("Leave").size(state.zs(13)))
         .on_press(Msg::VoiceLeave)
         .style(button::danger)
         .padding([state.z(6.0), state.z(12.0)]);
@@ -6961,14 +7026,14 @@ fn view_voice_panel(state: &AppState) -> Option<Element<'_, Msg>> {
                 .map(|(_, n)| n.clone())
                 .unwrap_or_else(|| format!("User {uid}"));
             let tag = match kind {
-                VoiceVideoKind::Camera => "📷",
-                VoiceVideoKind::Screen => "🖥️",
+                VoiceVideoKind::Camera => "CAM",
+                VoiceVideoKind::Screen => "SCR",
             };
             column![
                 iced::widget::Image::new(handle.clone())
                     .width(Length::Fixed(state.z(160.0)))
                     .height(Length::Fixed(state.z(90.0))),
-                row![text(tag).size(state.zs(11)), text(name).size(state.zs(11))]
+                row![text(tag).size(state.zs(11)).color(iced::Color::from_rgb(0.6, 0.8, 1.0)), text(name).size(state.zs(11))]
                     .spacing(state.z(4))
                     .align_y(iced::Alignment::Center),
             ]
@@ -6983,15 +7048,12 @@ fn view_voice_panel(state: &AppState) -> Option<Element<'_, Msg>> {
 
     let mut body = column![
         row![
-            text("🔊 Voice: ").size(state.zs(13)),
+            text("Voice: ").size(state.zs(13)),
             text(format!("#{channel_name}")).size(state.zs(13)).color(state.accent),
             space::horizontal(),
             controls,
         ].spacing(state.z(6)).align_y(iced::Alignment::Center),
     ].spacing(state.z(6));
-    if !member_chips.is_empty() {
-        body = body.push(row(member_chips).spacing(state.z(12)));
-    }
     if !tiles.is_empty() {
         body = body.push(row(tiles).spacing(state.z(10)));
     }

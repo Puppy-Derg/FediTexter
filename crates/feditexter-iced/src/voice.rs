@@ -89,7 +89,11 @@ struct VoiceInner {
     channel_id: Option<u64>,
     guild_id: Option<u64>,
     self_user_id: u64,
+    self_name: String,
     members: HashMap<u64, String>,
+    /// channel_id -> occupants (id, username) for every voice channel we can
+    /// see, kept fresh by real-time presence events and periodic polling.
+    occupancy: HashMap<u64, Vec<(u64, String)>>,
     peers: HashMap<u64, Arc<dyn PeerConnection>>,
     pending_ice: HashMap<u64, Vec<webrtc::peer_connection::RTCIceCandidateInit>>,
     /// peer -> (ssrc, mic track)
@@ -111,7 +115,9 @@ impl Default for VoiceInner {
             channel_id: None,
             guild_id: None,
             self_user_id: 0,
+            self_name: String::new(),
             members: HashMap::new(),
+            occupancy: HashMap::new(),
             peers: HashMap::new(),
             pending_ice: HashMap::new(),
             audio_tracks: HashMap::new(),
@@ -182,7 +188,7 @@ impl VoiceManager {
 
     /// Join a voice channel. Presence is announced over the WS; the server
     /// replies with the occupant list via `handle_voice_state`.
-    pub fn join(self: &Arc<Self>, guild_id: u64, channel_id: u64, self_user_id: u64) {
+    pub fn join(self: &Arc<Self>, guild_id: u64, channel_id: u64, self_user_id: u64, self_username: String) {
         if self.in_channel().is_some() {
             self.leave();
         }
@@ -191,6 +197,7 @@ impl VoiceManager {
             inner.channel_id = Some(channel_id);
             inner.guild_id = Some(guild_id);
             inner.self_user_id = self_user_id;
+            inner.self_name = self_username;
         }
         let _ = self.ws_tx.send(
             json!({ "type": "voice_join", "guild_id": guild_id, "channel_id": channel_id }).to_string(),
@@ -285,10 +292,27 @@ impl VoiceManager {
 
     /// Server pushed the occupant list right after we joined.
     pub fn handle_voice_state(self: &Arc<Self>, channel_id: u64, users: Vec<(u64, String)>) {
-        let (guild_id, is_current) = {
+        let (guild_id, is_current, self_id, self_name) = {
             let inner = self.inner.lock().unwrap();
-            (inner.guild_id, inner.channel_id == Some(channel_id))
+            (
+                inner.guild_id,
+                inner.channel_id == Some(channel_id),
+                inner.self_user_id,
+                inner.self_name.clone(),
+            )
         };
+        // Record the channel's occupants so the sidebar can list them even
+        // before any join/leave events arrive. The server's list excludes the
+        // joiner, so add ourselves back in.
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let mut occ = users.clone();
+            if !self_name.is_empty() {
+                occ.push((self_id, self_name));
+            }
+            occ.sort_by_key(|(id, _)| *id);
+            inner.occupancy.insert(channel_id, occ);
+        }
         if !is_current {
             return;
         }
@@ -310,7 +334,9 @@ impl VoiceManager {
         }
     }
 
-    /// Another member joined or left the channel we're in.
+    /// A user joined or left a voice channel. Occupancy is tracked for every
+    /// channel we can see (for the sidebar); peer/mesh logic only runs when the
+    /// channel is the one we're currently in.
     pub fn handle_voice_presence(
         self: &Arc<Self>,
         channel_id: u64,
@@ -318,6 +344,20 @@ impl VoiceManager {
         username: String,
         joined: bool,
     ) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let occ = inner.occupancy.entry(channel_id).or_default();
+            if joined {
+                if !occ.iter().any(|(id, _)| *id == user_id) {
+                    occ.push((user_id, username.clone()));
+                }
+            } else {
+                occ.retain(|(id, _)| *id != user_id);
+                if occ.is_empty() {
+                    inner.occupancy.remove(&channel_id);
+                }
+            }
+        }
         let current = self.inner.lock().unwrap().channel_id == Some(channel_id);
         if !current {
             return;
@@ -339,6 +379,28 @@ impl VoiceManager {
             }
             self.hangup_peer(user_id);
             let _ = self.ui_tx.send(VoiceEvent::MemberLeft { user_id });
+        }
+    }
+
+    /// Occupants of a voice channel (empty if none / unknown).
+    pub fn occupants(&self, channel_id: u64) -> Vec<(u64, String)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .occupancy
+            .get(&channel_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Replace the occupancy snapshot (from the periodic polling endpoint).
+    pub fn set_occupancy(&self, channels: Vec<(u64, Vec<(u64, String)>)>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.occupancy.clear();
+        for (channel_id, users) in channels {
+            let mut users = users;
+            users.sort_by_key(|(id, _)| *id);
+            inner.occupancy.insert(channel_id, users);
         }
     }
 

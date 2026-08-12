@@ -6,4 +6,5 @@ pub mod guilds;
 pub mod moderation;
 pub mod preview;
 pub mod stickers;
+pub mod voice;
 pub mod ws;

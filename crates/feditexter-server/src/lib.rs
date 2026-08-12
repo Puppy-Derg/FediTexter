@@ -30,6 +30,7 @@ use api::stickers::{
     sticker_image,
 };
 use api::ws::ws_handler;
+use api::voice::voice_occupancy;
 use db::AppState;
 
 pub fn build_app(state: AppState) -> Router {
@@ -89,6 +90,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/federation/users/lookup", get(user_lookup))
         .route("/api/federation/inbox", post(inbox))
         .route("/api/ws", get(ws_handler))
+        .route("/api/voice/occupancy", get(voice_occupancy))
         .with_state(state)
 }
 
