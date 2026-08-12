@@ -297,7 +297,10 @@ pub async fn list_messages(
         ApiError::Internal("db error")
     })?;
 
-    let read_up_to: i64 = sqlx::query_scalar(
+    // `last_read_message_id` is BIGINT UNSIGNED, so it must decode as u64 —
+    // decoding it as i64 fails the whole request once a row exists (after the
+    // first mark_read), making message history 500.
+    let read_up_to: u64 = sqlx::query_scalar(
         "SELECT last_read_message_id FROM conversation_reads WHERE conversation_id = ? AND user_id = ?",
     )
     .bind(conversation_id)
@@ -314,7 +317,7 @@ pub async fn list_messages(
         .iter()
         .map(|m| {
             let mut v = serde_json::to_value(m).unwrap_or_default();
-            v["read"] = json!(m.id <= read_up_to as u64);
+            v["read"] = json!(m.id <= read_up_to);
             v
         })
         .collect();
