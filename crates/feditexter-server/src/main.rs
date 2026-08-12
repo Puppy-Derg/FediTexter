@@ -9,12 +9,40 @@ use tracing_subscriber::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dotenvy::dotenv().ok();
+    let args: Vec<String> = env::args().collect();
+    let mut env_file: Option<String> = None;
+    let mut enable_tui = false;
+    let mut subcommand: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--env" => {
+                if i + 1 < args.len() {
+                    env_file = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            "--tui" => enable_tui = true,
+            other if !other.starts_with('-') && subcommand.is_none() => {
+                subcommand = Some(other.to_string());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    load_env(env_file.as_deref());
+
+    // `migrate` only touches the database (applies pending migrations and
+    // verifies the schema), then exits — used by the update script to make sure
+    // the DB is set up for the next version before the server restarts.
+    if subcommand.as_deref() == Some("migrate") {
+        return run_migrate().await;
+    }
 
     // `--tui` launches the btop++-style dashboard. When active, server logs are
     // routed into the dashboard's log ring instead of stdout so they don't
     // corrupt the alternate screen.
-    let enable_tui = env::args().any(|a| a == "--tui") && std::io::stdout().is_terminal();
+    let enable_tui = enable_tui && std::io::stdout().is_terminal();
     let log_ring: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
 
     if enable_tui {
@@ -109,6 +137,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         server.await?;
+    }
+    Ok(())
+}
+
+/// Load the environment from `--env <path>` if given, otherwise the first
+/// existing file among: `.env` in the working directory, the per-user config
+/// file (`~/.config/feditexter/server.env`), and `.env` next to the executable.
+/// This lets `feditexter-server --tui` (and the plain server) be launched from
+/// anywhere on the system.
+fn load_env(env_file: Option<&str>) {
+    if let Some(path) = env_file {
+        if let Err(e) = dotenvy::from_path(path) {
+            eprintln!("[env] could not load {path}: {e}");
+        }
+        return;
+    }
+    let mut candidates = vec![".env".to_string()]; // cwd .env
+    if let Some(home) = env::var("HOME").ok() {
+        candidates.push(
+            std::path::Path::new(&home).join(".config").join("feditexter").join("server.env").to_string_lossy().into_owned(),
+        );
+    }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(".env").to_string_lossy().into_owned());
+        }
+    }
+    for candidate in candidates {
+        if std::path::Path::new(&candidate).is_file() {
+            let _ = dotenvy::from_path(&candidate);
+            break;
+        }
+    }
+}
+
+/// Apply pending DB migrations and report the resulting schema state. Exits
+/// with a non-zero code if the database is unreachable or a migration fails.
+async fn run_migrate() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::level_filters::LevelFilter::INFO)
+        .init();
+    let url = env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set (in .env, ~/.config/feditexter/server.env, or via --env)");
+    let pool = MySqlPool::connect(&url).await?;
+    println!("[migrate] connected to database");
+
+    let migrator = sqlx::migrate!("../../migrations");
+    println!(
+        "[migrate] {} migrations registered; applying any pending…",
+        migrator.migrations.len()
+    );
+    migrator.run(&pool).await?;
+    println!("[migrate] migrations applied OK");
+
+    let applied: Vec<(String,)> = sqlx::query_as(
+        "SELECT description FROM _sqlx_migrations ORDER BY version",
+    )
+    .fetch_all(&pool)
+    .await?;
+    println!("[migrate] applied migrations:");
+    for (desc,) in applied {
+        println!("[migrate]   - {desc}");
     }
     Ok(())
 }
