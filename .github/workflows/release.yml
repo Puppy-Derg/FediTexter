@@ -60,6 +60,11 @@ jobs:
             name: feditexter-iced-linux-arm64
             binary: feditexter-iced
     runs-on: ${{ matrix.os }}
+    env:
+      # audiopus_sys (used by the opus crate) builds the bundled libopus with
+      # cmake; its CMakeLists declares cmake_minimum_required(VERSION 3.1),
+      # which CMake >= 3.27 refuses. Tell CMake to tolerate the old minimum.
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
 
