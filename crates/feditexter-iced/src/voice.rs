@@ -868,6 +868,14 @@ fn spawn_remote_video(
                         continue;
                     };
                     acc.extend_from_slice(&nal);
+                    // A peer that never sets the RTP marker bit (or sends a
+                    // malformed stream) would otherwise grow this buffer without
+                    // bound. Drop the partial frame once it exceeds a sane cap
+                    // (an H.264 access unit for a 4K frame is a few MB).
+                    if acc.len() > 8 * 1024 * 1024 {
+                        acc.clear();
+                        continue;
+                    }
                     if pkt.header.marker {
                         if let Ok(Some(frame)) = decoder.decode(&acc) {
                             let (w, h) = frame.dimensions();

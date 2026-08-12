@@ -275,6 +275,37 @@ async fn voice_join(state: &AppState, auth: &AuthUser, guild_id: u64, channel_id
         return false;
     }
 
+    // A user may only occupy one voice channel. If they were already in
+    // another (e.g. a `voice_join` for a new channel without a preceding
+    // leave, or another device), evict them from it first.
+    let left_channel = {
+        let mut voice = state.voice.lock().unwrap();
+        let keys: Vec<(u64, u64)> = voice
+            .iter()
+            .filter(|((_, ch), occupants)| *ch != channel_id && occupants.contains_key(&auth.user.id))
+            .map(|((g, c), _)| (*g, *c))
+            .collect();
+        let mut left_channel = None;
+        for (g, c) in keys {
+            if let Some(occupants) = voice.get_mut(&(g, c)) {
+                occupants.remove(&auth.user.id);
+                if occupants.is_empty() {
+                    voice.remove(&(g, c));
+                }
+            }
+            left_channel = Some(c);
+        }
+        left_channel
+    };
+    if let Some(c) = left_channel {
+        state.hub.publish_voice_presence(
+            c,
+            auth.user.id,
+            auth.user.username.clone(),
+            false,
+        );
+    }
+
     let mut voice = state.voice.lock().unwrap();
     let occupants = voice.entry((guild_id, channel_id)).or_default();
     let was_present = occupants.contains_key(&auth.user.id);
@@ -326,6 +357,26 @@ async fn voice_leave(state: &AppState, auth: &AuthUser, guild_id: u64, channel_i
     }
 }
 
+/// Both the sender and the target must currently be occupants of the voice
+/// channel named in the signal's `file_id` (`voice-<channel_id>`).
+fn voice_signal_allowed(state: &AppState, from_user_id: u64, sig: &ClientSignal) -> bool {
+    let Some(channel_id) = sig
+        .file_id
+        .strip_prefix("voice-")
+        .and_then(|rest| rest.parse::<u64>().ok())
+    else {
+        return false;
+    };
+    let voice = state.voice.lock().unwrap();
+    voice
+        .iter()
+        .find(|((_, channel), _)| *channel == channel_id)
+        .map(|(_, occupants)| {
+            occupants.contains_key(&from_user_id) && occupants.contains_key(&sig.to_user_id)
+        })
+        .unwrap_or(false)
+}
+
 async fn route_signal(state: &AppState, auth: &AuthUser, sig: &ClientSignal) {
     let Some(kind) = SignalKind::from_str(&sig.kind) else {
         return;
@@ -334,6 +385,13 @@ async fn route_signal(state: &AppState, auth: &AuthUser, sig: &ClientSignal) {
         kind,
         SignalKind::VoiceOffer | SignalKind::VoiceAnswer | SignalKind::VoiceIce | SignalKind::VoiceHangup
     );
+    // Voice signaling may only flow between two users who are currently in the
+    // same voice channel. Without this check a malicious client could send a
+    // `voice_offer` to an arbitrary user and (if that user is in some voice
+    // channel) trick their client into answering and streaming audio back.
+    if is_voice && !voice_signal_allowed(state, auth.user.id, sig) {
+        return;
+    }
     // Look up the target. If the target is a remote mirror, forward the
     // signaling to their server via the federation inbox. `remote_id` is NULL
     // for local users, so it must decode as an Option. Voice signaling is
