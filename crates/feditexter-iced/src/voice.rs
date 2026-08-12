@@ -348,6 +348,10 @@ impl VoiceManager {
         if peer_id == 0 || !sig.file_id.starts_with("voice-") {
             return;
         }
+        let self_id = self.inner.lock().unwrap().self_user_id;
+        if self_id != 0 && self_id == peer_id {
+            return;
+        }
         match sig.kind.as_str() {
             "voice_offer" => self.on_offer(sig, peer_id),
             "voice_answer" => self.on_answer(sig, peer_id),
