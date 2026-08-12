@@ -627,6 +627,8 @@ struct AppState {
     /// True once the results come from the whole-server search (instead of the
     /// client-side filter of previous contacts).
     new_conv_full_search: bool,
+    /// A whole-server search is in flight (button disabled to avoid spamming).
+    new_conv_search_busy: bool,
     new_conv_selected: Vec<u64>,
     new_conv_busy: bool,
     busy: bool,
@@ -731,6 +733,7 @@ impl Default for AppState {
             new_conv_search: String::new(),
             new_conv_results: Vec::new(),
             new_conv_full_search: false,
+            new_conv_search_busy: false,
             new_conv_selected: Vec::new(),
             new_conv_busy: false,
             busy: false,
@@ -3171,6 +3174,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             // Filter previous contacts locally; the server search only runs when
             // the user presses "search entire server".
             state.new_conv_full_search = false;
+            state.new_conv_search_busy = false;
             let needle = q.trim().to_lowercase();
             state.new_conv_results = previous_contacts(state)
                 .into_iter()
@@ -3183,17 +3187,27 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             ensure_avatars(state)
         }
         Msg::NewConvServerSearch => {
+            if state.new_conv_search_busy {
+                return Task::none();
+            }
             state.new_conv_full_search = true;
+            state.new_conv_search_busy = true;
             let server = state.server.clone();
             let token = state.token.clone().unwrap_or_default();
             let q = state.new_conv_search.clone();
             Task::perform(search_users_api(server, token, q), Msg::NewConvSearchResults)
         }
         Msg::NewConvSearchResults(result) => {
+            state.new_conv_search_busy = false;
             match result {
                 Ok(users) => {
-                    state.new_conv_results = users;
-                    return ensure_avatars(state);
+                    // Ignore a response for a query the user has since changed
+                    // or cleared (the previous-contacts list is showing again).
+                    if state.new_conv_full_search {
+                        state.new_conv_results = users;
+                        return ensure_avatars(state);
+                    }
+                    Task::none()
                 }
                 Err(e) => return handle_api_error(state, e),
             }
@@ -5473,16 +5487,24 @@ fn view_new_conv(state: &AppState) -> Element<'_, Msg> {
     };
 
     // Whole-server search is opt-in: a button appears under the (client-filtered)
-    // previous-contacts list once the user has typed something.
+    // previous-contacts list once the user has typed something. It's disabled
+    // while a search is in flight so it can't hammer the server.
     let server_search_btn: Element<'_, Msg> = if !state.new_conv_full_search
         && !state.new_conv_search.trim().is_empty()
     {
-        let query = state.new_conv_search.trim();
-        button(text(format!("Search entire server for \"{query}\"…")).size(state.zs(12)))
-            .on_press(Msg::NewConvServerSearch)
-            .style(button::text)
-            .padding([state.z(8.0), state.z(4.0)])
-            .into()
+        if state.new_conv_search_busy {
+            button(row![throbber(state.z(14)), text("Searching…").size(state.zs(12))].spacing(state.z(8)))
+                .style(button::text)
+                .padding([state.z(8.0), state.z(4.0)])
+                .into()
+        } else {
+            let query = state.new_conv_search.trim();
+            button(text(format!("Search entire server for \"{query}\"…")).size(state.zs(12)))
+                .on_press(Msg::NewConvServerSearch)
+                .style(button::text)
+                .padding([state.z(8.0), state.z(4.0)])
+                .into()
+        }
     } else {
         space::horizontal().into()
     };
