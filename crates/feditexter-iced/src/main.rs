@@ -897,7 +897,8 @@ fn handle_api_error(state: &mut AppState, e: String) -> Task<Msg> {
 }
 
 /// Classify a response: Ok(()) on success, AUTH_FAILED on 401, otherwise a
-/// descriptive error. HTTP 403 (moderation, 2FA-setup) is left untouched.
+/// descriptive error that includes the endpoint. HTTP 403 (moderation,
+/// 2FA-setup) is left untouched.
 fn auth_aware_error(resp: &reqwest::Response) -> Result<(), String> {
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         return Err(AUTH_FAILED.to_string());
@@ -905,7 +906,8 @@ fn auth_aware_error(resp: &reqwest::Response) -> Result<(), String> {
     if resp.status().is_success() {
         return Ok(());
     }
-    Err(format!("request failed: {}", resp.status()))
+    let url = resp.url().as_str();
+    Err(format!("{url}: {}", resp.status()))
 }
 
 // ---------------------------------------------------------------------------

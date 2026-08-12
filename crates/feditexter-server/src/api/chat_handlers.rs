@@ -3,6 +3,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tracing::error;
 
 use crate::api::error::ApiError;
 use crate::auth::AuthUser;
@@ -291,7 +292,10 @@ pub async fn list_messages(
     .bind(conversation_id)
     .fetch_all(&state.pool)
     .await
-    .map_err(|_| ApiError::Internal("db error"))?;
+    .map_err(|e| {
+        error!("list_messages conv={conversation_id} failed: {e}");
+        ApiError::Internal("db error")
+    })?;
 
     let read_up_to: i64 = sqlx::query_scalar(
         "SELECT last_read_message_id FROM conversation_reads WHERE conversation_id = ? AND user_id = ?",
@@ -300,7 +304,10 @@ pub async fn list_messages(
     .bind(auth.user.id)
     .fetch_optional(&state.pool)
     .await
-    .map_err(|_| ApiError::Internal("db error"))?
+    .map_err(|e| {
+        error!("list_messages read_up_to conv={conversation_id} failed: {e}");
+        ApiError::Internal("db error")
+    })?
     .unwrap_or(0);
 
     let msgs: Vec<Value> = messages
@@ -335,7 +342,10 @@ pub async fn mark_read(
     .bind(body.message_id)
     .execute(&state.pool)
     .await
-    .map_err(|_| ApiError::Internal("db error"))?;
+    .map_err(|e| {
+        error!("mark_read conv={conversation_id} failed: {e}");
+        ApiError::Internal("db error")
+    })?;
     Ok(Json(json!({ "status": "ok" })))
 }
 
