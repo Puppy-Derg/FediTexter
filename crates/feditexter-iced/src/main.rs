@@ -438,6 +438,7 @@ enum Msg {
     NewConvKindChanged(NewConvKind),
     NewConvSearchChanged(String),
     NewConvSearchResults(Result<Vec<SearchUser>, String>),
+    NewConvServerSearch,
     NewConvToggleUser(u64),
     NewConvCreate,
     NewConvCreated(Result<Conversation, String>),
@@ -623,6 +624,9 @@ struct AppState {
     new_conv_kind: NewConvKind,
     new_conv_search: String,
     new_conv_results: Vec<SearchUser>,
+    /// True once the results come from the whole-server search (instead of the
+    /// client-side filter of previous contacts).
+    new_conv_full_search: bool,
     new_conv_selected: Vec<u64>,
     new_conv_busy: bool,
     busy: bool,
@@ -726,6 +730,7 @@ impl Default for AppState {
             new_conv_kind: NewConvKind::Direct,
             new_conv_search: String::new(),
             new_conv_results: Vec::new(),
+            new_conv_full_search: false,
             new_conv_selected: Vec::new(),
             new_conv_busy: false,
             busy: false,
@@ -1502,6 +1507,7 @@ fn msg_short(msg: &Msg) -> String {
         Msg::NewConvKindChanged(_) => "NewConvKindChanged".into(),
         Msg::NewConvSearchChanged(_) => "NewConvSearchChanged".into(),
         Msg::NewConvSearchResults(_) => "NewConvSearchResults".into(),
+        Msg::NewConvServerSearch => "NewConvServerSearch".into(),
         Msg::NewConvToggleUser(_) => "NewConvToggleUser".into(),
         Msg::NewConvCreate => "NewConvCreate".into(),
         Msg::NewConvCreated(_) => "NewConvCreated".into(),
@@ -3117,14 +3123,12 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             state.new_conv_open = true;
             state.new_conv_kind = NewConvKind::Direct;
             state.new_conv_search.clear();
-            state.new_conv_results.clear();
             state.new_conv_selected.clear();
-            let server = state.server.clone();
-            let token = state.token.clone().unwrap_or_default();
-            Task::perform(
-                search_users_api(server, token, String::new()),
-                Msg::NewConvSearchResults,
-            )
+            // Show only people we've talked to before; the whole-server search
+            // is opt-in via the "search entire server" button.
+            state.new_conv_full_search = false;
+            state.new_conv_results = previous_contacts(state);
+            ensure_avatars(state)
         }
         Msg::CloseNewConv => {
             state.new_conv_open = false;
@@ -3143,6 +3147,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             state.new_conv_search.clear();
             state.new_conv_selected.clear();
             state.new_conv_results.clear();
+            state.new_conv_full_search = true;
             if let Some(p) = state.profile.as_ref().filter(|p| p.id == user_id) {
                 state.new_conv_results.push(SearchUser {
                     id: p.id,
@@ -3163,12 +3168,26 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
         }
         Msg::NewConvSearchChanged(q) => {
             state.new_conv_search = q.clone();
+            // Filter previous contacts locally; the server search only runs when
+            // the user presses "search entire server".
+            state.new_conv_full_search = false;
+            let needle = q.trim().to_lowercase();
+            state.new_conv_results = previous_contacts(state)
+                .into_iter()
+                .filter(|u| {
+                    needle.is_empty()
+                        || u.username.to_lowercase().contains(&needle)
+                        || u.display_name.to_lowercase().contains(&needle)
+                })
+                .collect();
+            ensure_avatars(state)
+        }
+        Msg::NewConvServerSearch => {
+            state.new_conv_full_search = true;
             let server = state.server.clone();
             let token = state.token.clone().unwrap_or_default();
-            Task::perform(
-                search_users_api(server, token, q),
-                Msg::NewConvSearchResults,
-            )
+            let q = state.new_conv_search.clone();
+            Task::perform(search_users_api(server, token, q), Msg::NewConvSearchResults)
         }
         Msg::NewConvSearchResults(result) => {
             match result {
@@ -4348,6 +4367,32 @@ async fn fetch_avatar_bytes(url: String) -> Result<Vec<u8>, String> {
     cached_bytes(&url).await
 }
 
+/// Users the caller has talked to before, derived from the loaded conversation
+/// list. These are shown by default in the new-conversation picker instead of
+/// every account on the server.
+fn previous_contacts(state: &AppState) -> Vec<SearchUser> {
+    let self_id = state.user.as_ref().map(|u| u.id);
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut out = Vec::new();
+    for conv in &state.conversations {
+        for m in &conv.members {
+            if Some(m.id) == self_id || seen.contains(&m.id) {
+                continue;
+            }
+            seen.insert(m.id);
+            out.push(SearchUser {
+                id: m.id,
+                username: m.username.clone(),
+                display_name: m.display_name.clone(),
+                domain: m.domain.clone(),
+                avatar_url: m.avatar_url.clone(),
+                is_bot: m.is_bot,
+            });
+        }
+    }
+    out
+}
+
 /// Scan every known user (self, conversation members, open profile) and load
 /// any avatar we haven't attempted yet. `data:` URLs are decoded inline; http(s)
 /// URLs are fetched in the background.
@@ -5390,7 +5435,12 @@ fn view_new_conv(state: &AppState) -> Element<'_, Msg> {
     };
 
     let results: Element<'_, Msg> = if state.new_conv_results.is_empty() {
-        container(text("No users found").size(state.zs(13)).color(iced::Color::from_rgb(0.7, 0.7, 0.7)))
+        let hint = if state.new_conv_search.trim().is_empty() {
+            "No previous conversations yet — type a name to search people you've talked to."
+        } else {
+            "No matches in previous conversations."
+        };
+        container(text(hint).size(state.zs(13)).color(iced::Color::from_rgb(0.7, 0.7, 0.7)))
             .center_x(Length::Fill)
             .height(Length::Fixed(state.z(80.0)))
             .into()
@@ -5422,6 +5472,21 @@ fn view_new_conv(state: &AppState) -> Element<'_, Msg> {
         scrollable(column(items).spacing(state.z(2))).height(Length::Fixed(state.z(260.0))).into()
     };
 
+    // Whole-server search is opt-in: a button appears under the (client-filtered)
+    // previous-contacts list once the user has typed something.
+    let server_search_btn: Element<'_, Msg> = if !state.new_conv_full_search
+        && !state.new_conv_search.trim().is_empty()
+    {
+        let query = state.new_conv_search.trim();
+        button(text(format!("Search entire server for \"{query}\"…")).size(state.zs(12)))
+            .on_press(Msg::NewConvServerSearch)
+            .style(button::text)
+            .padding([state.z(8.0), state.z(4.0)])
+            .into()
+    } else {
+        space::horizontal().into()
+    };
+
     let valid = match state.new_conv_kind {
         NewConvKind::Direct => state.new_conv_selected.len() == 1,
         NewConvKind::Group => state.new_conv_selected.len() >= 2,
@@ -5445,6 +5510,7 @@ fn view_new_conv(state: &AppState) -> Element<'_, Msg> {
         search,
         chips,
         results,
+        server_search_btn,
         create_btn,
     ].spacing(state.z(10)))
         .padding(state.z(20))
