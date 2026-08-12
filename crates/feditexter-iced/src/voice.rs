@@ -586,12 +586,8 @@ impl VoiceManager {
             let _keep_streams = (in_stream, out_stream);
             let mut resampler = LinearResampler::new(SAMPLE_RATE as f32 / in_rate);
             let mut accum: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES);
-            let encoder = audiopus::coder::Encoder::new(
-                audiopus::SampleRate::Hz48000,
-                audiopus::Channels::Mono,
-                audiopus::Application::Voip,
-            )
-            .ok();
+            let mut encoder = opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
+                .ok();
             let mut out = [0u8; 4096];
             let mut shutdown_rx = shutdown_rx;
             loop {
@@ -604,7 +600,7 @@ impl VoiceManager {
                                 .drain(..FRAME_SAMPLES)
                                 .map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
                                 .collect();
-                            if let Some(enc) = &encoder
+                            if let Some(enc) = &mut encoder
                                 && let Ok(n) = enc.encode(&frame, &mut out)
                             {
                                 let opus = out[..n].to_vec();
@@ -818,10 +814,7 @@ fn spawn_remote_audio(mgr: Arc<VoiceManager>, track: Arc<dyn TrackRemote>, peer_
     let handle = mgr.handle.clone();
     handle.spawn(async move {
         let mut depacketizer = rtc::rtp::codec::opus::OpusPacket::default();
-        let decoder = audiopus::coder::Decoder::new(
-            audiopus::SampleRate::Hz48000,
-            audiopus::Channels::Mono,
-        );
+        let decoder = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono);
         let mut pcm = vec![0i16; FRAME_SAMPLES * 2];
         let mut decoder = match decoder {
             Ok(d) => d,
@@ -830,10 +823,10 @@ fn spawn_remote_audio(mgr: Arc<VoiceManager>, track: Arc<dyn TrackRemote>, peer_
         while let Some(event) = track.poll().await {
             match event {
                 TrackRemoteEvent::OnRtpPacket(pkt) => {
-                    let Ok(opus) = depacketizer.depacketize(&pkt.payload) else {
+                    let Ok(opus_payload) = depacketizer.depacketize(&pkt.payload) else {
                         continue;
                     };
-                    if let Ok(n) = decoder.decode(Some(&opus[..]), &mut pcm, false)
+                    if let Ok(n) = decoder.decode(&opus_payload[..], &mut pcm, false)
                         && n > 0
                     {
                         let samples: Vec<f32> =
