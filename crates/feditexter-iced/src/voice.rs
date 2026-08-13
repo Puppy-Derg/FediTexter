@@ -4,11 +4,11 @@
 //! When you join a voice channel the server replies with the current occupant
 //! list (`voice_state`); the joiner then builds one peer connection per occupant
 //! and sends an SDP `voice_offer`. Existing members answer. Every connection
-//! carries three tracks: microphone (Opus), camera (H.264) and screen (H.264).
-//! Toggling the camera or screen only starts/stops writing frames to those
-//! tracks — no renegotiation is ever needed. Remote Opus is decoded and mixed
-//! into the output device; remote H.264 is decoded and surfaced to the UI as
-//! RGBA frames for live tiles.
+//! carries three tracks: microphone (Opus), camera (HEVC/H.265) and screen
+//! (HEVC/H.265). Toggling the camera or screen only starts/stops writing frames
+//! to those tracks — no renegotiation is ever needed. Remote Opus is decoded
+//! and mixed into the output device; remote HEVC is decoded and surfaced to the
+//! UI as RGBA frames for live tiles.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,9 +41,9 @@ use rtc::shared::time::SystemInstant;
 use crate::p2p::SignalEvent;
 
 /// Negotiated payload types: both peers run identical builds registering the
-/// default codecs, so Opus is 111 and H.264 (packetization-mode=1) is 102.
+/// default codecs, so Opus is 111 and HEVC/H.265 is 126.
 const PT_OPUS: u8 = 111;
-const PT_H264: u8 = 102;
+const PT_HEVC: u8 = 126;
 const SAMPLE_RATE: u32 = 48_000;
 const FRAME_SAMPLES: usize = 960; // 20 ms at 48 kHz
 const CAMERA_MAX_WIDTH: u32 = 640;
@@ -652,9 +652,7 @@ impl VoiceManager {
             let _keep_streams = (in_stream, out_stream);
             let mut resampler = LinearResampler::new(SAMPLE_RATE as f32 / in_rate);
             let mut accum: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES);
-            let mut encoder = opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
-                .ok();
-            let mut out = [0u8; 4096];
+            let encoder = crate::codec::OpusEnc::new();
             let mut shutdown_rx = shutdown_rx;
             loop {
                 tokio::select! {
@@ -662,14 +660,13 @@ impl VoiceManager {
                     Some(chunk) = mic_rx.recv() => {
                         accum.extend(resampler.process(&chunk));
                         while accum.len() >= FRAME_SAMPLES {
-                            let frame: Vec<i16> = accum
+                            let frame: Vec<f32> = accum
                                 .drain(..FRAME_SAMPLES)
-                                .map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+                                .map(|s| s.clamp(-1.0, 1.0))
                                 .collect();
-                            if let Some(enc) = &mut encoder
-                                && let Ok(n) = enc.encode(&frame, &mut out)
+                            if let Some(enc) = &encoder
+                                && let Some(opus) = enc.encode(&frame)
                             {
-                                let opus = out[..n].to_vec();
                                 let (tracks, muted) = {
                                     let inner = mgr.inner.lock().unwrap();
                                     (inner.audio_tracks.clone(), inner.muted)
@@ -801,12 +798,12 @@ fn opus_codec() -> RTCRtpCodec {
     }
 }
 
-fn h264_codec() -> RTCRtpCodec {
+fn h265_codec() -> RTCRtpCodec {
     RTCRtpCodec {
-        mime_type: "video/H264".to_owned(),
+        mime_type: "video/H265".to_owned(),
         clock_rate: 90_000,
         channels: 0,
-        sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f".to_owned(),
+        sdp_fmtp_line: String::new(),
         rtcp_feedback: vec![],
     }
 }
@@ -859,7 +856,7 @@ async fn add_local_tracks(
             "feditex-video",
             name,
             RtpCodecKind::Video,
-            h264_codec(),
+            h265_codec(),
         ))?;
         let video_ssrc = video.ssrcs().await.first().copied().unwrap_or(1);
         pc.add_track(Arc::new(video.clone())).await?;
@@ -880,11 +877,9 @@ fn spawn_remote_audio(mgr: Arc<VoiceManager>, track: Arc<dyn TrackRemote>, peer_
     let handle = mgr.handle.clone();
     handle.spawn(async move {
         let mut depacketizer = rtc::rtp::codec::opus::OpusPacket::default();
-        let decoder = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono);
-        let mut pcm = vec![0i16; FRAME_SAMPLES * 2];
-        let mut decoder = match decoder {
-            Ok(d) => d,
-            Err(_) => return,
+        let decoder = crate::codec::OpusDec::new();
+        let Some(decoder) = decoder else {
+            return;
         };
         while let Some(event) = track.poll().await {
             match event {
@@ -892,11 +887,7 @@ fn spawn_remote_audio(mgr: Arc<VoiceManager>, track: Arc<dyn TrackRemote>, peer_
                     let Ok(opus_payload) = depacketizer.depacketize(&pkt.payload) else {
                         continue;
                     };
-                    if let Ok(n) = decoder.decode(&opus_payload[..], &mut pcm, false)
-                        && n > 0
-                    {
-                        let samples: Vec<f32> =
-                            pcm[..n].iter().map(|&s| s as f32 / 32768.0).collect();
+                    if let Some(samples) = decoder.decode(&opus_payload[..]) {
                         let mut mix = mgr.mix.lock().unwrap();
                         let q = mix.buffers.entry(peer_id).or_default();
                         q.extend(samples);
@@ -919,14 +910,13 @@ fn spawn_remote_video(
     peer_id: u64,
     kind: VoiceVideoKind,
 ) {
-    use openh264::formats::YUVSource;
     let handle = mgr.handle.clone();
     handle.spawn(async move {
-        let mut depacketizer = rtc::rtp::codec::h264::H264Packet::default();
-        let mut acc: Vec<u8> = Vec::new();
-        let Some(mut decoder) = openh264::decoder::Decoder::new().ok() else {
+        let mut depacketizer = rtc::rtp::codec::h265::H265Packet::default();
+        let Some(decoder) = crate::codec::HevcDec::new() else {
             return;
         };
+        let mut acc: Vec<u8> = Vec::new();
         while let Some(event) = track.poll().await {
             match event {
                 TrackRemoteEvent::OnRtpPacket(pkt) => {
@@ -934,32 +924,28 @@ fn spawn_remote_video(
                         continue;
                     };
                     acc.extend_from_slice(&nal);
-                    // A peer that never sets the RTP marker bit (or sends a
-                    // malformed stream) would otherwise grow this buffer without
-                    // bound. Drop the partial frame once it exceeds a sane cap
-                    // (an H.264 access unit for a 4K frame is a few MB).
+                    // Guard against unbounded partial-frame growth (a HEVC
+                    // access unit for a 4K frame is a few MB).
                     if acc.len() > 8 * 1024 * 1024 {
                         acc.clear();
                         continue;
                     }
                     if pkt.header.marker {
-                        if let Ok(Some(frame)) = decoder.decode(&acc) {
-                            let (w, h) = frame.dimensions();
-                            let mut rgba = vec![0u8; w * h * 4];
-                            frame.write_rgba8(&mut rgba);
-                            let _ = mgr.ui_tx.send(VoiceEvent::Video {
-                                user_id: peer_id,
-                                kind,
-                                width: w as u32,
-                                height: h as u32,
-                                rgba,
-                            });
-                        }
-                        acc.clear();
+                        let au = std::mem::take(&mut acc);
+                        decoder.feed(au);
                     }
                 }
                 TrackRemoteEvent::OnEnded | TrackRemoteEvent::OnEnding => break,
                 _ => {}
+            }
+            for (w, h, rgba) in decoder.try_drain() {
+                let _ = mgr.ui_tx.send(VoiceEvent::Video {
+                    user_id: peer_id,
+                    kind,
+                    width: w,
+                    height: h,
+                    rgba,
+                });
             }
         }
     });
@@ -1003,7 +989,7 @@ fn spawn_camera(mgr: Arc<VoiceManager>) {
                 prev_padding_packets: 0,
             };
             for (ssrc, track) in &tracks {
-                let _ = track.write_sample(*ssrc, PT_H264, &sample, &[]).await;
+                let _ = track.write_sample(*ssrc, PT_HEVC, &sample, &[]).await;
             }
         }
     });
@@ -1020,7 +1006,6 @@ fn run_camera_capture(
     use nokhwa::pixel_format::RgbFormat;
     use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
     use nokhwa::Camera;
-    use openh264::encoder::{Encoder, EncoderConfig, IntraFramePeriod};
 
     let mut cam = Camera::new(
         CameraIndex::Index(0),
@@ -1028,12 +1013,7 @@ fn run_camera_capture(
     )?;
     cam.open_stream()?;
 
-    let mut encoder = Encoder::with_api_config(
-        openh264::OpenH264API::from_source(),
-        EncoderConfig::new()
-            .bitrate(openh264::encoder::BitRate::from_bps(1_500_000))
-            .intra_frame_period(IntraFramePeriod::from_num_frames(60)),
-    )?;
+    let mut encoder: Option<crate::codec::HevcEnc> = None;
     let mut frame_no: u64 = 0;
     while stop.load(Ordering::Relaxed) {
         let buf = match cam.frame() {
@@ -1052,22 +1032,24 @@ fn run_camera_capture(
         else {
             continue;
         };
-        if frame_no % 120 == 0 {
-            encoder.force_intra_frame();
+        if encoder.is_none() {
+            encoder = crate::codec::HevcEnc::new(nw, nh, 15, 60, 1500);
+        }
+        let Some(enc) = encoder.as_mut() else {
+            continue;
+        };
+        if frame_no.is_multiple_of(120) {
+            enc.force_keyframe();
         }
         frame_no += 1;
-        let src = I420Src {
-            y,
-            u,
-            v,
-            w: nw as usize,
-            h: nh as usize,
-            sy: stride_y(nw as usize),
-            suv: stride_uv(nw as usize),
+        let Some(out) = enc.encode_yuv(
+            &y, &u, &v,
+            stride_y(nw as usize),
+            stride_uv(nw as usize),
+            nw, nh,
+        ) else {
+            continue;
         };
-        let bs = encoder.encode(&src)?;
-        let mut out = Vec::new();
-        bs.write_vec(&mut out);
         if tx.send(out).is_err() {
             break;
         }
@@ -1112,7 +1094,7 @@ fn spawn_screen(mgr: Arc<VoiceManager>) {
                 prev_padding_packets: 0,
             };
             for (ssrc, track) in &tracks {
-                let _ = track.write_sample(*ssrc, PT_H264, &sample, &[]).await;
+                let _ = track.write_sample(*ssrc, PT_HEVC, &sample, &[]).await;
             }
         }
     });
@@ -1126,19 +1108,12 @@ fn run_screen_capture(
     stop: Arc<AtomicBool>,
     tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use openh264::encoder::{Encoder, EncoderConfig, IntraFramePeriod};
-
     let monitors = xcap::Monitor::all()?;
     let Some(monitor) = monitors.first() else {
         mgr.ui_err("no monitor found for screen share".into());
         return Ok(());
     };
-    let mut encoder = Encoder::with_api_config(
-        openh264::OpenH264API::from_source(),
-        EncoderConfig::new()
-            .bitrate(openh264::encoder::BitRate::from_bps(3_000_000))
-            .intra_frame_period(IntraFramePeriod::from_num_frames(30)),
-    )?;
+    let mut encoder: Option<crate::codec::HevcEnc> = None;
     let mut frame_no: u64 = 0;
     while stop.load(Ordering::Relaxed) {
         let img = match monitor.capture_image() {
@@ -1153,22 +1128,24 @@ fn run_screen_capture(
         else {
             continue;
         };
-        if frame_no % 30 == 0 {
-            encoder.force_intra_frame();
+        if encoder.is_none() {
+            encoder = crate::codec::HevcEnc::new(nw, nh, 10, 30, 3000);
+        }
+        let Some(enc) = encoder.as_mut() else {
+            continue;
+        };
+        if frame_no.is_multiple_of(30) {
+            enc.force_keyframe();
         }
         frame_no += 1;
-        let src = I420Src {
-            y,
-            u,
-            v,
-            w: nw as usize,
-            h: nh as usize,
-            sy: stride_y(nw as usize),
-            suv: stride_uv(nw as usize),
+        let Some(out) = enc.encode_yuv(
+            &y, &u, &v,
+            stride_y(nw as usize),
+            stride_uv(nw as usize),
+            nw, nh,
+        ) else {
+            continue;
         };
-        let bs = encoder.encode(&src)?;
-        let mut out = Vec::new();
-        bs.write_vec(&mut out);
         if tx.send(out).is_err() {
             break;
         }
@@ -1236,34 +1213,6 @@ fn stride_y(w: usize) -> usize {
 
 fn stride_uv(w: usize) -> usize {
     (((w / 2) + 15) & !15).max(16)
-}
-
-struct I420Src {
-    y: Vec<u8>,
-    u: Vec<u8>,
-    v: Vec<u8>,
-    w: usize,
-    h: usize,
-    sy: usize,
-    suv: usize,
-}
-
-impl openh264::formats::YUVSource for I420Src {
-    fn dimensions(&self) -> (usize, usize) {
-        (self.w, self.h)
-    }
-    fn strides(&self) -> (usize, usize, usize) {
-        (self.sy, self.suv, self.suv)
-    }
-    fn y(&self) -> &[u8] {
-        &self.y
-    }
-    fn u(&self) -> &[u8] {
-        &self.u
-    }
-    fn v(&self) -> &[u8] {
-        &self.v
-    }
 }
 
 /// Nearest-neighbour downscale (if wider than `max_w`) + RGB -> I420.

@@ -3,6 +3,8 @@
 mod media;
 mod p2p;
 mod voice;
+mod img;
+mod codec;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -2109,7 +2111,9 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             match result {
                 Ok(bytes) => {
                     state.sticker_bytes.insert(sticker_id, bytes.clone());
-                    state.sticker_handles.insert(sticker_id, iced::widget::image::Handle::from_bytes(bytes));
+                    if let Some(h) = handle_from_bytes(bytes) {
+                        state.sticker_handles.insert(sticker_id, h);
+                    }
                 }
                 Err(_) => {}
             }
@@ -2402,24 +2406,20 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                 .unwrap_or_else(|| "image/webp".to_string());
             let file_id = uuid::Uuid::new_v4().to_string();
             // Compress the 1024x1024 sticker into a small bubble thumbnail.
-            let thumbnail = image::load_from_memory(&bytes)
-                .ok()
-                .map(|img| {
+            let thumbnail = img::decode(&bytes)
+                .and_then(|d| {
                     let max_dim = 480u32;
-                    let img = if img.width() > max_dim || img.height() > max_dim {
-                        let scale = max_dim as f32 / img.width().max(img.height()) as f32;
-                        img.resize(
-                            ((img.width() as f32) * scale) as u32,
-                            ((img.height() as f32) * scale) as u32,
-                            image::imageops::FilterType::Lanczos3,
-                        )
+                    let d = if d.width.max(d.height) > max_dim {
+                        let scale = max_dim as f32 / d.width.max(d.height) as f32;
+                        img::resize(&d, (d.width as f32 * scale) as u32, (d.height as f32 * scale) as u32)?
                     } else {
-                        img
+                        d
                     };
-                    let mut out = std::io::Cursor::new(Vec::new());
-                    let _ = img.write_to(&mut out, image::ImageFormat::Jpeg);
+                    img::encode_jpeg(&d)
+                })
+                .map(|data| {
                     use base64::Engine;
-                    base64::engine::general_purpose::STANDARD.encode(out.get_ref())
+                    base64::engine::general_purpose::STANDARD.encode(data)
                 })
                 .unwrap_or_default();
             state.pending_attachment = Some(Attachment {
@@ -3080,7 +3080,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                     // The receiver already streamed the bytes to `path`.
                     let image_handle = std::fs::read(&path).ok().and_then(|bytes| {
                         if mime.starts_with("image/") {
-                            Some(iced::widget::image::Handle::from_bytes(bytes))
+                            handle_from_bytes(bytes)
                         } else {
                             None
                         }
@@ -3117,24 +3117,20 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                     let file_id = uuid::Uuid::new_v4().to_string();
                     let file_size = bytes.len() as u64;
                     let thumbnail = if mime.starts_with("image/") {
-                        image::load_from_memory(&bytes)
-                            .ok()
-                            .map(|img| {
+                        img::decode(&bytes)
+                            .and_then(|d| {
                                 let max_dim = 480u32;
-                                let img = if img.width() > max_dim || img.height() > max_dim {
-                                    let scale = max_dim as f32 / img.width().max(img.height()) as f32;
-                                    img.resize(
-                                        ((img.width() as f32) * scale) as u32,
-                                        ((img.height() as f32) * scale) as u32,
-                                        image::imageops::FilterType::Lanczos3,
-                                    )
+                                let d = if d.width.max(d.height) > max_dim {
+                                    let scale = max_dim as f32 / d.width.max(d.height) as f32;
+                                    img::resize(&d, (d.width as f32 * scale) as u32, (d.height as f32 * scale) as u32)?
                                 } else {
-                                    img
+                                    d
                                 };
-                                let mut out = std::io::Cursor::new(Vec::new());
-                                let _ = img.write_to(&mut out, image::ImageFormat::Jpeg);
+                                img::encode_jpeg(&d)
+                            })
+                            .map(|data| {
                                 use base64::Engine;
-                                let data = base64::engine::general_purpose::STANDARD.encode(out.into_inner());
+                                let data = base64::engine::general_purpose::STANDARD.encode(data);
                                 format!("data:image/jpeg;base64,{data}")
                             })
                             .unwrap_or_default()
@@ -3150,7 +3146,9 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
             state.picking_file = false;
             if !att.thumbnail.is_empty() {
                 if let Some(bytes) = data_url_bytes(&att.thumbnail) {
-                    state.thumb_handles.insert(att.file_id.clone(), iced::widget::image::Handle::from_bytes(bytes));
+                    if let Some(h) = handle_from_bytes(bytes) {
+                        state.thumb_handles.insert(att.file_id.clone(), h);
+                    }
                 }
             }
             state.pending_attachment = Some(att);
@@ -3276,7 +3274,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                     let _ = w;
                     v.full_bytes = Some(bytes.clone());
                     // Upgrade the image to full resolution bytes.
-                    v.image_handle = Some(iced::widget::image::Handle::from_bytes(bytes));
+                    v.image_handle = handle_from_bytes(bytes);
                     v.error = None;
                 }
             }
@@ -3643,7 +3641,9 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                         continue;
                     }
                     if let Ok(bytes) = std::fs::read(preview_cache_path(img)) {
-                        state.media_handles.insert(img.clone(), iced::widget::image::Handle::from_bytes(bytes));
+                        if let Some(h) = handle_from_bytes(bytes) {
+                            state.media_handles.insert(img.clone(), h);
+                        }
                     }
                 }
                 state.link_previews.insert(url.clone(), p);
@@ -3735,7 +3735,9 @@ fn do_send(state: &mut AppState) -> Task<Msg> {
             });
         }
         if att.mime.starts_with("image/") {
-            state.own_full_handles.insert(att.file_id.clone(), iced::widget::image::Handle::from_bytes(att.bytes.clone()));
+            if let Some(h) = handle_from_bytes(att.bytes.clone()) {
+                state.own_full_handles.insert(att.file_id.clone(), h);
+            }
         }
         state.own_files.insert(
             att.file_id.clone(),
@@ -3751,7 +3753,7 @@ fn do_send(state: &mut AppState) -> Task<Msg> {
         }
         let _ = std::fs::write(&path, &att.bytes);
         let image_handle = if att.mime.starts_with("image/") {
-            Some(iced::widget::image::Handle::from_bytes(att.bytes.clone()))
+            handle_from_bytes(att.bytes.clone())
         } else {
             None
         };
@@ -4532,7 +4534,7 @@ async fn cached_preview_jpeg(url: &str) -> Option<Vec<u8>> {
     if let Ok(bytes) = std::fs::read(&path)
         && !bytes.is_empty()
     {
-        if image::load_from_memory(&bytes).is_ok() {
+        if img::is_image(&bytes) {
             return Some(bytes);
         }
         let _ = std::fs::remove_file(&path);
@@ -4546,21 +4548,15 @@ async fn cached_preview_jpeg(url: &str) -> Option<Vec<u8>> {
     if raw.len() > PREVIEW_MAX_IMAGE_BYTES {
         return None;
     }
-    let decoded = image::load_from_memory(&raw).ok()?;
-    let (w, h) = (decoded.width(), decoded.height());
+    let decoded = img::decode(&raw)?;
+    let (w, h) = (decoded.width, decoded.height);
     let scaled = if w > PREVIEW_IMAGE_MAX_DIM || h > PREVIEW_IMAGE_MAX_DIM {
         let scale = PREVIEW_IMAGE_MAX_DIM as f32 / w.max(h) as f32;
-        decoded.resize(
-            ((w as f32) * scale) as u32,
-            ((h as f32) * scale) as u32,
-            image::imageops::FilterType::Lanczos3,
-        )
+        img::resize(&decoded, ((w as f32) * scale) as u32, ((h as f32) * scale) as u32)?
     } else {
         decoded
     };
-    let mut out = std::io::Cursor::new(Vec::new());
-    scaled.write_to(&mut out, image::ImageFormat::Jpeg).ok()?;
-    let jpeg = out.into_inner();
+    let jpeg = img::encode_jpeg(&scaled)?;
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -4674,7 +4670,9 @@ fn open_media_viewer(state: &mut AppState, mime: &str, title: &str, bytes: Vec<u
         open_video_viewer(state, title, path);
     } else {
         let mut v = ViewerState::empty(title.into(), ViewerKind::Image);
-        v.image_handle = Some(iced::widget::image::Handle::from_bytes(bytes));
+        if let Some(h) = handle_from_bytes(bytes) {
+            v.image_handle = Some(h);
+        }
         state.viewer = Some(v);
     }
 }
@@ -4803,24 +4801,18 @@ fn build_thumb_handles(state: &mut AppState) {
         }
         if let Some(thumb) = &m.thumbnail_data {
             if let Some(bytes) = data_url_bytes(thumb)
-                && let Ok(img) = image::load_from_memory(&bytes)
+                && let Some(img) = img::decode(&bytes)
             {
-                let (w, h) = (img.width(), img.height());
+                let (w, h) = (img.width, img.height);
                 let max_dim = 256u32;
                 let thumb_img = if w > max_dim || h > max_dim {
                     let scale = max_dim as f32 / w.max(h) as f32;
-                    img.resize(
-                        ((w as f32) * scale) as u32,
-                        ((h as f32) * scale) as u32,
-                        image::imageops::FilterType::Lanczos3,
-                    )
+                    img::resize(&img, ((w as f32) * scale) as u32, ((h as f32) * scale) as u32)
                 } else {
-                    img
+                    Some(img)
                 };
-                let mut buf = Vec::new();
-                let mut cursor = std::io::Cursor::new(&mut buf);
-                if thumb_img.write_to(&mut cursor, image::ImageFormat::Png).is_ok() {
-                    state.thumb_handles.insert(file_id.clone(), iced::widget::image::Handle::from_bytes(buf));
+                if let Some(t) = thumb_img {
+                    state.thumb_handles.insert(file_id.clone(), iced::widget::image::Handle::from_rgba(t.width, t.height, t.pixels));
                 }
             }
         }
@@ -4843,8 +4835,7 @@ fn load_cached_files(state: &mut AppState) {
                     if bytes.len() > 50_000_000 {
                         return None;
                     }
-                    image::load_from_memory(&bytes).ok()?;
-                    Some(iced::widget::image::Handle::from_bytes(bytes))
+                    handle_from_bytes(bytes)
                 });
                 state.downloaded.insert(
                     name.to_string(),
@@ -4855,37 +4846,46 @@ fn load_cached_files(state: &mut AppState) {
     }
 }
 
+/// Decode image bytes to an RGBA iced handle (decode once, cache the handle).
+fn handle_from_bytes(bytes: Vec<u8>) -> Option<iced::widget::image::Handle> {
+    let d = img::decode(&bytes)?;
+    Some(iced::widget::image::Handle::from_rgba(d.width, d.height, d.pixels))
+}
+
 /// Decode avatar bytes, upscale/crop to a square, apply a circular alpha mask
-/// with a soft edge, and return a PNG handle suitable for `image()`.
+/// with a soft edge, and return an RGBA handle suitable for `image()`.
 fn make_avatar_handle(bytes: Vec<u8>) -> Option<iced::widget::image::Handle> {
-    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
-    let (w, h) = img.dimensions();
+    let d = img::decode(&bytes)?;
+    let (w, h) = (d.width, d.height);
     let target: u32 = 128;
     let scale = target as f32 / w.max(h) as f32;
     let (nw, nh) = ((w as f32 * scale).round().max(1.0) as u32, (h as f32 * scale).round().max(1.0) as u32);
-    let resized = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Lanczos3);
+    let resized = img::resize(&d, nw, nh)?;
     let sq = nw.min(nh);
     let (x0, y0) = ((nw - sq) / 2, (nh - sq) / 2);
-    let cropped = image::imageops::crop_imm(&resized, x0, y0, sq, sq).to_image();
+    let mut pixels = vec![0u8; (sq * sq * 4) as usize];
+    for j in 0..sq {
+        for i in 0..sq {
+            let si = (((y0 + j) * nw + (x0 + i)) * 4) as usize;
+            let di = ((j * sq + i) * 4) as usize;
+            pixels[di..di + 4].copy_from_slice(&resized.pixels[si..si + 4]);
+        }
+    }
     let cx = sq as f32 / 2.0;
     let cy = sq as f32 / 2.0;
     let radius = sq as f32 / 2.0;
     let feather = 1.5f32;
-    let mut out = cropped;
-    for y in 0..sq {
-        for x in 0..sq {
-            let dx = x as f32 + 0.5 - cx;
-            let dy = y as f32 + 0.5 - cy;
+    for j in 0..sq {
+        for i in 0..sq {
+            let dx = i as f32 + 0.5 - cx;
+            let dy = j as f32 + 0.5 - cy;
             let dist = (dx * dx + dy * dy).sqrt();
             let cover = ((radius - dist) / feather).clamp(0.0, 1.0);
-            let px = out.get_pixel_mut(x, y);
-            px[3] = ((px[3] as f32) * cover).round() as u8;
+            let di = ((j * sq + i) * 4) as usize;
+            pixels[di + 3] = ((pixels[di + 3] as f32) * cover).round() as u8;
         }
     }
-    let mut buf = Vec::new();
-    let mut cursor = std::io::Cursor::new(&mut buf);
-    image::DynamicImage::ImageRgba8(out).write_to(&mut cursor, image::ImageFormat::Png).ok()?;
-    Some(iced::widget::image::Handle::from_bytes(buf))
+    Some(iced::widget::image::Handle::from_rgba(sq, sq, pixels))
 }
 
 async fn fetch_avatar_bytes(url: String) -> Result<Vec<u8>, String> {
@@ -4973,21 +4973,17 @@ fn ensure_avatars(state: &mut AppState) -> Task<Msg> {
 
 /// Downscale to ≤256px, re-encode as a PNG data URL for POST /api/me/avatar.
 fn avatar_data_url(bytes: Vec<u8>) -> Result<String, String> {
-    let img = image::load_from_memory(&bytes).map_err(|_| String::from("could not decode image"))?;
+    let img = img::decode(&bytes).ok_or_else(|| String::from("could not decode image"))?;
     const MAX: u32 = 256;
-    let img = if img.width() > MAX || img.height() > MAX {
-        let scale = MAX as f32 / img.width().max(img.height()) as f32;
-        img.resize(
-            ((img.width() as f32) * scale) as u32,
-            ((img.height() as f32) * scale) as u32,
-            image::imageops::FilterType::Lanczos3,
-        )
+    let img = if img.width > MAX || img.height > MAX {
+        let scale = MAX as f32 / img.width.max(img.height) as f32;
+        img::resize(&img, ((img.width as f32) * scale) as u32, ((img.height as f32) * scale) as u32)
+            .ok_or_else(|| String::from("could not resize image"))?
     } else {
         img
     };
-    let mut out = std::io::Cursor::new(Vec::new());
-    img.write_to(&mut out, image::ImageFormat::Png).map_err(|_| String::from("could not encode image"))?;
-    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, out.into_inner());
+    let png = img::encode_png(&img).ok_or_else(|| String::from("could not encode image"))?;
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png);
     Ok(format!("data:image/png;base64,{b64}"))
 }
 
@@ -5598,7 +5594,7 @@ fn view_2fa_setup(state: &AppState) -> Element<'_, Msg> {
         }
         Some(info) => {
             let qr_handle = data_url_bytes(&info.qr)
-                .map(iced::widget::image::Handle::from_bytes)
+                .and_then(handle_from_bytes)
                 .unwrap_or_else(|| iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 0]));
             let qr_img = iced::widget::Image::new(qr_handle).width(state.z(200)).height(state.z(200));
             let secret = text(format!("Secret: {}", info.secret)).size(state.zs(12))
@@ -6802,7 +6798,7 @@ fn view_settings(state: &AppState) -> Element<'_, Msg> {
             let secret = text(format!("Secret: {}", info.secret)).size(state.zs(12))
                 .color(iced::Color::from_rgb(0.7, 0.7, 0.7));
             let qr_handle = data_url_bytes(&info.qr)
-                .map(iced::widget::image::Handle::from_bytes)
+                .and_then(handle_from_bytes)
                 .unwrap_or_else(|| iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 0]));
             let qr_img = iced::widget::Image::new(qr_handle).width(state.z(160)).height(state.z(160));
             let code_input = text_input("Enter code from app", &state.twofa_toggle_code)
