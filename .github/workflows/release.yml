@@ -43,22 +43,29 @@ jobs:
             target: aarch64-apple-darwin
             name: feditexter-iced-macos-arm64
             binary: feditexter-iced
+            ffmpeg: build
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             name: feditexter-iced-windows-x64.exe
             binary: feditexter-iced.exe
+            ffmpeg: vcpkg
+            vcpkg_triplet: x64-windows-static-md
           - os: windows-latest
             target: aarch64-pc-windows-msvc
             name: feditexter-iced-windows-arm64.exe
             binary: feditexter-iced.exe
+            ffmpeg: vcpkg
+            vcpkg_triplet: arm64-windows-static-md
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             name: feditexter-iced-linux-x64
             binary: feditexter-iced
+            ffmpeg: build
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             name: feditexter-iced-linux-arm64
             binary: feditexter-iced
+            ffmpeg: build
     runs-on: ${{ matrix.os }}
     env:
       # audiopus_sys (used by the opus crate) builds the bundled libopus with
@@ -77,17 +84,45 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev \
+          sudo apt-get install -y build-essential nasm libxkbcommon-dev libxkbcommon-x11-dev \
             libwayland-dev libx11-dev libxcb1-dev libxcb-render0-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libgtk-3-dev \
             libfontconfig1-dev libfreetype6-dev libssl-dev pkg-config \
             libasound2-dev libv4l-dev libpipewire-0.3-dev libspa-0.2-dev \
             libgbm-dev libegl1-mesa-dev
+          # build-essential/nasm are required by the static FFmpeg source build
+          # (gcc+make, and nasm for x86 asm on the x86_64 job).
           # The aarch64 job runs natively on an arm64 runner (ubuntu-24.04-arm),
           # so the packages above are native — no cross toolchain needed.
           # libasound2-dev (cpal), libv4l-dev (nokhwa camera), libpipewire/libspa
           # (xcap screen capture), and libgbm/libegl (xcap's Mesa capture stack)
           # are required by the voice chat feature's audio/video capture stack.
+          # nasm is required by FFmpeg's x86 asm (x86_64 job only).
+
+      - name: Build static FFmpeg
+        if: matrix.ffmpeg == 'build'
+        run: |
+          .github/scripts/build-ffmpeg.sh "$GITHUB_WORKSPACE/.ffmpeg"
+          echo "FFMPEG_DIR=$GITHUB_WORKSPACE/.ffmpeg" >> "$GITHUB_ENV"
+
+      - name: Cache vcpkg FFmpeg
+        if: matrix.ffmpeg == 'vcpkg'
+        uses: actions/cache@v4
+        with:
+          path: C:/vcpkg/installed
+          key: vcpkg-ffmpeg-${{ matrix.vcpkg_triplet }}-9.0
+
+      - name: Install FFmpeg via vcpkg
+        if: matrix.ffmpeg == 'vcpkg'
+        shell: bash
+        run: |
+          echo "VCPKG_ROOT=C:/vcpkg" >> "$GITHUB_ENV"
+          echo "VCPKGRS_TRIPLET=${{ matrix.vcpkg_triplet }}" >> "$GITHUB_ENV"
+          if [ ! -d C:/vcpkg/.git ]; then
+            git clone https://github.com/microsoft/vcpkg C:/vcpkg
+          fi
+          C:/vcpkg/bootstrap-vcpkg.bat -disableMetrics
+          C:/vcpkg/vcpkg.exe install "ffmpeg[avcodec,avformat,swscale,swresample]:${{ matrix.vcpkg_triplet }}" --clean-after-build
 
       - name: Build client
         run: cargo build --release --target ${{ matrix.target }} -p feditexter-iced

@@ -1,18 +1,20 @@
 #![allow(dead_code)]
 
+mod media;
 mod p2p;
 mod voice;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use hmac::Mac as _;
-use iced::widget::{button, column, container, mouse_area, row, rule, scrollable, space, text, text_input};
+use iced::widget::{button, column, container, mouse_area, row, rule, scrollable, slider, space, text, text_input};
 use iced::widget::scrollable::Viewport;
 use iced::widget::Id;
 use iced::{Element, Length, Subscription, Task};
+use media::{MediaEngine, MediaEvent, PlayState};
 use p2p::{P2pEvent, P2pManager, ServingFile, SignalEvent};
 use tokio::sync::mpsc::UnboundedSender;
 use voice::{VoiceEvent, VoiceManager, VoiceVideoKind};
@@ -317,6 +319,64 @@ struct Attachment {
     bytes: Vec<u8>,
 }
 
+/// State for the in-app media viewer overlay.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewerKind {
+    Image,
+    Video,
+}
+
+struct ViewerState {
+    title: String,
+    kind: ViewerKind,
+    /// Image content (full-res for attachments, cached preview for link images).
+    image_handle: Option<iced::widget::image::Handle>,
+    /// Full-res image bytes refetched for embedded previews (tall images).
+    full_bytes: Option<Vec<u8>>,
+    /// Video playback engine (Video kind only).
+    engine: Option<MediaEngine>,
+    /// Receiver drained by `media_subscription`.
+    video_rx: Option<Arc<Mutex<std::sync::mpsc::Receiver<MediaEvent>>>>,
+    /// Latest decoded frame handle (rebuilt once per incoming frame).
+    video_handle: Option<iced::widget::image::Handle>,
+    video_width: u32,
+    video_height: u32,
+    video_duration: f64,
+    play_state: PlayState,
+    volume: f32,
+    zoom: f32,
+    pan_x: f32,
+    pan_y: f32,
+    dragging: bool,
+    pan_last: Option<iced::Point>,
+    error: Option<String>,
+}
+
+impl ViewerState {
+    fn empty(title: String, kind: ViewerKind) -> Self {
+        ViewerState {
+            title,
+            kind,
+            image_handle: None,
+            full_bytes: None,
+            engine: None,
+            video_rx: None,
+            video_handle: None,
+            video_width: 0,
+            video_height: 0,
+            video_duration: 0.0,
+            play_state: PlayState::Stopped,
+            volume: 1.0,
+            zoom: 1.0,
+            pan_x: 0.0,
+            pan_y: 0.0,
+            dragging: false,
+            pan_last: None,
+            error: None,
+        }
+    }
+}
+
 /// A file we sent this session, kept to render our own bubble at full res.
 #[derive(Clone)]
 struct OwnFile {
@@ -474,6 +534,20 @@ enum Msg {
     ClearAttachment,
     OpenFile(u64),
     RetryFile(u64),
+    OpenViewerImage { handle: iced::widget::image::Handle, title: String },
+    OpenViewerPreview { url: String, title: String },
+    ViewerMediaEvent(MediaEvent),
+    ViewerToggle,
+    ViewerSeek(f64),
+    ViewerVolume(f32),
+    ViewerZoom(f32),
+    ViewerPan { dx: f32, dy: f32 },
+    ViewerClose,
+    ViewerFullBytes(Vec<u8>),
+    ViewerDragStart,
+    ViewerDragMove(iced::Point),
+    ViewerDragEnd,
+    ViewerTick,
     SessionExpired(String),
     ToggleBlock(u64),
     ToggleMute(u64),
@@ -600,6 +674,7 @@ struct AppState {
     info: String,
     conversations: Vec<Conversation>,
     guilds: Vec<Guild>,
+    viewer: Option<ViewerState>,
     selected_guild: Option<u64>,
     left_tab: LeftTab,
     guild_modal_open: bool,
@@ -752,6 +827,7 @@ impl Default for AppState {
             link_previews: HashMap::new(),
             preview_loading: HashSet::new(),
             media_handles: HashMap::new(),
+            viewer: None,
             ws_connected: false,
             window_size: iced::Size::new(1024.0, 768.0),
             accent: accent_from_file(),
@@ -1305,6 +1381,11 @@ fn save_session(server: &str, token: &str) {
 fn subscription(state: &AppState) -> iced::Subscription<Msg> {
     let mut subs = Vec::new();
     subs.push(iced::window::resize_events().map(|(_id, size)| Msg::Resized(size)));
+    if let Some(v) = &state.viewer {
+        if v.engine.is_some() {
+            subs.push(iced::time::every(Duration::from_millis(33)).map(|_| Msg::ViewerTick));
+        }
+    }
     subs.push(iced::event::listen_with(|event, _status, _window| {
         if let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { physical_key, modifiers, .. }) = event {
             let zoom_key = match physical_key {
@@ -1565,6 +1646,20 @@ fn msg_short(msg: &Msg) -> String {
         Msg::ClearAttachment => "ClearAttachment".into(),
         Msg::OpenFile(_) => "OpenFile".into(),
         Msg::RetryFile(_) => "RetryFile".into(),
+        Msg::OpenViewerImage { .. } => "OpenViewerImage".into(),
+        Msg::OpenViewerPreview { .. } => "OpenViewerPreview".into(),
+        Msg::ViewerMediaEvent(_) => "ViewerMediaEvent".into(),
+        Msg::ViewerToggle => "ViewerToggle".into(),
+        Msg::ViewerSeek(_) => "ViewerSeek".into(),
+        Msg::ViewerVolume(_) => "ViewerVolume".into(),
+        Msg::ViewerZoom(_) => "ViewerZoom".into(),
+        Msg::ViewerPan { .. } => "ViewerPan".into(),
+        Msg::ViewerClose => "ViewerClose".into(),
+        Msg::ViewerFullBytes(_) => "ViewerFullBytes".into(),
+        Msg::ViewerDragStart => "ViewerDragStart".into(),
+        Msg::ViewerDragMove(_) => "ViewerDragMove".into(),
+        Msg::ViewerDragEnd => "ViewerDragEnd".into(),
+        Msg::ViewerTick => "ViewerTick".into(),
         Msg::SessionExpired(_) => "SessionExpired".into(),
         Msg::ToggleBlock(_) => "ToggleBlock".into(),
         Msg::ToggleMute(_) => "ToggleMute".into(),
@@ -3083,7 +3178,20 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                     .and_then(|p| std::fs::read(p).ok())
             };
             match bytes {
-                Some(bytes) => { open_bytes(&mime, &name, &bytes); Task::none() }
+                Some(bytes) => {
+                    if is_media_mime(&mime) {
+                        let title = if name.is_empty() {
+                            m.file_id.clone().unwrap_or_else(|| "attachment".into())
+                        } else {
+                            name.clone()
+                        };
+                        open_media_viewer(state, &mime, &title, bytes);
+                        Task::none()
+                    } else {
+                        open_bytes(&mime, &name, &bytes);
+                        Task::none()
+                    }
+                }
                 None => {
                     if let Some(p2p) = state.p2p.clone() {
                         p2p.retry_fetch(file_id, m.sender_id);
@@ -3091,6 +3199,121 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                     Task::none()
                 }
             }
+        }
+        Msg::OpenViewerImage { handle, title } => {
+            let mut v = ViewerState::empty(title, ViewerKind::Image);
+            v.image_handle = Some(handle);
+            state.viewer = Some(v);
+            Task::none()
+        }
+        Msg::OpenViewerPreview { url, title } => {
+            let mut v = ViewerState::empty(title, ViewerKind::Image);
+            v.image_handle = state.media_handles.get(&url).cloned();
+            state.viewer = Some(v);
+            let task = fetch_full_media(url);
+            Task::perform(task, |res| match res {
+                Ok(Some(bytes)) => Msg::ViewerFullBytes(bytes),
+                _ => Msg::Noop,
+            })
+        }
+        Msg::ViewerMediaEvent(ev) => {
+            drain_video_events(state);
+            apply_media_event(state, ev);
+            Task::none()
+        }
+        Msg::ViewerToggle => {
+            if let Some(v) = state.viewer.as_mut() {
+                if let Some(e) = v.engine.as_ref() {
+                    if v.play_state == PlayState::Playing {
+                        e.pause();
+                        v.play_state = PlayState::Paused;
+                    } else {
+                        e.play();
+                        v.play_state = PlayState::Playing;
+                    }
+                }
+            }
+            Task::none()
+        }
+        Msg::ViewerSeek(pos) => {
+            if let Some(v) = state.viewer.as_mut() {
+                if let Some(e) = v.engine.as_ref() {
+                    e.seek(pos);
+                }
+            }
+            Task::none()
+        }
+        Msg::ViewerVolume(vol) => {
+            if let Some(v) = state.viewer.as_mut() {
+                v.volume = vol;
+                if let Some(e) = v.engine.as_ref() {
+                    e.set_volume(vol);
+                }
+            }
+            Task::none()
+        }
+        Msg::ViewerZoom(z) => {
+            if let Some(v) = state.viewer.as_mut() {
+                if v.kind == ViewerKind::Image {
+                    v.zoom = (v.zoom * z).clamp(0.25, 8.0);
+                }
+            }
+            Task::none()
+        }
+        Msg::ViewerPan { dx, dy } => {
+            if let Some(v) = state.viewer.as_mut() {
+                if v.zoom > 1.0 {
+                    v.pan_x += dx;
+                    v.pan_y += dy;
+                }
+            }
+            Task::none()
+        }
+        Msg::ViewerFullBytes(bytes) => {
+            if let Some(v) = state.viewer.as_mut() {
+                if bytes.len() > 8 {
+                    let w = v.video_width;
+                    let _ = w;
+                    v.full_bytes = Some(bytes.clone());
+                    // Upgrade the image to full resolution bytes.
+                    v.image_handle = Some(iced::widget::image::Handle::from_bytes(bytes));
+                    v.error = None;
+                }
+            }
+            Task::none()
+        }
+        Msg::ViewerClose => {
+            state.viewer = None;
+            Task::none()
+        }
+        Msg::ViewerDragStart => {
+            if let Some(v) = state.viewer.as_mut() {
+                v.dragging = true;
+                v.pan_last = None;
+            }
+            Task::none()
+        }
+        Msg::ViewerDragMove(p) => {
+            if let Some(v) = state.viewer.as_mut() {
+                if v.dragging && v.zoom > 1.0 {
+                    if let Some(last) = v.pan_last {
+                        v.pan_x += (p.x - last.x) as f32 / v.zoom;
+                        v.pan_y += (p.y - last.y) as f32 / v.zoom;
+                    }
+                }
+                v.pan_last = Some(p);
+            }
+            Task::none()
+        }
+        Msg::ViewerDragEnd => {
+            if let Some(v) = state.viewer.as_mut() {
+                v.dragging = false;
+            }
+            Task::none()
+        }
+        Msg::ViewerTick => {
+            drain_video_events(state);
+            Task::none()
         }
         Msg::RetryFile(msg_id) => {
             let m = state.messages.iter().find(|m| m.id == msg_id).cloned();
@@ -4421,6 +4644,135 @@ fn open_bytes(mime: &str, name: &str, bytes: &[u8]) {
     let _ = open::that(&path);
 }
 
+fn is_media_mime(mime: &str) -> bool {
+    mime.starts_with("image/")
+        || mime.starts_with("video/")
+        || mime == "application/ogg"
+        || mime == "audio/ogg"
+}
+
+/// Open an attachment in the in-app media viewer. Images are decoded with iced;
+/// videos go through the ffmpeg engine backed by a temp file.
+fn open_media_viewer(state: &mut AppState, mime: &str, title: &str, bytes: Vec<u8>) {
+    if mime.starts_with("video/") || mime == "application/ogg" || mime == "audio/ogg" {
+        let ext = match mime {
+            "video/mp4" => "mp4",
+            "video/webm" => "webm",
+            "video/quicktime" => "mov",
+            "video/x-matroska" => "mkv",
+            "application/ogg" | "audio/ogg" => "ogv",
+            _ => "bin",
+        };
+        let unique = uuid::Uuid::new_v4();
+        let path = std::env::temp_dir().join(format!("ft-media-{unique}.{ext}"));
+        if std::fs::write(&path, &bytes).is_err() {
+            let mut v = ViewerState::empty(title.into(), ViewerKind::Video);
+            v.error = Some("could not stage media file".into());
+            state.viewer = Some(v);
+            return;
+        }
+        open_video_viewer(state, title, path);
+    } else {
+        let mut v = ViewerState::empty(title.into(), ViewerKind::Image);
+        v.image_handle = Some(iced::widget::image::Handle::from_bytes(bytes));
+        state.viewer = Some(v);
+    }
+}
+
+fn open_video_viewer(state: &mut AppState, title: &str, path: std::path::PathBuf) {
+    let engine = MediaEngine::open(path, 0.0, 1.0);
+    let mut v = ViewerState::empty(title.into(), ViewerKind::Video);
+    v.video_rx = Some(engine.events());
+    v.engine = Some(engine);
+    v.play_state = PlayState::Playing;
+    state.viewer = Some(v);
+}
+
+/// Poll the media engine's event channel, coalescing video frames so only the
+/// latest frame is turned into a GPU handle. Control events are applied as-is.
+fn drain_video_events(state: &mut AppState) {
+    let Some(v) = state.viewer.as_mut() else { return };
+    let Some(rx) = &v.video_rx else { return };
+    let mut control = Vec::new();
+    let mut last_frame: Option<MediaEvent> = None;
+    loop {
+        let ev = {
+            let g = rx.lock().unwrap();
+            match g.try_recv() {
+                Ok(e) => e,
+                Err(_) => break,
+            }
+        };
+        match ev {
+            MediaEvent::Frame { .. } => last_frame = Some(ev),
+            other => control.push(other),
+        }
+    }
+    if control.is_empty() && last_frame.is_none() {
+        return;
+    }
+    let mut v = state.viewer.take().unwrap();
+    for ev in control {
+        apply_media_event_inner(&mut v, ev);
+    }
+    if let Some(ev) = last_frame {
+        apply_media_event_inner(&mut v, ev);
+    }
+    state.viewer = Some(v);
+}
+
+fn apply_media_event(state: &mut AppState, ev: MediaEvent) {
+    let Some(mut v) = state.viewer.take() else { return };
+    apply_media_event_inner(&mut v, ev);
+    state.viewer = Some(v);
+}
+
+fn apply_media_event_inner(v: &mut ViewerState, ev: MediaEvent) {
+    match ev {
+        MediaEvent::Opened { duration, has_audio } => {
+            v.video_duration = duration;
+            let _ = has_audio;
+            if let Some(e) = v.engine.as_ref() {
+                let _ = e;
+            }
+            v.play_state = PlayState::Playing;
+            v.error = None;
+        }
+        MediaEvent::Frame { width, height, rgba } => {
+            v.video_width = width;
+            v.video_height = height;
+            v.video_handle =
+                Some(iced::widget::image::Handle::from_rgba(width, height, rgba.to_vec()));
+            v.play_state = PlayState::Playing;
+        }
+        MediaEvent::Ended => {
+            v.play_state = PlayState::Paused;
+            if let Some(e) = v.engine.as_ref() {
+                e.seek(0.0);
+            }
+        }
+        MediaEvent::Error(msg) => {
+            v.error = Some(msg);
+        }
+    }
+}
+
+/// Fetch an embedded/preview image at full resolution with a descriptive UA
+/// (e621.net and friends reject generic browsers).
+async fn fetch_full_media(url: String) -> Result<Option<Vec<u8>>, String> {
+    let client = media_http_client();
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    Ok(Some(bytes.to_vec()))
+}
+
 /// Request P2P transfers for any visible file attachments we don't hold yet.
 /// Idempotent per file (the manager dedupes).
 fn auto_fetch_files(state: &AppState) {
@@ -4722,6 +5074,28 @@ fn preview_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .default_headers(headers)
         .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_default()
+}
+
+/// Client for fetching embedded media at full resolution. Sends a descriptive,
+/// app-like user agent so image hosts (e621.net, e926.net, rule34.xxx, etc.)
+/// that reject generic scrapers still serve the bytes.
+fn media_http_client() -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "User-Agent",
+        reqwest::header::HeaderValue::from_static(
+            "FediTexter/0.1 (media viewer; +https://dergdungeon.com.au)",
+        ),
+    );
+    headers.insert(
+        "Accept",
+        reqwest::header::HeaderValue::from_static("image/avif,image/webp,image/*,*/*;q=0.8"),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .timeout(Duration::from_secs(30))
         .build()
         .unwrap_or_default()
 }
@@ -5566,10 +5940,179 @@ fn view_chat(state: &AppState) -> Element<'_, Msg> {
         layers.push(view_guild_settings(state));
     }
 
+    if state.viewer.is_some() {
+        layers.push(view_media_viewer(state));
+    }
+
     iced::widget::Stack::from_vec(layers)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+}
+
+fn view_media_viewer(state: &AppState) -> Element<'_, Msg> {
+    let ui = ui(state);
+    let Some(v) = &state.viewer else {
+        return iced::widget::Space::new().width(Length::Fill).height(Length::Fill).into();
+    };
+    let close_btn = button(text("✕").size(state.zs(13)).color(ui.text))
+        .on_press(Msg::ViewerClose)
+        .style(button::secondary)
+        .padding([state.z(4.0), state.z(10.0)]);
+
+    let header = row![
+        text(&v.title)
+            .size(state.zs(13))
+            .color(ui.text)
+            .width(Length::Fill),
+        close_btn,
+    ]
+    .spacing(state.z(8))
+    .align_y(iced::Alignment::Center);
+
+    let content: Element<'_, Msg> = match v.kind {
+        ViewerKind::Image => view_viewer_image(state),
+        ViewerKind::Video => view_viewer_video(state),
+    };
+
+    container(column![header, content].spacing(state.z(10)))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(state.z(16))
+        .style(move |_: &iced::Theme| iced::widget::container::Style {
+            background: Some(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.94).into()),
+            ..iced::widget::container::Style::default()
+        })
+        .into()
+}
+
+fn view_viewer_image(state: &AppState) -> Element<'_, Msg> {
+    let ui = ui(state);
+    let Some(v) = &state.viewer else {
+        return iced::widget::Space::new().width(Length::Fill).height(Length::Fill).into();
+    };
+    let Some(handle) = &v.image_handle else {
+        return container(
+            text("no preview available").size(state.zs(13)).color(ui.text_muted),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::Alignment::Center)
+        .align_y(iced::Alignment::Center)
+        .into();
+    };
+    let zoom = v.zoom;
+    let pan = iced::Vector::new(v.pan_x * zoom, v.pan_y * zoom);
+    let img = iced::widget::image::Image::new(handle.clone())
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .content_fit(iced::ContentFit::Contain);
+    let floater = iced::widget::float::Float::new(img)
+        .scale(zoom)
+        .translate(move |_content, _viewport| pan);
+    mouse_area(floater)
+        .on_press(Msg::ViewerDragStart)
+        .on_move(Msg::ViewerDragMove)
+        .on_release(Msg::ViewerDragEnd)
+        .on_scroll(|delta| {
+            let factor = match delta {
+                iced::mouse::ScrollDelta::Lines { y, .. } if y > 0.0 => 1.15,
+                iced::mouse::ScrollDelta::Lines { .. } => 1.0 / 1.15,
+                iced::mouse::ScrollDelta::Pixels { y, .. } if y > 0.0 => 1.15,
+                iced::mouse::ScrollDelta::Pixels { .. } => 1.0 / 1.15,
+            };
+            Msg::ViewerZoom(factor)
+        })
+        .into()
+}
+
+fn view_viewer_video(state: &AppState) -> Element<'_, Msg> {
+    let ui = ui(state);
+    let Some(v) = &state.viewer else {
+        return iced::widget::Space::new().width(Length::Fill).height(Length::Fill).into();
+    };
+    if let Some(msg) = &v.error {
+        return container(
+            text(msg).size(state.zs(13)).color(ui.danger),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::Alignment::Center)
+        .align_y(iced::Alignment::Center)
+        .into();
+    }
+
+    let body: Element<'_, Msg> = match &v.video_handle {
+        Some(h) => iced::widget::image::Image::new(h.clone())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .content_fit(iced::ContentFit::Contain)
+            .into(),
+        None => container(
+            text("Loading…").size(state.zs(14)).color(ui.text_muted),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::Alignment::Center)
+        .align_y(iced::Alignment::Center)
+        .into(),
+    };
+    let body: Element<'_, Msg> = container(mouse_area(body).on_press(Msg::ViewerToggle))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into();
+
+    let pos = v.engine.as_ref().map(|e| e.position_secs()).unwrap_or(0.0) as f64;
+    let dur = if v.video_duration > 0.0 { v.video_duration } else { 0.001 };
+
+    let play_label = if v.play_state == PlayState::Playing { "❚❚" } else { "▶" };
+    let play_btn = button(text(play_label).size(state.zs(14)))
+        .on_press(Msg::ViewerToggle)
+        .style(button::primary)
+        .padding([state.z(6.0), state.z(14.0)]);
+
+    let progress = slider(0.0..=dur, pos.clamp(0.0, dur), Msg::ViewerSeek)
+        .width(Length::Fill);
+
+    let time_el = text(format!("{} / {}", fmt_mmss(pos), fmt_mmss(dur)))
+        .size(state.zs(11))
+        .color(ui.text_muted);
+
+    let vol_el = row![
+        text("🔉").size(state.zs(11)).color(ui.text_muted),
+        slider(0.0..=1.0, v.volume, Msg::ViewerVolume).width(state.z(120.0)),
+    ]
+    .spacing(state.z(6))
+    .align_y(iced::Alignment::Center);
+
+    let raised = ui.raised;
+    let border_c = ui.border;
+    let controls = container(
+        row![play_btn, progress, time_el, vol_el]
+            .spacing(state.z(12))
+            .align_y(iced::Alignment::Center),
+    )
+    .padding([state.z(10.0), state.z(14.0)])
+    .style(move |_: &iced::Theme| iced::widget::container::Style {
+        background: Some(raised.into()),
+        border: iced::Border {
+            radius: 10.0.into(),
+            color: border_c.into(),
+            width: 1.0,
+        },
+        ..iced::widget::container::Style::default()
+    });
+
+    column![body, controls]
+        .spacing(state.z(8))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+fn fmt_mmss(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    format!("{:02}:{:02}", s / 60, s % 60)
 }
 
 fn new_conv_kind_button(state: &AppState, kind: NewConvKind) -> Element<'_, Msg> {
@@ -7062,18 +7605,25 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
             }
             if let Some(preview) = state.link_previews.get(&url) {
                 let mut card_content = column![].spacing(state.z(4));
-                let img_handles: Vec<iced::widget::image::Handle> = preview.images
+                let img_els: Vec<Element<'_, Msg>> = preview.images
                     .iter()
-                    .filter_map(|img| state.media_handles.get(img).cloned())
+                    .filter_map(|img| state.media_handles.get(img).cloned().map(|h| (img.clone(), h)))
+                    .map(|(img_url, handle)| {
+                        let title = preview.title.clone().unwrap_or_else(|| img_url.clone());
+                        mouse_area(
+                            iced::widget::Image::new(handle)
+                                .width(Length::Fill)
+                                .height(Length::Shrink),
+                        )
+                        .on_press(Msg::OpenViewerPreview {
+                            url: img_url,
+                            title,
+                        })
+                        .into()
+                    })
                     .collect();
-                if !img_handles.is_empty() {
-                    let imgs: Vec<Element<'_, Msg>> = img_handles.into_iter().map(|handle| {
-                        iced::widget::Image::new(handle)
-                            .width(Length::Fill)
-                            .height(Length::Shrink)
-                            .into()
-                    }).collect();
-                    card_content = card_content.push(column(imgs).spacing(state.z(4)));
+                if !img_els.is_empty() {
+                    card_content = card_content.push(column(img_els).spacing(state.z(4)));
                 }
                 if let Some(ref title) = preview.title {
                     if !title.is_empty() {
