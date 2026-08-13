@@ -261,7 +261,23 @@ pub async fn login_2fa(
     }
 
     // The pending session was created with a 10-minute expiry; promote it to a
-    // full session now that 2FA passed.
+    // full session now that 2FA passed. Any older login from the same device
+    // is replaced (one session per device).
+    if let Some(dev) = &session.device_id {
+        sqlx::query(
+            "DELETE FROM sessions
+             WHERE user_id = ? AND device_id = ? AND is_2fa_pending = 0 AND id != ?",
+        )
+        .bind(user_id)
+        .bind(dev)
+        .bind(session_id)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| {
+            eprintln!("[sessions] 2fa dedup failed: {e:?}");
+            ApiError::Internal("db error")
+        })?;
+    }
     let days = if body.remember_me.unwrap_or(false) {
         crate::auth::SESSION_DAYS_REMEMBER
     } else {
@@ -362,6 +378,21 @@ async fn create_pending_session(
     device_id: Option<String>,
     login_ip: Option<String>,
 ) -> Result<String, ApiError> {
+    // Drop stale pending sessions for this device (a fresh login attempt
+    // invalidates any earlier in-progress 2FA exchange on the same device).
+    if let Some(dev) = &device_id {
+        sqlx::query(
+            "DELETE FROM sessions WHERE user_id = ? AND device_id = ? AND is_2fa_pending = 1",
+        )
+        .bind(user_id)
+        .bind(dev)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| {
+            eprintln!("[sessions] pending dedup failed: {e:?}");
+            ApiError::Internal("db error")
+        })?;
+    }
     let (token, token_hash) = crate::auth::generate_token_pair();
     let expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::minutes(10);
     sqlx::query(
@@ -401,7 +432,9 @@ pub async fn list_sessions(
     auth: AuthUser,
 ) -> Result<Json<Value>, ApiError> {
     let sessions: Vec<(u64, Option<String>, Option<String>, chrono::NaiveDateTime)> = sqlx::query_as(
-        "SELECT id, device_id, login_ip, created_at FROM sessions WHERE user_id = ? ORDER BY created_at DESC",
+        "SELECT id, device_id, login_ip, created_at FROM sessions
+         WHERE user_id = ? AND is_2fa_pending = 0 AND expires_at > NOW()
+         ORDER BY created_at DESC",
     )
     .bind(auth.user.id)
     .fetch_all(&state.pool)
@@ -664,6 +697,22 @@ async fn create_session(
     device_id: Option<String>,
     login_ip: Option<String>,
 ) -> Result<String, ApiError> {
+    // Reuse a single session per device: a relogin on the same device replaces
+    // the old row instead of piling up one "device" per login.
+    if let Some(dev) = &device_id {
+        sqlx::query(
+            "DELETE FROM sessions
+             WHERE user_id = ? AND device_id = ? AND is_2fa_pending = 0",
+        )
+        .bind(user_id)
+        .bind(dev)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| {
+            eprintln!("[sessions] dedup failed: {e:?}");
+            ApiError::Internal("db error")
+        })?;
+    }
     let (token, token_hash) = crate::auth::generate_token_pair();
     let days = if remember_me {
         crate::auth::SESSION_DAYS_REMEMBER

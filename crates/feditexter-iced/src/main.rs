@@ -184,6 +184,17 @@ struct SearchUser {
     is_bot: bool,
 }
 
+/// A per-user profile visibility override the caller has set: `visible` wins
+/// over the default for that specific user.
+#[derive(serde::Deserialize, Clone, Debug)]
+struct PrivacyOverride {
+    id: u64,
+    username: String,
+    display_name: String,
+    domain: String,
+    visible: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NewConvKind {
     Direct,
@@ -467,6 +478,14 @@ enum Msg {
     ToggleBlock(u64),
     ToggleMute(u64),
     ModerationResult(Result<Profile, String>),
+    PrivacyOverridesLoaded(Result<Vec<PrivacyOverride>, String>),
+    PrivacyDefaultToggled(bool),
+    PrivacyOverrideSet(u64, bool),
+    PrivacyOverrideRemove(u64),
+    PrivacyOverrideUpdated(Result<(), String>),
+    PrivacyAddQueryChanged(String),
+    PrivacyAddSearch,
+    PrivacyAddResults(Result<Vec<SearchUser>, String>),
     TwoFaSetup,
     TwoFaSetupResult(Result<TwoFaSetupInfo, String>),
     TwoFaEnable,
@@ -599,6 +618,10 @@ struct AppState {
     profile_open: bool,
     settings_open: bool,
     display_name_input: String,
+    privacy_overrides: Vec<PrivacyOverride>,
+    privacy_busy: bool,
+    privacy_add_query: String,
+    privacy_add_results: Vec<SearchUser>,
     twofa_setup: Option<TwoFaSetupInfo>,
     twofa_toggle_code: String,
     twofa_busy: bool,
@@ -709,6 +732,10 @@ impl Default for AppState {
             profile_open: false,
             settings_open: false,
             display_name_input: String::new(),
+            privacy_overrides: Vec::new(),
+            privacy_busy: false,
+            privacy_add_query: String::new(),
+            privacy_add_results: Vec::new(),
             twofa_setup: None,
             twofa_toggle_code: String::new(),
             twofa_busy: false,
@@ -1542,6 +1569,14 @@ fn msg_short(msg: &Msg) -> String {
         Msg::ToggleBlock(_) => "ToggleBlock".into(),
         Msg::ToggleMute(_) => "ToggleMute".into(),
         Msg::ModerationResult(_) => "ModerationResult".into(),
+        Msg::PrivacyOverridesLoaded(r) => format!("PrivacyOverridesLoaded({})", if r.is_ok() { "Ok" } else { "Err" }),
+        Msg::PrivacyDefaultToggled(_) => "PrivacyDefaultToggled".into(),
+        Msg::PrivacyOverrideSet(_, _) => "PrivacyOverrideSet".into(),
+        Msg::PrivacyOverrideRemove(_) => "PrivacyOverrideRemove".into(),
+        Msg::PrivacyOverrideUpdated(_) => "PrivacyOverrideUpdated".into(),
+        Msg::PrivacyAddQueryChanged(_) => "PrivacyAddQueryChanged".into(),
+        Msg::PrivacyAddSearch => "PrivacyAddSearch".into(),
+        Msg::PrivacyAddResults(_) => "PrivacyAddResults".into(),
         Msg::TwoFaSetup => "TwoFaSetup".into(),
         Msg::TwoFaSetupResult(_) => "TwoFaSetupResult".into(),
         Msg::TwoFaEnable => "TwoFaEnable".into(),
@@ -2164,6 +2199,75 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                 }
             }, Msg::SettingsResult)
         }
+        Msg::PrivacyOverridesLoaded(Ok(overrides)) => {
+            state.privacy_busy = false;
+            state.privacy_overrides = overrides;
+            Task::none()
+        }
+        Msg::PrivacyOverridesLoaded(Err(e)) => { state.privacy_busy = false; handle_api_error(state, e) }
+        Msg::PrivacyDefaultToggled(visible) => {
+            if state.user.as_ref().map(|u| u.profile_visible) == Some(!visible) {
+                state.user.as_mut().map(|u| u.profile_visible = visible);
+            }
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            Task::perform(async move {
+                let client = make_client();
+                let resp = client.patch(format!("{server}/api/me"))
+                    .bearer_auth(&token)
+                    .json(&serde_json::json!({ "profile_visible": visible }))
+                    .send().await;
+                match resp {
+                    Ok(r) => {
+                        auth_aware_error(&r)?;
+                        let v: serde_json::Value = r.json().await.unwrap_or_default();
+                        serde_json::from_value::<User>(v.get("user").cloned().unwrap_or_default())
+                            .map_err(|_| String::from("parse error"))
+                    }
+                    Err(e) => Err(format!("{e}")),
+                }
+            }, Msg::SettingsResult)
+        }
+        Msg::PrivacyOverrideSet(target_id, visible) => {
+            if state.user.as_ref().map(|u| u.id) == Some(target_id) {
+                return Task::none();
+            }
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            Task::perform(
+                set_privacy_override_api(server, token, target_id, visible),
+                Msg::PrivacyOverrideUpdated,
+            )
+        }
+        Msg::PrivacyOverrideRemove(target_id) => {
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            Task::perform(
+                remove_privacy_override_api(server, token, target_id),
+                Msg::PrivacyOverrideUpdated,
+            )
+        }
+        Msg::PrivacyOverrideUpdated(Ok(())) => {
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            Task::perform(get_privacy_overrides_api(server, token), Msg::PrivacyOverridesLoaded)
+        }
+        Msg::PrivacyOverrideUpdated(Err(e)) => handle_api_error(state, e),
+        Msg::PrivacyAddQueryChanged(q) => { state.privacy_add_query = q; state.privacy_add_results.clear(); Task::none() }
+        Msg::PrivacyAddSearch => {
+            let q = state.privacy_add_query.trim().to_string();
+            if q.is_empty() {
+                return Task::none();
+            }
+            let server = state.server.clone();
+            let token = state.token.clone().unwrap_or_default();
+            Task::perform(search_users_api(server, token, q), Msg::PrivacyAddResults)
+        }
+        Msg::PrivacyAddResults(Ok(users)) => {
+            state.privacy_add_results = users;
+            Task::none()
+        }
+        Msg::PrivacyAddResults(Err(e)) => handle_api_error(state, e),
         Msg::SessionsLoaded(Ok(sessions)) => { state.sessions_busy = false; state.sessions = sessions; Task::none() }
         Msg::SessionsLoaded(Err(e)) => { state.sessions_busy = false; handle_api_error(state, e) }
         Msg::RevokeSession(session_id) => {
@@ -2397,7 +2501,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
         Msg::ShowProfile(user_id) => {
             let token = state.token.clone().unwrap_or_default();
             let server = state.server.clone();
-            Task::perform(async move {
+            let tasks = Task::perform(async move {
                 let client = make_client();
                 let resp = client.get(format!("{server}/api/users/{user_id}"))
                     .bearer_auth(&token).send().await;
@@ -2413,7 +2517,16 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                     }
                     Err(e) => Err(format!("{e}")),
                 }
-            }, |r: Result<Profile, String>| match r { Ok(p) => Msg::ProfileLoaded(p), Err(e) => Msg::Error(e) })
+            }, |r: Result<Profile, String>| match r { Ok(p) => Msg::ProfileLoaded(p), Err(e) => Msg::Error(e) });
+            // Keep the profile modal's privacy state in sync.
+            if !state.privacy_busy && state.privacy_overrides.is_empty() {
+                state.privacy_busy = true;
+                let server = state.server.clone();
+                let token = state.token.clone().unwrap_or_default();
+                tasks.chain(Task::perform(get_privacy_overrides_api(server, token), Msg::PrivacyOverridesLoaded))
+            } else {
+                tasks
+            }
         }
         Msg::ProfileLoaded(p) => { state.profile = Some(p); state.profile_open = true; ensure_avatars(state) }
         Msg::CloseProfile => { state.profile_open = false; Task::none() }
@@ -2997,6 +3110,12 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                 }
                 if state.accent_hex_input.is_empty() {
                     state.accent_hex_input = accent_to_hex(state.accent);
+                }
+                if !state.privacy_busy {
+                    state.privacy_busy = true;
+                    let server = state.server.clone();
+                    let token = state.token.clone().unwrap_or_default();
+                    return Task::perform(get_privacy_overrides_api(server, token), Msg::PrivacyOverridesLoaded);
                 }
             }
             Task::none()
@@ -3889,6 +4008,43 @@ async fn search_users_api(server: String, token: String, q: String) -> Result<Ve
             serde_json::from_value(v.get("users").cloned().unwrap_or_default())
                 .map_err(|e| format!("parse error: {e}"))
         }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn get_privacy_overrides_api(server: String, token: String) -> Result<Vec<PrivacyOverride>, String> {
+    let client = make_client();
+    let resp = client.get(format!("{server}/api/me/privacy")).bearer_auth(&token).send().await;
+    match resp {
+        Ok(r) => {
+            auth_aware_error(&r)?;
+            let v: serde_json::Value = r.json().await.unwrap_or_default();
+            serde_json::from_value(v.get("overrides").cloned().unwrap_or_default())
+                .map_err(|e| format!("parse error: {e}"))
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn set_privacy_override_api(server: String, token: String, target_id: u64, visible: bool) -> Result<(), String> {
+    let client = make_client();
+    let resp = client.put(format!("{server}/api/me/privacy/{target_id}"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "visible": visible }))
+        .send().await;
+    match resp {
+        Ok(r) => auth_aware_error(&r),
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+async fn remove_privacy_override_api(server: String, token: String, target_id: u64) -> Result<(), String> {
+    let client = make_client();
+    let resp = client.delete(format!("{server}/api/me/privacy/{target_id}"))
+        .bearer_auth(&token)
+        .send().await;
+    match resp {
+        Ok(r) => auth_aware_error(&r),
         Err(e) => Err(format!("{e}")),
     }
 }
@@ -5213,6 +5369,46 @@ fn view_chat(state: &AppState) -> Element<'_, Msg> {
                 info = info.push(mod_row);
             }
 
+            // Per-user privacy: your profile visibility for this specific person.
+            if !profile.is_self {
+                let existing = state.privacy_overrides.iter().find(|o| o.id == profile.id);
+                let current: Option<bool> = existing.map(|o| o.visible);
+                let show_btn = button(text("Show my profile").size(state.zs(11)))
+                    .on_press(Msg::PrivacyOverrideSet(profile.id, true))
+                    .style(if current == Some(true) { button::primary } else { button::secondary })
+                    .padding([state.z(4.0), state.z(10.0)]);
+                let hide_btn = button(text("Hide my profile").size(state.zs(11)))
+                    .on_press(Msg::PrivacyOverrideSet(profile.id, false))
+                    .style(if current == Some(false) { button::primary } else { button::secondary })
+                    .padding([state.z(4.0), state.z(10.0)]);
+                let mut privacy_row = row![show_btn, hide_btn].spacing(state.z(6));
+                if current.is_some() {
+                    privacy_row = privacy_row.push(
+                        button(text("Use default").size(state.zs(11)))
+                            .on_press(Msg::PrivacyOverrideRemove(profile.id))
+                            .style(button::text)
+                            .padding(state.z(0)),
+                    );
+                }
+                let status_label = match current {
+                    Some(true) => "You're shown to them",
+                    Some(false) => "Hidden from them",
+                    None => "Using your default",
+                };
+                info = info.push(
+                    container(
+                        column![
+                            text("Privacy").size(state.zs(11)).color(ui.text_muted),
+                            text(status_label).size(state.zs(11)).color(ui.text_muted),
+                            privacy_row,
+                        ].spacing(state.z(6)).align_x(iced::Alignment::Center),
+                    )
+                    .padding([state.z(8.0), state.z(12.0)])
+                    .width(Length::Fill)
+                    .style(composer_style)
+                );
+            }
+
             info = info.push(close_btn);
 
             let card = container(info)
@@ -6126,19 +6322,114 @@ fn view_settings(state: &AppState) -> Element<'_, Msg> {
         twofa_section,
     ].spacing(state.z(12));
 
-    // Privacy tab: profile visibility.
+    // Privacy tab: profile visibility. A default (hide/show) applies to
+    // everyone, and per-user SHOW/HIDE overrides take precedence for specific
+    // users.
     let profile_visible = state.user.as_ref().map(|u| u.profile_visible).unwrap_or(true);
-    let privacy_tab = column![
-        rule::horizontal(1),
-        text("Profile visibility").size(state.zs(14)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
-        text("When hidden, other users can still find and message you, but your profile (bio, avatar) appears bare-bones.").size(state.zs(11)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+    let overrides = &state.privacy_overrides;
+
+    let default_section = column![
+        text("Default profile visibility").size(state.zs(14)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
+        text("Applies to everyone. You can override it below for individual users.").size(state.zs(11)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
         row![
             text(if profile_visible { "Visible to everyone" } else { "Hidden (bare-bones for others)" }).size(state.zs(12)),
             space::horizontal(),
             button(text(if profile_visible { "Hide" } else { "Show" }).size(state.zs(12)))
-                .on_press(Msg::ProfileVisibleToggled(!profile_visible))
+                .on_press(Msg::PrivacyDefaultToggled(!profile_visible))
                 .padding([state.z(5.0), state.z(12.0)]),
         ].spacing(state.z(8)).align_y(iced::Alignment::Center),
+    ].spacing(state.z(8));
+
+    let mut override_rows: Vec<Element<'_, Msg>> = Vec::new();
+    if overrides.is_empty() {
+        override_rows.push(
+            text("No per-user overrides yet").size(state.zs(12)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)).into(),
+        );
+    }
+    for o in overrides {
+        let name = if o.display_name.is_empty() { o.username.clone() } else { o.display_name.clone() };
+        let show_btn = button(text("Show").size(state.zs(11)))
+            .on_press(Msg::PrivacyOverrideSet(o.id, true))
+            .style(if o.visible { button::primary } else { button::secondary })
+            .padding([state.z(4.0), state.z(10.0)]);
+        let hide_btn = button(text("Hide").size(state.zs(11)))
+            .on_press(Msg::PrivacyOverrideSet(o.id, false))
+            .style(if o.visible { button::secondary } else { button::primary })
+            .padding([state.z(4.0), state.z(10.0)]);
+        let remove_btn = button(text("Remove").size(state.zs(11)).color(iced::Color::from_rgb(0.9, 0.44, 0.4)))
+            .on_press(Msg::PrivacyOverrideRemove(o.id))
+            .style(button::text)
+            .padding(state.z(0));
+        let row_el = container(
+            row![
+                column![
+                    text(name.clone()).size(state.zs(12)),
+                    text(format!("@{}{}", o.username, if o.domain.is_empty() { String::new() } else { format!("@{}", o.domain) })).size(state.zs(10)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+                ].spacing(state.z(2)),
+                space::horizontal(),
+                show_btn,
+                hide_btn,
+                remove_btn,
+            ].spacing(state.z(6)).align_y(iced::Alignment::Center),
+        )
+        .padding([state.z(6.0), state.z(10.0)])
+        .style(composer_style);
+        override_rows.push(row_el.into());
+    }
+
+    let override_section = column![
+        text("Per-user overrides").size(state.zs(14)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
+        text("Search a username, then choose Show or Hide to set that person's view of your profile.").size(state.zs(11)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+        row![
+            text_input("Search username to override…", &state.privacy_add_query)
+                .on_input(Msg::PrivacyAddQueryChanged)
+                .on_submit(Msg::PrivacyAddSearch)
+                .width(Length::Fixed(state.z(240.0))),
+            button(text("Search").size(state.zs(12)))
+                .on_press(Msg::PrivacyAddSearch)
+                .padding([state.z(5.0), state.z(12.0)]),
+        ].spacing(state.z(6)).align_y(iced::Alignment::Center),
+        column(override_rows).spacing(state.z(6)),
+    ].spacing(state.z(8));
+
+    let add_results = state.privacy_add_results.iter()
+        .filter(|u| !overrides.iter().any(|o| o.id == u.id))
+        .map(|u| {
+            let name = if u.display_name.is_empty() { u.username.clone() } else { u.display_name.clone() };
+            let from = if u.domain.is_empty() { String::new() } else { format!("@{}", u.domain) };
+            let row_el = container(
+                row![
+                    column![
+                        text(name.clone()).size(state.zs(12)),
+                        text(format!("@{}{from}", u.username)).size(state.zs(10)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+                    ].spacing(state.z(2)),
+                    space::horizontal(),
+                    button(text("Show").size(state.zs(11)))
+                        .on_press(Msg::PrivacyOverrideSet(u.id, true))
+                        .style(button::primary)
+                        .padding([state.z(4.0), state.z(10.0)]),
+                    button(text("Hide").size(state.zs(11)))
+                        .on_press(Msg::PrivacyOverrideSet(u.id, false))
+                        .padding([state.z(4.0), state.z(10.0)]),
+                ].spacing(state.z(6)).align_y(iced::Alignment::Center),
+            )
+            .padding([state.z(6.0), state.z(10.0)])
+            .style(composer_style);
+            row_el.into()
+        })
+        .collect::<Vec<Element<'_, Msg>>>();
+
+    let privacy_tab = column![
+        rule::horizontal(1),
+        default_section,
+        rule::horizontal(1),
+        override_section,
+        if add_results.is_empty() {
+            let spacer: Element<'_, Msg> = space::horizontal().into();
+            spacer
+        } else {
+            column(add_results).spacing(state.z(6)).into()
+        },
     ].spacing(state.z(10));
 
     // Devices tab: logged-in sessions.

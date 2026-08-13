@@ -1,5 +1,6 @@
 use axum::extract::{Path, State};
 use axum::Json;
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::api::error::ApiError;
@@ -74,9 +75,29 @@ async fn profile_value(state: &AppState, viewer_id: u64, target_id: u64) -> Resu
     let muted = !is_self && is_muted(state, viewer_id, target_id).await?;
     let blocked_by = !is_self && is_blocked(state, target_id, viewer_id).await?;
 
-    // Privacy: when the target hides their profile, other users only see a
-    // bare-bones record (no avatar, no bio). Their own profile is always full.
-    if !is_self && !profile_visible {
+    // Default visibility: users.profile_visible. A per-user override for this
+    // viewer (set by the target) wins over the default when present.
+    let mut effective_visible = profile_visible;
+    if !is_self {
+        let override_row: Option<bool> = sqlx::query_scalar(
+            "SELECT visible FROM privacy_overrides WHERE user_id = ? AND target_id = ?",
+        )
+        .bind(target_id)
+        .bind(viewer_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| {
+            eprintln!("[mod] override select failed: {e:?}");
+            ApiError::Internal("db error")
+        })?;
+        if let Some(v) = override_row {
+            effective_visible = v;
+        }
+    }
+
+    // Privacy: when the target hides their profile from this viewer, only a
+    // bare-bones record is returned (no avatar, no bio). Own profile is full.
+    if !is_self && !effective_visible {
         return Ok(json!({
             "id": target_id,
             "username": username,
@@ -182,4 +203,112 @@ pub async fn unmute_user(
         .await
         .map_err(|_| ApiError::Internal("db error"))?;
     Ok(Json(json!({ "user": profile_value(&state, auth.user.id, user_id).await? })))
+}
+
+// ---------------------------------------------------------------------------
+// Privacy: default profile visibility + per-user SHOW/HIDE overrides
+// ---------------------------------------------------------------------------
+
+/// Result of the caller's privacy settings: their default visibility and every
+/// per-user override they have set.
+pub async fn list_privacy(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> Result<Json<Value>, ApiError> {
+    let default: bool = sqlx::query_scalar("SELECT profile_visible FROM users WHERE id = ?")
+        .bind(auth.user.id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|e| {
+            eprintln!("[privacy] default select failed: {e:?}");
+            ApiError::Internal("db error")
+        })?;
+
+    let overrides: Vec<(u64, String, String, Option<String>, bool)> = sqlx::query_as(
+        "SELECT u.id, u.username, u.display_name, s.domain, po.visible
+         FROM privacy_overrides po
+         JOIN users u ON u.id = po.target_id
+         LEFT JOIN servers s ON s.id = u.server_id
+         WHERE po.user_id = ?
+         ORDER BY u.username",
+    )
+    .bind(auth.user.id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| {
+        eprintln!("[privacy] overrides select failed: {e:?}");
+        ApiError::Internal("db error")
+    })?;
+
+    let domain = state.federation.domain.clone();
+    let overrides = overrides
+        .into_iter()
+        .map(|(id, username, display_name, srv_domain, visible)| json!({
+            "id": id,
+            "username": username,
+            "display_name": display_name,
+            "domain": srv_domain.unwrap_or_else(|| domain.clone()),
+            "visible": visible,
+        }))
+        .collect::<Vec<_>>();
+
+    Ok(Json(json!({ "default": default, "overrides": overrides })))
+}
+
+#[derive(Deserialize)]
+pub struct PrivacyOverrideRequest {
+    pub visible: bool,
+}
+
+/// Set (upsert) a per-user SHOW/HIDE override for what `target_id` sees of the
+/// caller's profile.
+pub async fn set_privacy_override(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(target_id): Path<u64>,
+    Json(body): Json<PrivacyOverrideRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if target_id == auth.user.id {
+        return Err(ApiError::BadRequest("cannot set an override for yourself"));
+    }
+    let exists: bool = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE id = ?")
+        .bind(target_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?
+        > 0;
+    if !exists {
+        return Err(ApiError::NotFound("user not found"));
+    }
+
+    sqlx::query(
+        "INSERT INTO privacy_overrides (user_id, target_id, visible) VALUES (?, ?, ?)
+         ON DUPLICATE KEY UPDATE visible = VALUES(visible)",
+    )
+    .bind(auth.user.id)
+    .bind(target_id)
+    .bind(body.visible)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| {
+        eprintln!("[privacy] override upsert failed: {e:?}");
+        ApiError::Internal("db error")
+    })?;
+
+    Ok(Json(json!({ "status": "ok", "visible": body.visible })))
+}
+
+/// Remove a per-user privacy override, falling back to the default.
+pub async fn remove_privacy_override(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(target_id): Path<u64>,
+) -> Result<Json<Value>, ApiError> {
+    sqlx::query("DELETE FROM privacy_overrides WHERE user_id = ? AND target_id = ?")
+        .bind(auth.user.id)
+        .bind(target_id)
+        .execute(&state.pool)
+        .await
+        .map_err(|_| ApiError::Internal("db error"))?;
+    Ok(Json(json!({ "status": "ok" })))
 }

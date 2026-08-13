@@ -7,7 +7,7 @@ pub mod federation;
 pub mod mail;
 pub mod tui;
 
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 use api::auth_handlers::{
     list_sessions, login, login_2fa, logout, me, register, resend_verification, revoke_session,
@@ -23,7 +23,10 @@ use api::guilds::{
     delete_channel, delete_guild, delete_role, guild_detail, join_guild, kick_member, leave_guild,
     list_guilds, rename_channel, revoke_invite, set_role, transfer_owner, unban_member,
 };
-use api::moderation::{block_user, mute_user, unblock_user, unmute_user, user_profile};
+use api::moderation::{
+    block_user, list_privacy, mute_user, remove_privacy_override, set_privacy_override, unblock_user,
+    unmute_user, user_profile,
+};
 use api::preview::link_preview;
 use api::stickers::{
     add_sticker, create_sticker_pack, delete_sticker, delete_sticker_pack, list_sticker_packs,
@@ -45,6 +48,8 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/me/avatar", post(set_avatar))
         .route("/api/me/sessions", get(list_sessions))
         .route("/api/me/sessions/{session_id}", delete(revoke_session))
+        .route("/api/me/privacy", get(list_privacy))
+        .route("/api/me/privacy/{target_id}", put(set_privacy_override).delete(remove_privacy_override))
         .route("/api/me/2fa/setup", post(two_fa_setup))
         .route("/api/me/2fa/enable", post(two_fa_enable))
         .route("/api/verify", post(verify))
