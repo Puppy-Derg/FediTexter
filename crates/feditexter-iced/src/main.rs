@@ -884,6 +884,8 @@ struct UiColors {
     text: iced::Color,
     /// Secondary text.
     text_muted: iced::Color,
+    /// Destructive / error highlights.
+    danger: iced::Color,
     accent: iced::Color,
     accent_light: iced::Color,
     accent_dark: iced::Color,
@@ -898,6 +900,7 @@ fn ui(state: &AppState) -> UiColors {
         border: iced::Color::from_rgb(0.22, 0.25, 0.30),
         text: iced::Color::from_rgb(0.93, 0.94, 0.97),
         text_muted: iced::Color::from_rgb(0.56, 0.59, 0.65),
+        danger: iced::Color::from_rgb(0.86, 0.31, 0.31),
         accent,
         accent_light: accent_light(accent),
         accent_dark: accent_dark(accent),
@@ -5111,6 +5114,7 @@ fn clamp_menu_pos(state: &AppState, x: f32, y: f32, w: f32, h: f32) -> (f32, f32
 }
 
 fn view_chat(state: &AppState) -> Element<'_, Msg> {
+    let ui = ui(state);
     if state.settings_open {
         return view_settings(state);
     }
@@ -5132,9 +5136,9 @@ fn view_chat(state: &AppState) -> Element<'_, Msg> {
             let avatar = avatar_element(state, profile.id, &profile.display_name, 64.0);
 
             let username_el: Element<'_, Msg> = if profile.is_self {
-                text(format!("@{}", profile.username)).size(state.zs(14)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)).into()
+                text(format!("@{}", profile.username)).size(state.zs(14)).color(ui.text_muted).into()
             } else {
-                button(text(format!("@{}", profile.username)).size(state.zs(14)).color(state.accent))
+                button(text(format!("@{}", profile.username)).size(state.zs(14)).color(ui.accent))
                     .on_press(Msg::NewConvWithUser(profile.id))
                     .style(button::text)
                     .padding(state.z(0))
@@ -5145,15 +5149,15 @@ fn view_chat(state: &AppState) -> Element<'_, Msg> {
                 avatar,
                 text(&profile.display_name).size(state.zs(20)),
                 username_el,
-                text(&profile.domain).size(state.zs(12)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+                text(&profile.domain).size(state.zs(12)).color(ui.text_muted),
             ].spacing(state.z(8)).align_x(iced::Alignment::Center);
 
             if profile.is_bot {
                 info = info.push(
                     container(text("BOT").size(state.zs(9)).color(iced::Color::WHITE))
                         .padding([state.z(2.0), state.z(8.0)])
-                        .style(|_: &iced::Theme| iced::widget::container::Style {
-                            background: Some(iced::Color::from_rgb(0.4, 0.6, 0.8).into()),
+                        .style(move |_: &iced::Theme| iced::widget::container::Style {
+                            background: Some(ui.accent.into()),
                             border: iced::Border { radius: 8.0.into(), ..iced::Border::default() },
                             ..iced::widget::container::Style::default()
                         })
@@ -5164,13 +5168,13 @@ fn view_chat(state: &AppState) -> Element<'_, Msg> {
                 info = info.push(
                     container(row![
                         text("🔒").size(state.zs(12)),
-                        text("This profile is private — no bio or avatar shown").size(state.zs(11)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
+                        text("This profile is private — no bio or avatar shown").size(state.zs(11)).color(ui.text_muted),
                     ].spacing(state.z(6)).align_y(iced::Alignment::Center))
                         .padding([state.z(6.0), state.z(12.0)])
                         .style(composer_style)
                 );
             } else if !profile.bio.is_empty() {
-                info = info.push(text(&profile.bio).size(state.zs(13)).color(iced::Color::from_rgb(0.75, 0.75, 0.75)));
+                info = info.push(text(&profile.bio).size(state.zs(13)).color(ui.text_muted));
             }
 
             if !profile.is_self {
@@ -5183,10 +5187,10 @@ fn view_chat(state: &AppState) -> Element<'_, Msg> {
             }
 
             if profile.blocked {
-                info = info.push(text("Blocked").size(state.zs(12)).color(iced::Color::from_rgb(0.9, 0.3, 0.2)));
+                info = info.push(text("Blocked").size(state.zs(12)).color(ui.danger));
             }
             if profile.muted {
-                info = info.push(text("Muted").size(state.zs(12)).color(iced::Color::from_rgb(0.9, 0.7, 0.2)));
+                info = info.push(text("Muted").size(state.zs(12)).color(iced::Color::from_rgb(0.95, 0.68, 0.22)));
             }
 
             if !profile.is_self && !profile.blocked_by {
@@ -5214,18 +5218,15 @@ fn view_chat(state: &AppState) -> Element<'_, Msg> {
             let card = container(info)
                 .padding(state.z(24))
                 .max_width(state.z(320))
-                .style(|theme: &iced::Theme| {
-                    let p = theme.extended_palette();
-                    iced::widget::container::Style {
-                        background: Some(p.background.weakest.color.into()),
-                        border: iced::Border {
-                            width: 1.0,
-                            color: p.background.weak.color,
-                            radius: 12.0.into(),
-                        },
-                        shadow: iced::Shadow { color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.3), offset: iced::Vector::new(0.0, 4.0), blur_radius: 8.0 },
-                        ..iced::widget::container::Style::default()
-                    }
+                .style(move |_: &iced::Theme| iced::widget::container::Style {
+                    background: Some(ui.raised.into()),
+                    border: iced::Border {
+                        width: 1.0,
+                        color: ui.border,
+                        radius: 12.0.into(),
+                    },
+                    shadow: iced::Shadow { color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.3), offset: iced::Vector::new(0.0, 4.0), blur_radius: 16.0 },
+                    ..iced::widget::container::Style::default()
                 });
 
             let card_wrapped = mouse_area(card).on_press(Msg::Noop);
@@ -5258,18 +5259,15 @@ fn view_chat(state: &AppState) -> Element<'_, Msg> {
         let menu = container(menu_items)
             .padding(state.z(4))
             .max_width(state.z(180))
-            .style(|theme: &iced::Theme| {
-                let p = theme.extended_palette();
-                iced::widget::container::Style {
-                    background: Some(p.background.weakest.color.into()),
-                    border: iced::Border {
-                        width: 1.0,
-                        color: p.background.weak.color,
-                        radius: 8.0.into(),
-                    },
-                    shadow: iced::Shadow { color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.3), offset: iced::Vector::new(0.0, 4.0), blur_radius: 8.0 },
-                    ..iced::widget::container::Style::default()
-                }
+            .style(move |_: &iced::Theme| iced::widget::container::Style {
+                background: Some(ui.raised.into()),
+                border: iced::Border {
+                    width: 1.0,
+                    color: ui.border,
+                    radius: 8.0.into(),
+                },
+                shadow: iced::Shadow { color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.3), offset: iced::Vector::new(0.0, 4.0), blur_radius: 12.0 },
+                ..iced::widget::container::Style::default()
             });
 
         let (mut cx, mut cy) = state.conv_menu_pos.unwrap_or((0.0, 0.0));
@@ -5306,18 +5304,15 @@ fn view_chat(state: &AppState) -> Element<'_, Msg> {
         let menu = container(menu_items)
             .padding(state.z(4))
             .max_width(state.z(160))
-            .style(|theme: &iced::Theme| {
-                let p = theme.extended_palette();
-                iced::widget::container::Style {
-                    background: Some(p.background.weakest.color.into()),
-                    border: iced::Border {
-                        width: 1.0,
-                        color: p.background.weak.color,
-                        radius: 8.0.into(),
-                    },
-                    shadow: iced::Shadow { color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.3), offset: iced::Vector::new(0.0, 4.0), blur_radius: 8.0 },
-                    ..iced::widget::container::Style::default()
-                }
+            .style(move |_: &iced::Theme| iced::widget::container::Style {
+                background: Some(ui.raised.into()),
+                border: iced::Border {
+                    width: 1.0,
+                    color: ui.border,
+                    radius: 8.0.into(),
+                },
+                shadow: iced::Shadow { color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.3), offset: iced::Vector::new(0.0, 4.0), blur_radius: 12.0 },
+                ..iced::widget::container::Style::default()
             });
         let (mut cx, mut cy) = state.context_menu_pos.unwrap_or((0.0, 0.0));
         (cx, cy) = clamp_menu_pos(state, cx, cy, 170.0, 140.0);
@@ -5337,18 +5332,15 @@ fn view_chat(state: &AppState) -> Element<'_, Msg> {
             text(body.as_str()).size(state.zs(14)),
             close_btn,
         ].spacing(state.z(12)).padding(state.z(20)).max_width(state.z(500)))
-            .style(|theme: &iced::Theme| {
-                let p = theme.extended_palette();
-                iced::widget::container::Style {
-                    background: Some(p.background.weakest.color.into()),
-                    border: iced::Border {
-                        width: 1.0,
-                        color: p.background.weak.color,
-                        radius: 12.0.into(),
-                    },
-                    shadow: iced::Shadow { color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.3), offset: iced::Vector::new(0.0, 4.0), blur_radius: 8.0 },
-                    ..iced::widget::container::Style::default()
-                }
+            .style(move |_: &iced::Theme| iced::widget::container::Style {
+                background: Some(ui.raised.into()),
+                border: iced::Border {
+                    width: 1.0,
+                    color: ui.border,
+                    radius: 12.0.into(),
+                },
+                shadow: iced::Shadow { color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.3), offset: iced::Vector::new(0.0, 4.0), blur_radius: 16.0 },
+                ..iced::widget::container::Style::default()
             });
         let card_wrapped = mouse_area(card).on_press(Msg::Noop);
         let overlay = mouse_area(
@@ -5388,7 +5380,7 @@ fn new_conv_kind_button(state: &AppState, kind: NewConvKind) -> Element<'_, Msg>
     let selected = state.new_conv_kind == kind;
     let label = column![
         text(kind.label()).size(state.zs(13)),
-        text(kind.description()).size(state.zs(10)).color(iced::Color::from_rgb(0.75, 0.75, 0.75)),
+        text(kind.description()).size(state.zs(10)).color(iced::Color::from_rgb(0.66, 0.69, 0.75)),
     ].spacing(state.z(2)).align_x(iced::Alignment::Center).width(Length::Fill);
     button(label)
         .on_press(Msg::NewConvKindChanged(kind))
@@ -6576,12 +6568,13 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
 }
 
  fn view_chat_area(state: &AppState) -> Element<'_, Msg> {
+    let ui = ui(state);
     let Some(conv_id) = state.selected_conversation else {
         let placeholder: Element<'_, Msg> = container(
             column![
-                text("FediTexter").size(state.zs(28)),
-                text("Select a conversation").size(state.zs(14)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
-            ].spacing(state.z(8)).align_x(iced::Alignment::Center)
+                text("FediTexter").size(state.zs(28)).color(ui.accent_light),
+                text("Select a conversation to start chatting").size(state.zs(14)).color(ui.text_muted),
+            ].spacing(state.z(6)).align_x(iced::Alignment::Center)
         )
         .center_x(Length::Fill)
         .center_y(Length::Fill)
@@ -6643,7 +6636,7 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
     } else {
         "Offline".to_string()
     };
-    let status_color = if online { iced::Color::from_rgb(0.3, 0.8, 0.3) } else { iced::Color::from_rgb(0.5, 0.5, 0.5) };
+    let status_color = if online { iced::Color::from_rgb(0.31, 0.75, 0.42) } else { ui.text_muted };
 
     let typing_text = state.typing.get(&conv_id)
         .filter(|(_, at)| at.elapsed() < Duration::from_secs(3))
@@ -6691,7 +6684,7 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
             header_avatar_btn,
             column![
                 header_name_el,
-                text(typing_text).size(state.zs(11)).color(iced::Color::from_rgb(0.49, 0.36, 0.88)),
+                text(typing_text).size(state.zs(11)).color(ui.accent_light),
             ].spacing(state.z(2)),
         ].spacing(state.z(10)).align_y(iced::Alignment::Center)
     };
@@ -6710,7 +6703,7 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
 
         let sender_name_widget = button(
             text(sender_label.clone()).size(state.zs(11))
-                .color(if is_self { iced::Color::from_rgba(1.0, 1.0, 1.0, 0.6) } else { iced::Color::from_rgba(0.0, 0.0, 0.0, 0.5) })
+                .color(if is_self { iced::Color::from_rgba(1.0, 1.0, 1.0, 0.8) } else { iced::Color::from_rgb(0.72, 0.75, 0.82) })
         )
         .on_press(Msg::ShowProfile(m.sender_id))
         .padding(state.z(0))
@@ -6718,7 +6711,7 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
 
         let sender_line = row![
             sender_name_widget,
-            text(format!(" · {time}")).size(state.zs(11)).color(if is_self { iced::Color::from_rgba(1.0, 1.0, 1.0, 0.4) } else { iced::Color::from_rgba(0.0, 0.0, 0.0, 0.35) }),
+            text(format!(" · {time}")).size(state.zs(11)).color(if is_self { iced::Color::from_rgba(1.0, 1.0, 1.0, 0.6) } else { iced::Color::from_rgb(0.5, 0.53, 0.6) }),
         ].spacing(state.z(0)).align_y(iced::Alignment::Center);
 
         let body_elements: Vec<Element<'_, Msg>> = m.body.split('\n').flat_map(|line| {
@@ -6732,7 +6725,7 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
                     let url_end = remaining[start..].find(|c: char| c.is_whitespace()).unwrap_or(remaining[start..].len());
                     let url = &remaining[start..start + url_end];
                     segments.push(
-                        button(text(url).size(state.zs(14)).color(iced::Color::from_rgb(0.6, 0.8, 1.0)))
+                        button(text(url).size(state.zs(14)).color(ui.accent_light))
                             .on_press(Msg::OpenLink(url.to_string()))
                             .style(button::text)
                             .padding(state.z(0))
@@ -6758,23 +6751,20 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
         for url in extract_urls(&m.body) {
             if state.preview_loading.contains(&url) {
                 let loading_card = container(
-                    row![throbber(state.z(16)), text("Loading preview…").size(state.zs(11)).color(iced::Color::from_rgb(0.5, 0.5, 0.5))]
+                    row![throbber(state.z(16)), text("Loading preview…").size(state.zs(11)).color(ui.text_muted)]
                         .spacing(state.z(8))
                         .align_y(iced::Alignment::Center)
                 )
                 .padding(state.z(8))
                 .max_width(state.z(380))
-                .style(|theme: &iced::Theme| {
-                    let p = theme.extended_palette();
-                    iced::widget::container::Style {
-                        background: Some(p.background.weak.color.into()),
-                        border: iced::Border {
-                            width: 1.0,
-                            color: p.background.weak.color,
-                            radius: 8.0.into(),
-                        },
-                        ..iced::widget::container::Style::default()
-                    }
+                .style(move |_: &iced::Theme| iced::widget::container::Style {
+                    background: Some(ui.raised.into()),
+                    border: iced::Border {
+                        width: 1.0,
+                        color: ui.border,
+                        radius: 8.0.into(),
+                    },
+                    ..iced::widget::container::Style::default()
                 });
                 bubble_content = bubble_content.push(loading_card);
                 continue;
@@ -6796,34 +6786,31 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
                 }
                 if let Some(ref title) = preview.title {
                     if !title.is_empty() {
-                        card_content = card_content.push(text(title.as_str()).size(state.zs(13)).color(iced::Color::from_rgb(0.9, 0.9, 0.9)));
+                        card_content = card_content.push(text(title.as_str()).size(state.zs(13)).color(ui.text));
                     }
                 }
                 if let Some(ref desc) = preview.description {
                     if !desc.is_empty() {
                         let truncated = if desc.len() > 200 { format!("{}…", &desc[..200]) } else { desc.clone() };
-                        card_content = card_content.push(text(truncated).size(state.zs(12)).color(iced::Color::from_rgb(0.7, 0.7, 0.7)));
+                        card_content = card_content.push(text(truncated).size(state.zs(12)).color(ui.text_muted));
                     }
                 }
                 card_content = card_content.push(
-                    button(text(&preview.url).size(state.zs(11)).color(iced::Color::from_rgb(0.5, 0.7, 1.0)))
+                    button(text(&preview.url).size(state.zs(11)).color(ui.accent_light))
                         .on_press(Msg::OpenLink(preview.url.clone()))
                         .style(button::text).padding(state.z(0))
                 );
                 let card = container(card_content)
                     .padding(state.z(8))
                     .max_width(state.z(380))
-                    .style(|theme: &iced::Theme| {
-                        let p = theme.extended_palette();
-                        iced::widget::container::Style {
-                            background: Some(p.background.weak.color.into()),
-                            border: iced::Border {
-                                width: 1.0,
-                                color: p.background.weak.color,
-                                radius: 8.0.into(),
-                            },
-                            ..iced::widget::container::Style::default()
-                        }
+                    .style(move |_: &iced::Theme| iced::widget::container::Style {
+                        background: Some(ui.raised.into()),
+                        border: iced::Border {
+                            width: 1.0,
+                            color: ui.border,
+                            radius: 8.0.into(),
+                        },
+                        ..iced::widget::container::Style::default()
                     });
                 bubble_content = bubble_content.push(card);
             }
@@ -6874,13 +6861,13 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
                 let status = state.p2p_status.get(file_id).cloned().unwrap_or_default();
                 let status_text = if status.is_empty() { "waiting…".to_string() } else { status.clone() };
                 let status_el: Element<'_, Msg> = if status == "offline" || status == "error" {
-                    button(text(format!("{status_text} · retry")).size(state.zs(11)).color(iced::Color::from_rgb(0.9, 0.7, 0.5)))
+                    button(text(format!("{status_text} · retry")).size(state.zs(11)).color(iced::Color::from_rgb(0.95, 0.68, 0.22)))
                         .on_press(Msg::RetryFile(m.id))
                         .style(button::text)
                         .padding(state.z(0))
                         .into()
                 } else {
-                    text(status_text).size(state.zs(11)).color(iced::Color::from_rgb(0.6, 0.6, 0.6)).into()
+                    text(status_text).size(state.zs(11)).color(ui.text_muted).into()
                 };
                 card_content = card_content.push(status_el);
             }
@@ -6888,18 +6875,18 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
             let mut file_row = row![
                 text("📎").size(state.zs(14)),
                 text(name).size(state.zs(12)),
-                text(human_size(size)).size(state.zs(10)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+                text(human_size(size)).size(state.zs(10)).color(ui.text_muted),
                 space::horizontal(),
             ];
             if !is_image {
                 file_row = file_row.push(
                     if held {
-                        button(text("Open").size(state.zs(11)).color(iced::Color::from_rgb(0.6, 0.8, 1.0)))
+                        button(text("Open").size(state.zs(11)).color(ui.accent_light))
                             .on_press(Msg::OpenFile(m.id))
                             .style(button::text)
                             .padding(state.z(0))
                     } else {
-                        button(text("Open").size(state.zs(11)).color(iced::Color::from_rgb(0.4, 0.4, 0.4)))
+                        button(text("Open").size(state.zs(11)).color(ui.text_muted))
                             .style(button::text)
                             .padding(state.z(0))
                     }
@@ -6910,28 +6897,25 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
             let card = container(card_content)
                 .padding(state.z(8))
                 .max_width(state.z(320))
-                .style(|theme: &iced::Theme| {
-                    let p = theme.extended_palette();
-                    iced::widget::container::Style {
-                        background: Some(p.background.weak.color.into()),
-                        border: iced::Border {
-                            width: 1.0,
-                            color: p.background.weak.color,
-                            radius: 8.0.into(),
-                        },
-                        ..iced::widget::container::Style::default()
-                    }
+                .style(move |_: &iced::Theme| iced::widget::container::Style {
+                    background: Some(ui.raised.into()),
+                    border: iced::Border {
+                        width: 1.0,
+                        color: ui.border,
+                        radius: 8.0.into(),
+                    },
+                    ..iced::widget::container::Style::default()
                 });
             bubble_content = bubble_content.push(card);
         }
 
         if m.edited_at.is_some() {
-            let edit_color = if is_self { iced::Color::from_rgba(1.0, 1.0, 1.0, 0.5) } else { iced::Color::from_rgb(0.6, 0.6, 0.6) };
+            let edit_color = if is_self { iced::Color::from_rgba(1.0, 1.0, 1.0, 0.6) } else { ui.text_muted };
             bubble_content = bubble_content.push(text("edited").size(state.zs(10)).color(edit_color));
         }
         if let Some(ref body) = m.original_body {
             bubble_content = bubble_content.push(
-                button(text("view original").size(state.zs(10)).color(iced::Color::from_rgb(0.7, 0.8, 1.0)))
+                button(text("view original").size(state.zs(10)).color(ui.accent_light))
                     .on_press(Msg::ShowOriginal(body.clone()))
             );
         }
@@ -6969,7 +6953,7 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
     }).collect();
 
     let loading_indicator: Element<'_, Msg> = if state.loading_messages {
-        container(row![throbber(state.z(18)), text("Loading…").size(state.zs(12)).color(iced::Color::from_rgb(0.5, 0.5, 0.5))]
+        container(row![throbber(state.z(18)), text("Loading…").size(state.zs(12)).color(ui.text_muted)]
             .spacing(state.z(8)).align_y(iced::Alignment::Center))
         .center_x(Length::Fill)
         .padding(state.z(12))
@@ -7047,7 +7031,7 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
         let processing_chip: Option<Element<'_, Msg>> = if state.picking_file {
             Some(
                 container(
-                    row![throbber(state.z(14)), text("Processing…").size(state.zs(12)).color(iced::Color::from_rgb(0.5, 0.5, 0.5))]
+                    row![throbber(state.z(14)), text("Processing…").size(state.zs(12)).color(ui.text_muted)]
                         .spacing(state.z(8))
                         .align_y(iced::Alignment::Center)
                 )
@@ -7074,7 +7058,7 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
             let row: Element<'_, Msg> = row![
                 img_el,
                 text(att.name.clone()).size(state.zs(12)),
-                text(human_size(att.file_size)).size(state.zs(10)).color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+                text(human_size(att.file_size)).size(state.zs(10)).color(ui.text_muted),
                 space::horizontal(),
                 clear,
             ].spacing(state.z(8)).align_y(iced::Alignment::Center).into();
@@ -7110,12 +7094,12 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
             let spacer: Element<'_, Msg> = space::vertical().height(0.0).into();
             spacer
         } else {
-            container(text(state.error.as_str()).size(state.zs(12)).color(iced::Color::from_rgb(0.9, 0.35, 0.3)))
+            container(text(state.error.as_str()).size(state.zs(12)).color(ui.danger))
                 .padding(state.z(6))
                 .width(Length::Fill)
-                .style(|_: &iced::Theme| iced::widget::container::Style {
-                    background: Some(iced::Color::from_rgba(0.4, 0.1, 0.1, 0.6).into()),
-                    border: iced::Border { radius: 8.0.into(), ..iced::Border::default() },
+                .style(move |_: &iced::Theme| iced::widget::container::Style {
+                    background: Some(iced::Color::from_rgba(0.40, 0.13, 0.13, 0.55).into()),
+                    border: iced::Border { radius: 8.0.into(), color: iced::Color::from_rgba(0.86, 0.31, 0.31, 0.35), width: 1.0 },
                     ..iced::widget::container::Style::default()
                 })
                 .into()
@@ -7148,6 +7132,7 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
 /// Top dock shown while connected to a voice channel: current members, control
 /// buttons (mute / camera / screen / leave) and live remote video tiles.
 fn view_voice_panel(state: &AppState) -> Option<Element<'_, Msg>> {
+    let ui = ui(state);
     let voice = state.voice.as_ref()?;
     let channel_id = voice.in_channel()?;
     let channel_name = state
@@ -7197,19 +7182,38 @@ fn view_voice_panel(state: &AppState) -> Option<Element<'_, Msg>> {
                 .find(|(u, _)| u == uid)
                 .map(|(_, n)| n.clone())
                 .unwrap_or_else(|| format!("User {uid}"));
-            let tag = match kind {
-                VoiceVideoKind::Camera => "CAM",
-                VoiceVideoKind::Screen => "SCR",
+            let (tag, tag_color) = match kind {
+                VoiceVideoKind::Camera => ("CAM", ui.accent_light),
+                VoiceVideoKind::Screen => ("SCR", iced::Color::from_rgb(0.95, 0.68, 0.22)),
             };
-            column![
+            container(column![
                 iced::widget::Image::new(handle.clone())
                     .width(Length::Fixed(state.z(160.0)))
                     .height(Length::Fixed(state.z(90.0))),
-                row![text(tag).size(state.zs(11)).color(iced::Color::from_rgb(0.6, 0.8, 1.0)), text(name).size(state.zs(11))]
-                    .spacing(state.z(4))
+                row![
+                    container(text(tag).size(state.zs(9)).color(iced::Color::WHITE))
+                        .padding([state.z(1.0), state.z(5.0)])
+                        .style(move |_: &iced::Theme| iced::widget::container::Style {
+                            background: Some(tag_color.into()),
+                            border: iced::Border { radius: 6.0.into(), ..iced::Border::default() },
+                            ..iced::widget::container::Style::default()
+                        }),
+                    text(name).size(state.zs(11)).color(ui.text_muted),
+                ]
+                    .spacing(state.z(5))
                     .align_y(iced::Alignment::Center),
             ]
-            .spacing(state.z(4))
+            .spacing(state.z(5)))
+            .padding(state.z(6))
+            .style(move |_: &iced::Theme| iced::widget::container::Style {
+                background: Some(ui.raised.into()),
+                border: iced::Border {
+                    width: 1.0,
+                    color: ui.border,
+                    radius: 10.0.into(),
+                },
+                ..iced::widget::container::Style::default()
+            })
             .into()
         })
         .collect();
@@ -7221,7 +7225,8 @@ fn view_voice_panel(state: &AppState) -> Option<Element<'_, Msg>> {
     let mut body = column![
         row![
             text("Voice: ").size(state.zs(13)),
-            text(format!("#{channel_name}")).size(state.zs(13)).color(state.accent),
+            text(format!("#{channel_name}")).size(state.zs(13)).color(ui.accent_light),
+            text(format!(" · {} in channel", members.len())).size(state.zs(12)).color(ui.text_muted),
             space::horizontal(),
             controls,
         ].spacing(state.z(6)).align_y(iced::Alignment::Center),
@@ -7234,11 +7239,11 @@ fn view_voice_panel(state: &AppState) -> Option<Element<'_, Msg>> {
         container(body)
             .padding(state.z(10))
             .width(Length::Fill)
-            .style(|theme: &iced::Theme| iced::widget::container::Style {
-                background: Some(theme.extended_palette().background.weak.color.into()),
+            .style(move |_: &iced::Theme| iced::widget::container::Style {
+                background: Some(ui.surface.into()),
                 border: iced::Border {
                     width: 1.0,
-                    color: theme.extended_palette().background.weak.color,
+                    color: ui.border,
                     radius: 10.0.into(),
                 },
                 ..iced::widget::container::Style::default()
