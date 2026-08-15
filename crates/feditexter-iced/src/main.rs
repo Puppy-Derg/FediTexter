@@ -341,6 +341,10 @@ struct ViewerState {
     video_rx: Option<Arc<Mutex<std::sync::mpsc::Receiver<MediaEvent>>>>,
     /// Latest decoded frame handle (rebuilt once per incoming frame).
     video_handle: Option<iced::widget::image::Handle>,
+    /// Previous frame handle, kept drawn as a fallback. Frames >2MB RGBA are
+    /// uploaded on a background thread and skipped for one present, so keeping
+    /// the last uploaded frame in the batch prevents the video from strobing.
+    video_handle_prev: Option<iced::widget::image::Handle>,
     video_width: u32,
     video_height: u32,
     video_duration: f64,
@@ -364,6 +368,7 @@ impl ViewerState {
             engine: None,
             video_rx: None,
             video_handle: None,
+            video_handle_prev: None,
             video_width: 0,
             video_height: 0,
             video_duration: 0.0,
@@ -1746,7 +1751,20 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
     if std::env::var("FEDITEXTER_VERBOSE").is_ok() {
         eprintln!("UPDATE: {:?}", msg_short(&msg));
     }
-    match msg {
+    if std::env::var("FEDITEXTER_VIEWER_TRACE").is_ok() {
+        use std::io::Write;
+        use std::sync::OnceLock;
+        static T0: OnceLock<std::time::Instant> = OnceLock::new();
+        let t0 = *T0.get_or_init(std::time::Instant::now);
+        let line = format!("{:.3} {}", t0.elapsed().as_secs_f64(), msg_short(&msg));
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/feditexter-viewer.log")
+        {
+            let _ = writeln!(f, "{line}");
+        }
+    }    match msg {
         Msg::LoginEmailChanged(e) => { state.login_email = e; Task::none() }
         Msg::LoginPasswordChanged(p) => { state.login_password = p; Task::none() }
         Msg::LoginServerChanged(s) => { state.server = s; Task::none() }
@@ -2146,8 +2164,8 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                     let mut out = Vec::new();
                     for f in files {
                         let bytes = f.read().await;
-                        if bytes.is_empty() || bytes.len() > 512 * 1024 {
-                            return Err("sticker image too large (max 512 KiB)".to_string());
+                        if bytes.is_empty() {
+                            return Err("sticker image is empty".to_string());
                         }
                         let path = f.path();
                         let mime = mime_from_path(path).to_string();
@@ -2157,7 +2175,38 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                         let name = path.file_stem()
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_else(|| "sticker".to_string());
-                        out.push((name, mime, bytes));
+                        // Re-encode so any decodable format (GIF, BMP, PNG,
+                        // WebP, AVIF, …) becomes a small JPEG the server
+                        // accepts — otherwise the upload 400s on the MIME.
+                        let sticker = match img::decode(&bytes) {
+                            Some(d) => {
+                                let d = if d.width.max(d.height) > 1024 {
+                                    let scale = 1024.0 / d.width.max(d.height) as f32;
+                                    img::resize(&d, (d.width as f32 * scale) as u32, (d.height as f32 * scale) as u32)
+                                        .ok_or_else(|| "could not resize sticker".to_string())?
+                                } else {
+                                    d
+                                };
+                                let jpeg = img::encode_jpeg(&d)
+                                    .ok_or_else(|| "could not encode sticker".to_string())?;
+                                if jpeg.is_empty() || jpeg.len() > 512 * 1024 {
+                                    return Err("sticker image too large after compression (max 512 KiB)".to_string());
+                                }
+                                ("image/jpeg".to_string(), jpeg)
+                            }
+                            None => {
+                                // Not decodable by ffmpeg (e.g. SVG): only allow
+                                // formats the server accepts, raw.
+                                if !matches!(mime.as_str(), "image/jpeg" | "image/jpg" | "image/webp" | "image/png") {
+                                    return Err("unsupported sticker format (use JPEG, PNG or WebP)".to_string());
+                                }
+                                if bytes.len() > 512 * 1024 {
+                                    return Err("sticker image too large (max 512 KiB)".to_string());
+                                }
+                                (mime, bytes)
+                            }
+                        };
+                        out.push((name, sticker.0, sticker.1));
                     }
                     Ok(out)
                 },
@@ -2419,7 +2468,7 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                 })
                 .map(|data| {
                     use base64::Engine;
-                    base64::engine::general_purpose::STANDARD.encode(data)
+                    format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(data))
                 })
                 .unwrap_or_default();
             state.pending_attachment = Some(Attachment {
@@ -3116,7 +3165,9 @@ fn update(state: &mut AppState, msg: Msg) -> Task<Msg> {
                     let mime = mime_from_path(handle.path()).to_string();
                     let file_id = uuid::Uuid::new_v4().to_string();
                     let file_size = bytes.len() as u64;
-                    let thumbnail = if mime.starts_with("image/") {
+                    let thumbnail = if mime.starts_with("image/") || mime.starts_with("video/") {
+                        // For videos img::decode extracts the first frame, so
+                        // the same path produces a bubble preview.
                         img::decode(&bytes)
                             .and_then(|d| {
                                 let max_dim = 480u32;
@@ -4714,6 +4765,30 @@ fn drain_video_events(state: &mut AppState) {
         apply_media_event_inner(&mut v, ev);
     }
     if let Some(ev) = last_frame {
+        if std::env::var("FEDITEXTER_VIEWER_TRACE").is_ok() {
+            use std::io::Write;
+            use std::sync::OnceLock;
+            static T0: OnceLock<std::time::Instant> = OnceLock::new();
+            let t0 = *T0.get_or_init(std::time::Instant::now);
+            let (w, h, n) = match &ev {
+                MediaEvent::Frame { width, height, rgba } => (*width, *height, rgba.len()),
+                _ => (0, 0, 0),
+            };
+            let pos = v.engine.as_ref().map(|e| e.position_secs()).unwrap_or(-1.0);
+            let line = format!(
+                "{:.3} frame {w}x{h} {n}B pos={pos:.2} play={:?} dur={:.1}",
+                t0.elapsed().as_secs_f64(),
+                v.play_state,
+                v.video_duration
+            );
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/feditexter-viewer.log")
+            {
+                let _ = writeln!(f, "{line}");
+            }
+        }
         apply_media_event_inner(&mut v, ev);
     }
     state.viewer = Some(v);
@@ -4739,15 +4814,15 @@ fn apply_media_event_inner(v: &mut ViewerState, ev: MediaEvent) {
         MediaEvent::Frame { width, height, rgba } => {
             v.video_width = width;
             v.video_height = height;
+            v.video_handle_prev = v.video_handle.take();
             v.video_handle =
                 Some(iced::widget::image::Handle::from_rgba(width, height, rgba.to_vec()));
-            v.play_state = PlayState::Playing;
         }
         MediaEvent::Ended => {
+            // Stop at the end and hold the last frame; the next play toggle
+            // replays from the start (the engine's Ended path handles Cmd::Play
+            // by restarting the session).
             v.play_state = PlayState::Paused;
-            if let Some(e) = v.engine.as_ref() {
-                e.seek(0.0);
-            }
         }
         MediaEvent::Error(msg) => {
             v.error = Some(msg);
@@ -5971,15 +6046,21 @@ fn view_media_viewer(state: &AppState) -> Element<'_, Msg> {
         ViewerKind::Video => view_viewer_video(state),
     };
 
-    container(column![header, content].spacing(state.z(10)))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(state.z(16))
-        .style(move |_: &iced::Theme| iced::widget::container::Style {
-            background: Some(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.94).into()),
-            ..iced::widget::container::Style::default()
-        })
-        .into()
+    // Wrap the whole overlay in a mouse_area that captures clicks, so input on
+    // the viewer's non-interactive areas (padding, header) doesn't fall through
+    // to the chat underneath.
+    mouse_area(
+        container(column![header, content].spacing(state.z(10)))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(state.z(16))
+            .style(move |_: &iced::Theme| iced::widget::container::Style {
+                background: Some(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.94).into()),
+                ..iced::widget::container::Style::default()
+            }),
+    )
+    .on_press(Msg::Noop)
+    .into()
 }
 
 fn view_viewer_image(state: &AppState) -> Element<'_, Msg> {
@@ -6038,13 +6119,28 @@ fn view_viewer_video(state: &AppState) -> Element<'_, Msg> {
         .into();
     }
 
-    let body: Element<'_, Msg> = match &v.video_handle {
-        Some(h) => iced::widget::image::Image::new(h.clone())
+    let body: Element<'_, Msg> = match (&v.video_handle, &v.video_handle_prev) {
+        (Some(h), Some(p)) => iced::widget::Stack::from_vec(vec![
+            iced::widget::image::Image::new(p.clone())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .content_fit(iced::ContentFit::Contain)
+                .into(),
+            iced::widget::image::Image::new(h.clone())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .content_fit(iced::ContentFit::Contain)
+                .into(),
+        ])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into(),
+        (Some(h), None) => iced::widget::image::Image::new(h.clone())
             .width(Length::Fill)
             .height(Length::Fill)
             .content_fit(iced::ContentFit::Contain)
             .into(),
-        None => container(
+        (None, _) => container(
             text("Loading…").size(state.zs(14)).color(ui.text_muted),
         )
         .width(Length::Fill)
@@ -7654,10 +7750,8 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
         }
 
         if let Some(file_id) = &m.file_id {
-            let mime = m.attachment_mime.clone().unwrap_or_default();
             let name = m.attachment_name.clone().unwrap_or_default();
             let size = m.file_size.unwrap_or(0) as u64;
-            let is_image = mime.starts_with("image/");
 
             let mut card_content = column![].spacing(state.z(4));
 
@@ -7673,17 +7767,19 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
 
             let thumb_handle = state.thumb_handles.get(file_id).cloned();
 
-            if is_image {
+            // Show the sender's thumbnail for any attachment we have a preview
+            // for (images and, via the first-frame thumbnail, videos too).
+            let has_preview = full_handle.is_some() || thumb_handle.is_some();
+            if has_preview {
                 let img_el = if let Some(h) = full_handle {
                     iced::widget::Image::new(h)
                         .width(Length::Fixed(state.z(280)))
                         .height(Length::Shrink)
-                } else if let Some(h) = thumb_handle {
+                } else {
+                    let h = thumb_handle.clone().expect("preview handle checked above");
                     iced::widget::Image::new(h)
                         .width(Length::Fixed(state.z(200)))
                         .height(Length::Shrink)
-                } else {
-                    iced::widget::Image::new(iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 0]))
                 };
                 card_content = card_content.push(
                     button(img_el)
@@ -7709,13 +7805,24 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
                 card_content = card_content.push(status_el);
             }
 
+            // Keep long file names inside the card: truncate very long names
+            // and wrap at glyphs so an unbroken token never spills past the
+            // bubble.
+            let name_display: String = if name.chars().count() > 48 {
+                let mut s: String = name.chars().take(48).collect();
+                s.push('…');
+                s
+            } else {
+                name.clone()
+            };
+
             let mut file_row = row![
                 text("📎").size(state.zs(14)),
-                text(name).size(state.zs(12)),
+                text(name_display).size(state.zs(12)).wrapping(iced::widget::text::Wrapping::WordOrGlyph),
                 text(human_size(size)).size(state.zs(10)).color(ui.text_muted),
                 space::horizontal(),
             ];
-            if !is_image {
+            if !has_preview {
                 file_row = file_row.push(
                     if held {
                         button(text("Open").size(state.zs(11)).color(ui.accent_light))
@@ -7892,9 +7999,16 @@ fn view_sidebar(state: &AppState) -> Element<'_, Msg> {    let header = row![
                 Some(i) => i.into(),
                 None => text("📎").size(state.zs(16)).into(),
             };
+            let chip_name: String = if att.name.chars().count() > 40 {
+                let mut s: String = att.name.chars().take(40).collect();
+                s.push('…');
+                s
+            } else {
+                att.name.clone()
+            };
             let row: Element<'_, Msg> = row![
                 img_el,
-                text(att.name.clone()).size(state.zs(12)),
+                text(chip_name).size(state.zs(12)).wrapping(iced::widget::text::Wrapping::WordOrGlyph),
                 text(human_size(att.file_size)).size(state.zs(10)).color(ui.text_muted),
                 space::horizontal(),
                 clear,

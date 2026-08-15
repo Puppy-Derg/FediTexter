@@ -69,6 +69,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -95,11 +97,9 @@ jobs:
           # are required by the voice chat feature's audio/video capture stack.
           # nasm is required by FFmpeg's x86 asm (x86_64 job only).
 
-      - name: Build static FFmpeg
+      - name: Build client (static FFmpeg via make)
         if: matrix.ffmpeg == 'build'
-        run: |
-          .github/scripts/build-ffmpeg.sh "$GITHUB_WORKSPACE/.ffmpeg"
-          echo "FFMPEG_DIR=$GITHUB_WORKSPACE/.ffmpeg" >> "$GITHUB_ENV"
+        run: make client-release TARGET=${{ matrix.target }}
 
       - name: Cache vcpkg FFmpeg
         if: matrix.ffmpeg == 'vcpkg'
@@ -120,7 +120,8 @@ jobs:
           C:/vcpkg/bootstrap-vcpkg.bat -disableMetrics
           C:/vcpkg/vcpkg.exe install "ffmpeg[gpl,x265,opus,avcodec,avformat,swscale,swresample,zlib]:${{ matrix.vcpkg_triplet }}" --clean-after-build
 
-      - name: Build client
+      - name: Build client (vcpkg FFmpeg)
+        if: matrix.ffmpeg == 'vcpkg'
         run: cargo build --release --target ${{ matrix.target }} -p feditexter-iced
 
       - name: Rename binary

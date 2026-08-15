@@ -14,10 +14,24 @@
 set -euo pipefail
 
 PREFIX="${1:?usage: build-ffmpeg.sh <prefix> [jobs]}"
+# Resolve PREFIX to an absolute path: the build cd's into subdirectories, so a
+# relative prefix would have install lands somewhere unexpected.
+PREFIX="$(mkdir -p "$PREFIX" && cd "$PREFIX" && pwd)"
 JOBS="${2:-$(getconf _NPROCESSORS_ONLN)}"
-FFMPEG_TAG="${FFMPEG_TAG:-n9.0.1}"
 X265_TAG="${X265_TAG:-4.2}"
 OPUS_TAG="${OPUS_TAG:-v1.6.1}"
+
+# FFmpeg source comes from the pinned git submodule (third_party/ffmpeg),
+# checked out at tag n9.0.1. Resolve it relative to this script so the script
+# works from any working directory.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+FFMPEG_SRC="${FFMPEG_SRC:-$SCRIPT_DIR/../../third_party/ffmpeg}"
+
+if [ ! -f "$FFMPEG_SRC/configure" ]; then
+  echo "error: FFmpeg submodule not checked out at $FFMPEG_SRC" >&2
+  echo "  run: git submodule update --init --recursive" >&2
+  exit 1
+fi
 
 # x265 is C++; the FFmpeg link tests and EXTRALIBS need the C++ runtime.
 case "$(uname -s)" in
@@ -74,39 +88,38 @@ if [ ! -f "$PREFIX/lib/libx265.a" ]; then
 fi
 
 # ------------------------------------------------------------------ FFmpeg
-if [ ! -d "$SRC_DIR/.git" ]; then
-  git clone --depth 1 --branch "$FFMPEG_TAG" \
-    https://github.com/FFmpeg/FFmpeg.git "$SRC_DIR"
-else
-  git -C "$SRC_DIR" fetch --depth 1 origin tag "$FFMPEG_TAG"
-  git -C "$SRC_DIR" checkout -q "$FFMPEG_TAG"
+# Source comes from the pinned submodule; build out of tree so we never dirty
+# the submodule working tree with generated files.
+FFMPEG_BUILD_DIR="$PREFIX/ffmpeg-build"
+
+if [ ! -f "$PREFIX/lib/libavcodec.a" ]; then
+  mkdir -p "$FFMPEG_BUILD_DIR"
+  cd "$FFMPEG_BUILD_DIR"
+
+  PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
+  "$FFMPEG_SRC/configure" \
+    --prefix="$PREFIX" \
+    --disable-shared \
+    --enable-static \
+    --enable-pic \
+    --disable-autodetect \
+    --enable-gpl \
+    --enable-libx265 \
+    --enable-libopus \
+    --enable-zlib \
+    --disable-programs \
+    --disable-doc \
+    --disable-network \
+    --disable-avdevice \
+    --disable-avfilter \
+    --disable-muxers \
+    --disable-bsfs \
+    --disable-devices \
+    --disable-debug \
+    --extra-cflags="-I$PREFIX/include" \
+    --extra-ldflags="-L$PREFIX/lib" \
+    --extra-libs="$CXX_LIBS"
+
+  make -j"$JOBS"
+  make install
 fi
-
-cd "$SRC_DIR"
-
-PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
-./configure \
-  --prefix="$PREFIX" \
-  --disable-shared \
-  --enable-static \
-  --enable-pic \
-  --disable-autodetect \
-  --enable-gpl \
-  --enable-libx265 \
-  --enable-libopus \
-  --enable-zlib \
-  --disable-programs \
-  --disable-doc \
-  --disable-network \
-  --disable-avdevice \
-  --disable-avfilter \
-  --disable-muxers \
-  --disable-bsfs \
-  --disable-devices \
-  --disable-debug \
-  --extra-cflags="-I$PREFIX/include" \
-  --extra-ldflags="-L$PREFIX/lib" \
-  --extra-libs="$CXX_LIBS"
-
-make -j"$JOBS"
-make install

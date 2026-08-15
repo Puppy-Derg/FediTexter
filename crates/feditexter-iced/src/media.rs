@@ -55,6 +55,42 @@ enum Cmd {
     Stop,
 }
 
+enum CmdAction {
+    Continue,
+    Exit(SessionExit),
+}
+
+fn handle_cmd(
+    cmd: Cmd,
+    playing: &mut bool,
+    pos: &mut f64,
+    base: &mut std::time::Instant,
+    volume: &std::sync::Arc<std::sync::atomic::AtomicU32>,
+) -> CmdAction {
+    match cmd {
+        Cmd::Stop => CmdAction::Exit(SessionExit::Stop),
+        Cmd::Seek(t) => CmdAction::Exit(SessionExit::Seek(t.max(0.0))),
+        Cmd::Play => {
+            if !*playing {
+                *playing = true;
+                *base = std::time::Instant::now();
+            }
+            CmdAction::Continue
+        }
+        Cmd::Pause => {
+            if *playing {
+                *pos += base.elapsed().as_secs_f64();
+                *playing = false;
+            }
+            CmdAction::Continue
+        }
+        Cmd::Volume(v) => {
+            volume.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
+            CmdAction::Continue
+        }
+    }
+}
+
 struct AudioRing {
     data: VecDeque<f32>,
 }
@@ -158,6 +194,9 @@ fn run_loop(
     loop {
         match run_session(&path, seek, &cmd_rx, &ev_tx, &state, &volume, &position) {
             Ok(SessionExit::Seek(t)) => {
+                if std::env::var("FEDITEXTER_VIEWER_TRACE").is_ok() {
+                    eprintln!("[media] run_loop restarting with seek={t}");
+                }
                 seek = t;
                 state.store(1, Ordering::Relaxed);
                 continue;
@@ -181,8 +220,11 @@ fn run_session(
     if std::env::var("FEDITEXTER_MEDIA_TRACE").is_ok() {
         eprintln!("[media] init ok");
     }
+    if std::env::var("FEDITEXTER_VIEWER_TRACE").is_ok() {
+        eprintln!("[media] run_session enter seek={seek}");
+    }
 
-let mut input = match ffmpeg::format::input(path) {
+    let mut input = match ffmpeg::format::input(path) {
         Ok(i) => {
             if std::env::var("FEDITEXTER_MEDIA_TRACE").is_ok() {
                 eprintln!("[media] input opened");
@@ -197,6 +239,19 @@ let mut input = match ffmpeg::format::input(path) {
             return Err(());
         }
     };
+
+    // Real seek: jump the demuxer to the requested position instead of
+    // decoding every frame from the first one (which blasted through the
+    // whole preceding clip at decode speed — the "flashing" on scrub).
+    // `avformat_seek_file` with stream index -1 works in AV_TIME_BASE (µs).
+    // Done before taking the stream handles (Stream borrows the Input).
+    if seek > 0.0 {
+        let ts = (seek * 1_000_000.0) as i64;
+        let r = input.seek(ts, 0..ts);
+        if std::env::var("FEDITEXTER_VIEWER_TRACE").is_ok() {
+            eprintln!("[media] input.seek({ts}) -> {r:?}");
+        }
+    }
 
     if std::env::var("FEDITEXTER_MEDIA_TRACE").is_ok() {
         eprintln!("[media] after input open, streams()");
@@ -298,32 +353,36 @@ let mut input = match ffmpeg::format::input(path) {
 
     let mut demux = input.packets();
     let mut video_tb = None;
+    let mut iter: u32 = 0;
 
     'outer: loop {
+        iter += 1;
         // Command intake between frames.
         loop {
             match cmd_rx.try_recv() {
                 Ok(Cmd::Stop) => return Ok(SessionExit::Stop),
-                Ok(Cmd::Seek(t)) => return Ok(SessionExit::Seek(t.max(0.0))),
-                Ok(Cmd::Play) => {
-                    if !playing {
-                        playing = true;
-                        base = Instant::now();
+                Ok(cmd) => {
+                    if std::env::var("FEDITEXTER_VIEWER_TRACE").is_ok() {
+                        let name = match &cmd {
+                            Cmd::Play => "Play",
+                            Cmd::Pause => "Pause",
+                            Cmd::Seek(_) => "Seek",
+                            Cmd::Volume(_) => "Volume",
+                            Cmd::Stop => "Stop",
+                        };
+                        eprintln!("[media] intake {name} (iter {iter})");
                     }
-                }
-                Ok(Cmd::Pause) => {
-                    if playing {
-                        pos += base.elapsed().as_secs_f64();
-                        playing = false;
+                    match handle_cmd(cmd, &mut playing, &mut pos, &mut base, volume) {
+                        CmdAction::Continue => {}
+                        CmdAction::Exit(exit) => return Ok(exit),
                     }
-                }
-                Ok(Cmd::Volume(v)) => {
-                    volume.store(v.to_bits(), Ordering::Relaxed);
-                    let _ = v;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => return Ok(SessionExit::Stop),
             }
+        }
+        if iter % 300 == 0 && std::env::var("FEDITEXTER_VIEWER_TRACE").is_ok() {
+            eprintln!("[media] iter {iter} heartbeat playing={playing}");
         }
 
         state.store(if playing { 1 } else { 2 }, Ordering::Relaxed);
@@ -372,6 +431,11 @@ let mut input = match ffmpeg::format::input(path) {
                                 let pts = frame.pts().unwrap_or(0) as f64;
                                 let tb = video_tb.unwrap_or(0.0);
                                 let frame_pos = pts * tb;
+                                // GOP catch-up frames decoded between the seek
+                                // keyframe and the target — drop them silently.
+                                if frame_pos < seek {
+                                    continue;
+                                }
                                 if let Some(sc) = scaler.as_mut() {
                                     let mut out = ffmpeg::frame::Video::empty();
                                     if sc.run(&frame, &mut out).is_ok() {
@@ -392,8 +456,18 @@ let mut input = match ffmpeg::format::input(path) {
                                     let mut remain = delay;
                                     while remain > 0.0 {
                                         // Wake up for seek/pause without long sleeps.
-                                        if cmd_rx.recv_timeout(Duration::from_secs_f64(remain.min(0.05))).is_ok() {
-                                            continue 'outer;
+                                        // NOTE: recv_timeout CONSUMES the command, so
+                                        // process it here — `continue 'outer` alone
+                                        // would drop it (the intake's try_recv then
+                                        // finds an empty channel).
+                                        match cmd_rx.recv_timeout(Duration::from_secs_f64(remain.min(0.05))) {
+                                            Ok(cmd) => {
+                                                match handle_cmd(cmd, &mut playing, &mut pos, &mut base, volume) {
+                                                    CmdAction::Continue => continue 'outer,
+                                                    CmdAction::Exit(exit) => return Ok(exit),
+                                                }
+                                            }
+                                            Err(_) => {}
                                         }
                                         remain -= 0.05;
                                     }
@@ -403,7 +477,14 @@ let mut input = match ffmpeg::format::input(path) {
                                 }
                                 let p = frame_pos.max(wall_pos);
                                 if p.is_finite() {
+                                    // Re-anchor the playback clock to the
+                                    // present so `base.elapsed()` only accrues
+                                    // since the last presented frame. Otherwise
+                                    // `wall_pos` keeps counting absolute session
+                                    // time, delay goes negative and playback
+                                    // races at decode speed.
                                     pos = p;
+                                    base = Instant::now();
                                 }
                                 position.store((pos as f32).to_bits(), Ordering::Relaxed);
                             }
@@ -551,6 +632,229 @@ fn pick_output_config(dev: &cpal::Device) -> Option<(cpal::StreamConfig, cpal::S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pacing_measure() {
+        let path = std::env::var("FT_TEST_VIDEO")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| "/var/folders/_8/57kvqnk52kd94w0525ppqqz80000gn/T/opencode/videotest/sample.mp4".into());
+        if !path.exists() {
+            eprintln!("[test] sample missing");
+            return;
+        }
+        let engine = MediaEngine::open(path.clone(), 0.0, 1.0);
+        let rx = engine.events();
+        let mut g = rx.lock().unwrap();
+        let t0 = std::time::Instant::now();
+        let mut frames = Vec::new();
+        let mut last_sent = None;
+        while std::time::Instant::now() - t0 < std::time::Duration::from_secs(6) {
+            match g.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(MediaEvent::Frame { .. }) => {
+                    let now = last_sent.unwrap_or(t0);
+                    let dt = now.elapsed().as_secs_f64();
+                    frames.push(dt);
+                    last_sent = Some(std::time::Instant::now());
+                }
+                Ok(MediaEvent::Opened { .. }) => {}
+                Ok(MediaEvent::Ended) => { eprintln!("[test] ended"); break; }
+                Ok(MediaEvent::Error(e)) => { eprintln!("[test] err {e}"); break; }
+                Err(_) => {}
+            }
+        }
+        eprintln!("[test] frames={} first10_dt={:?}", frames.len(), &frames[..frames.len().min(10)]);
+    }
+
+    #[test]
+    fn seek_jumps() {
+        let path = std::env::var("FT_TEST_VIDEO")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| "/var/folders/_8/57kvqnk52kd94w0525ppqqz80000gn/T/opencode/videotest/sample.mp4".into());
+        if !path.exists() {
+            eprintln!("[test] sample missing");
+            return;
+        }
+        let engine = MediaEngine::open(path.clone(), 0.0, 1.0);
+        let rx = engine.events();
+        let mut g = rx.lock().unwrap();
+        let t0 = std::time::Instant::now();
+        let mut duration = 0.0f64;
+        while std::time::Instant::now() - t0 < std::time::Duration::from_secs(3) {
+            match g.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(MediaEvent::Opened { duration: d, .. }) => { duration = d; break; }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        assert!(duration > 0.0, "no Opened event");
+
+        let target = duration * 0.7;
+        engine.seek(target);
+        let t1 = std::time::Instant::now();
+        let mut pos = None;
+        while std::time::Instant::now() - t1 < std::time::Duration::from_secs(3) {
+            match g.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(MediaEvent::Frame { .. }) => {
+                    let p = engine.position_secs();
+                    if p > (target - 1.0) as f32 {
+                        pos = Some(p);
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        eprintln!("[test] seek to {target} position_secs={:?}", pos);
+        assert!(pos.unwrap_or(0.0) >= (target - 1.0) as f32, "seek did not jump: {pos:?}");
+    }
+
+    #[test]
+    fn seek_during_active_playback() {
+        let path = std::env::var("FT_TEST_VIDEO")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| "/var/folders/_8/57kvqnk52kd94w0525ppqqz80000gn/T/opencode/videotest/sample.mp4".into());
+        if !path.exists() {
+            eprintln!("[test] sample missing");
+            return;
+        }
+        let engine = MediaEngine::open(path.clone(), 0.0, 1.0);
+        let rx = engine.events();
+        let mut g = rx.lock().unwrap();
+        let t0 = std::time::Instant::now();
+        let mut frames = 0usize;
+        while std::time::Instant::now() - t0 < std::time::Duration::from_millis(1500) {
+            match g.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(MediaEvent::Frame { .. }) => frames += 1,
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        eprintln!("[test] drained {frames} frames in 1.5s");
+        assert!(frames > 5, "video not playing");
+
+        engine.seek(10.0);
+        let t1 = std::time::Instant::now();
+        let mut jumped = None;
+        while std::time::Instant::now() - t1 < std::time::Duration::from_secs(3) {
+            match g.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(MediaEvent::Frame { .. }) => {
+                    let p = engine.position_secs();
+                    if p > 9.0 {
+                        jumped = Some(p);
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        eprintln!("[test] seek to 10 during playback -> jumped={jumped:?}");
+        assert!(jumped.is_some(), "seek did not work during active playback");
+    }
+
+    #[test]
+    fn seek_through_taken_engine() {
+        let path = std::env::var("FT_TEST_VIDEO")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| "/var/folders/_8/57kvqnk52kd94w0525ppqqz80000gn/T/opencode/videotest/sample.mp4".into());
+        if !path.exists() {
+            eprintln!("[test] sample missing");
+            return;
+        }
+        let engine = MediaEngine::open(path.clone(), 0.0, 1.0);
+        let mut holder: Option<MediaEngine> = Some(engine);
+        let rx = holder.as_ref().unwrap().events();
+        let mut g = rx.lock().unwrap();
+        let t0 = std::time::Instant::now();
+        while std::time::Instant::now() - t0 < std::time::Duration::from_millis(1000) {
+            let _ = g.recv_timeout(std::time::Duration::from_millis(100));
+        }
+        let mut e = holder.take().unwrap();
+        e.seek(10.0);
+        holder = Some(e);
+        let e = holder.as_ref().unwrap();
+        let t1 = std::time::Instant::now();
+        let mut jumped = None;
+        while std::time::Instant::now() - t1 < std::time::Duration::from_secs(3) {
+            if let Ok(MediaEvent::Frame { .. }) = g.recv_timeout(std::time::Duration::from_millis(200)) {
+                let p = e.position_secs();
+                if p > 9.0 {
+                    jumped = Some(p);
+                    break;
+                }
+            }
+        }
+        eprintln!("[test] seek through taken engine -> jumped={jumped:?}");
+        assert!(jumped.is_some(), "seek broken after take/put");
+    }
+
+    #[test]
+    fn pause_during_active_playback() {
+        let path = std::env::var("FT_TEST_VIDEO")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| "/var/folders/_8/57kvqnk52kd94w0525ppqqz80000gn/T/opencode/videotest/sample.mp4".into());
+        if !path.exists() {
+            eprintln!("[test] sample missing");
+            return;
+        }
+        let engine = MediaEngine::open(path.clone(), 0.0, 1.0);
+        let rx = engine.events();
+        let mut g = rx.lock().unwrap();
+        let t0 = std::time::Instant::now();
+        while std::time::Instant::now() - t0 < std::time::Duration::from_millis(1000) {
+            match g.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(MediaEvent::Frame { .. }) => {}
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        engine.pause();
+        let t1 = std::time::Instant::now();
+        let mut frames_after = 0usize;
+        while std::time::Instant::now() - t1 < std::time::Duration::from_millis(800) {
+            match g.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(MediaEvent::Frame { .. }) => frames_after += 1,
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        eprintln!("[test] frames after pause: {frames_after} (expect ~0)");
+        assert!(frames_after <= 2, "video did not pause: {frames_after} frames after pause");
+    }
+
+    #[test]
+    fn frames_decode_at_source_resolution() {
+        let path = std::env::var("FT_TEST_VIDEO")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| "/var/folders/_8/57kvqnk52kd94w0525ppqqz80000gn/T/opencode/videotest/sample.mp4".into());
+        if !path.exists() {
+            eprintln!("[test] sample missing");
+            return;
+        }
+        let engine = MediaEngine::open(path.clone(), 0.0, 1.0);
+        let rx = engine.events();
+        let mut g = rx.lock().unwrap();
+        let t0 = std::time::Instant::now();
+        let mut biggest = 0usize;
+        let mut checked = 0usize;
+        while std::time::Instant::now() - t0 < std::time::Duration::from_secs(3) {
+            match g.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(MediaEvent::Frame { rgba, .. }) => {
+                    biggest = biggest.max(rgba.len());
+                    checked += 1;
+                    if checked >= 5 {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        eprintln!("[test] biggest frame rgba={biggest} bytes ({checked} frames)");
+        assert!(checked > 0, "no frames decoded");
+        assert!(biggest > 0, "empty frame");
+    }
 
     #[test]
     fn decodes_video_frames_to_rgba() {
