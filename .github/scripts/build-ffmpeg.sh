@@ -102,6 +102,7 @@ if [ ! -f "$PREFIX/lib/libavcodec.a" ]; then
     --disable-shared \
     --enable-static \
     --enable-pic \
+    --pkg-config-flags="--static" \
     --disable-autodetect \
     --enable-gpl \
     --enable-libx265 \
