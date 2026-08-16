@@ -28,12 +28,21 @@ fn main() {
             println!("cargo:rustc-link-lib=c++");
             println!("cargo:rustc-link-lib=z");
         }
+        // Emit the FFmpeg deps as raw link-args (so they land AFTER the rlibs)
+        // wrapped in --start-group. `cargo:rustc-link-lib` puts them before the
+        // rlibs, where GNU ld drops them under --as-needed before libavcodec's
+        // objects create the references — hence "undefined reference to
+        // uncompress/inflate (zlib), opus_*, x265_*" at link time.
         "linux" => {
-            println!("cargo:rustc-link-lib=x265");
-            println!("cargo:rustc-link-lib=opus");
-            println!("cargo:rustc-link-lib=stdc++");
-            println!("cargo:rustc-link-lib=dl");
-            println!("cargo:rustc-link-lib=z");
+            println!("cargo:rustc-link-arg=-Wl,--start-group");
+            println!("cargo:rustc-link-arg=-Wl,-Bstatic");
+            println!("cargo:rustc-link-arg=-lx265");
+            println!("cargo:rustc-link-arg=-lopus");
+            println!("cargo:rustc-link-arg=-lz");
+            println!("cargo:rustc-link-arg=-Wl,-Bdynamic");
+            println!("cargo:rustc-link-arg=-lstdc++");
+            println!("cargo:rustc-link-arg=-ldl");
+            println!("cargo:rustc-link-arg=-Wl,--end-group");
         }
         _ => {}
     }
