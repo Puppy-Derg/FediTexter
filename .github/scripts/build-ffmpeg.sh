@@ -77,12 +77,34 @@ else
 fi
 
 if [ ! -f "$PREFIX/lib/libx265.a" ]; then
-  cmake -S "$X265_DIR/source" -B "$X265_DIR/build" \
-    -DCMAKE_INSTALL_PREFIX="$PREFIX" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DENABLE_SHARED=OFF \
-    -DENABLE_CLI=OFF \
+  X265_CMAKE_ARGS=(
+    -DCMAKE_INSTALL_PREFIX="$PREFIX"
+    -DCMAKE_BUILD_TYPE=Release
+    -DENABLE_SHARED=OFF
+    -DENABLE_CLI=OFF
     -DENABLE_PIC=ON
+  )
+
+  # Linux aarch64 (GitHub ubuntu-24.04-arm): x265 is built by GCC, which by
+  # default emits calls to libgcc's outline-atomic helpers (__aarch64_ldadd4_sync
+  # & co.) and auto-vectorizes log/log2/atan2 into libmvec calls (_ZGVnN2v_*).
+  # Neither set of symbols exists in the LLVM-linked Rust binary, so the final
+  # link fails with undefined references. Disable both at codegen time, and drop
+  # the runtime-CPU-detected asm primitives (assembly/Neon/SVE/SVE2) so the
+  # archive is fully self-contained. macOS arm64 uses Apple Clang (different
+  # codegen) and must stay untouched.
+  if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "aarch64" ]; then
+    X265_CMAKE_ARGS+=(
+      -DENABLE_ASSEMBLY=OFF
+      -DENABLE_NEON=OFF
+      -DENABLE_SVE=OFF
+      -DENABLE_SVE2=OFF
+      -DCMAKE_C_FLAGS="-mno-outline-atomics -fno-tree-vectorize"
+      -DCMAKE_CXX_FLAGS="-mno-outline-atomics -fno-tree-vectorize"
+    )
+  fi
+
+  cmake -S "$X265_DIR/source" -B "$X265_DIR/build" "${X265_CMAKE_ARGS[@]}"
   cmake --build "$X265_DIR/build" -j"$JOBS"
   cmake --install "$X265_DIR/build"
 fi
