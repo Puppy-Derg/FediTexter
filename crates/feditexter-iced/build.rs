@@ -4,8 +4,9 @@
 //! so libx265.a must be linked explicitly. x265 is C++, so the C++ runtime is
 //! required too, and the png/zlib-family codecs need zlib (otherwise the
 //! linker skips pulling those objects). On Windows the vcpkg crate already
-//! emits every transitive dependency (including x265, zlib and their deps), so
-//! nothing is needed there.
+//! emits every transitive FFmpeg dependency (x265, zlib, opus, ...), but the
+//! Media Foundation encoder objects' COM GUIDs live in the Windows SDK, so
+//! those system libs are added below.
 
 fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
@@ -43,6 +44,18 @@ fn main() {
             println!("cargo:rustc-link-arg=-lstdc++");
             println!("cargo:rustc-link-arg=-ldl");
             println!("cargo:rustc-link-arg=-Wl,--end-group");
+        }
+        // vcpkg's static FFmpeg archive keeps the Media Foundation encoder
+        // objects (mfenc/mf_utils), whose COM interface GUIDs (IID_ICodecAPI,
+        // IID_IMFTransform, IID_IMFMediaEventGenerator) are defined in the
+        // Windows SDK, not in the vcpkg dependency graph. FFmpeg's own
+        // configure links these for --enable-mediafoundation; the final exe
+        // must do the same or the link fails with LNK2001. ole32 is already
+        // pulled in by the other deps.
+        "windows" => {
+            println!("cargo:rustc-link-lib=Mfplat");
+            println!("cargo:rustc-link-lib=Mfuuid");
+            println!("cargo:rustc-link-lib=Strmiids");
         }
         _ => {}
     }
